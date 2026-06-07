@@ -1,0 +1,7 @@
+# Example Agent Runtime Kit configuration.
+#
+# Real local configuration files should not be committed. Keep only sanitized
+# examples in this directory.
+
+runtime_root: .agent_runtime
+default_provider: codex

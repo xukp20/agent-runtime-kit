@@ -1,0 +1,41 @@
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE / local tools
+.vscode/
+.claude/
+.codex/
+
+# Local docs
+dev_docs/
+
+# Data artifacts
+data/
+
+# Local config
+configs/*.yaml
+configs/*.yml
+!configs/*example*.yaml
+!configs/*example*.yml
+
+# Local agent guidance
+AGENTS.md
+**/AGENTS.md

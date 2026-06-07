@@ -1,0 +1,514 @@
+from __future__ import annotations
+
+import threading
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
+
+from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimeContext
+
+from .homes import HomeService, build_provider_env
+from .models import (
+    Agent,
+    AgentAlreadyRunningError,
+    AgentClosedError,
+    AgentCompletionCheckError,
+    AgentCompletionRecord,
+    AgentHasNoCompletedTurn,
+    AgentIncompleteError,
+    AgentPausedError,
+    CompletionDecision,
+    WaitAgentsResult,
+)
+from .providers.codex import CodexProvider
+from .store import AgentStoreService
+from .store_utils import utc_now_iso
+from .templates import render_template
+
+
+class AgentType:
+    agent_type: str = ""
+    developer_instructions_template: str | None = None
+    start_prompt_template: str | None = None
+    continue_prompt_template: str | None = None
+
+    def render_developer_instructions(self, variables: dict[str, object]) -> str | None:
+        return render_template(self.developer_instructions_template, variables)
+
+    def render_start_prompt(self, variables: dict[str, object]) -> str:
+        rendered = render_template(self.start_prompt_template, variables)
+        if rendered is None:
+            raise ValueError(f"AgentType {self.agent_type} has no start_prompt_template")
+        return rendered
+
+    def render_continue_prompt(
+        self,
+        variables: dict[str, object],
+        ctx: "AgentCompletionContext",
+        decision: CompletionDecision,
+    ) -> str:
+        merged = dict(variables)
+        if decision.reason is not None:
+            merged.setdefault("reason", decision.reason)
+        rendered = render_template(self.continue_prompt_template, merged)
+        if rendered is None:
+            raise ValueError(f"AgentType {self.agent_type} has no continue_prompt_template")
+        return rendered
+
+    def check_completion(self, ctx: "AgentCompletionContext") -> CompletionDecision:
+        return CompletionDecision(complete=True)
+
+    def max_auto_continue_turns(self, ctx: "AgentCompletionContext | None") -> int:
+        return 0
+
+
+class AgentTypeRegistry:
+    def __init__(self) -> None:
+        self._types: dict[str, AgentType] = {}
+
+    def register(self, agent_type: AgentType) -> None:
+        key = agent_type.agent_type.strip()
+        if not key:
+            raise ValueError("agent_type must not be empty")
+        if key in self._types:
+            raise ValueError(f"duplicate agent_type: {key}")
+        self._types[key] = agent_type
+
+    def get(self, agent_type: str) -> AgentType:
+        key = agent_type.strip()
+        try:
+            return self._types[key]
+        except KeyError as exc:
+            raise KeyError(f"unknown agent_type: {key}") from exc
+
+    def list(self) -> list[AgentType]:
+        return [self._types[key] for key in sorted(self._types)]
+
+
+@dataclass(frozen=True)
+class AgentCompletionContext(RuntimeContext):
+    agent: Agent
+    turn_result: object
+    auto_continue_count: int
+    variables: dict[str, object]
+
+
+@dataclass
+class AgentRunPauseController:
+    global_paused: bool = False
+    paused_scopes: set[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.paused_scopes is None:
+            self.paused_scopes = set()
+
+    def pause(self, scope_id: str | None = None) -> None:
+        if scope_id is None:
+            self.global_paused = True
+        else:
+            self.paused_scopes.add(scope_id)
+
+    def resume(self, scope_id: str | None = None) -> None:
+        if scope_id is None:
+            self.global_paused = False
+        else:
+            self.paused_scopes.discard(scope_id)
+
+    def is_paused(self, scope_id: str | None = None) -> bool:
+        if self.global_paused:
+            return True
+        if scope_id is None:
+            return False
+        return scope_id in self.paused_scopes
+
+    def assert_can_start(self, scope_id: str) -> None:
+        if self.is_paused(scope_id):
+            raise AgentPausedError(f"agent runs are paused for scope: {scope_id}")
+
+
+@dataclass
+class _ActiveAgentRun:
+    agent_id: str
+    worker: threading.Thread
+    done_event: threading.Event
+    latest_result: object | None = None
+    latest_completion: AgentCompletionRecord | None = None
+    error: BaseException | None = None
+
+
+class AgentService:
+    def __init__(
+        self,
+        runtime_root: Path,
+        *,
+        agent_types: AgentTypeRegistry | None = None,
+        store: AgentStoreService | None = None,
+        home_service: HomeService | None = None,
+        providers: dict[str, object] | None = None,
+        ark_services: ARKServices | None = None,
+        app_services: AppServices | None = None,
+        start_paused: bool = False,
+    ) -> None:
+        self.runtime_root = Path(runtime_root)
+        self.agent_types = agent_types or AgentTypeRegistry()
+        self.providers = providers or {"codex": CodexProvider(runtime_root=self.runtime_root)}
+        self.store = store or AgentStoreService(self.runtime_root, providers=self.providers)
+        self.home_service = home_service or HomeService(self.runtime_root)
+        self.ark_services = ark_services or ARKServices()
+        self.ark_services.agent_service = self
+        self.app_services = app_services or AppServices()
+        self.pause_controller = AgentRunPauseController(global_paused=start_paused)
+        self._lock = threading.RLock()
+        self._active: dict[str, _ActiveAgentRun] = {}
+
+    def create_agent(
+        self,
+        scope_id: str,
+        agent_type: str,
+        cli_type: str = "codex",
+        home_id: str | None = None,
+    ) -> Agent:
+        self.agent_types.get(agent_type)
+        resolved_home_id = home_id or agent_type
+        home = self.home_service.get_home(cli_type, resolved_home_id)
+        if home.status != "active":
+            raise RuntimeError(f"home is not active: {cli_type}/{resolved_home_id}")
+        return self.store.create_agent_record(
+            scope_id=scope_id,
+            agent_type=agent_type,
+            cli_type=cli_type,
+            home_id=resolved_home_id,
+        )
+
+    def get_agent(self, agent_id: str) -> Agent:
+        return self.store.get_agent(agent_id)
+
+    def list_agents(self, scope_id: str | None = None, status: str | None = None) -> list[Agent]:
+        return self.store.list_agents(scope_id=scope_id, status=status)
+
+    def close_agent(self, agent_id: str) -> Agent:
+        with self._lock:
+            agent = self.store.get_agent(agent_id)
+            if agent.status == "running" or agent_id in self._active:
+                raise AgentAlreadyRunningError(agent_id)
+            return self.store.close_agent(agent_id)
+
+    def start_agent(
+        self,
+        agent_id: str,
+        *,
+        variables: dict[str, object] | None = None,
+        prompt: str | None = None,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> Agent:
+        variables = dict(variables or {})
+        with self._lock:
+            agent = self.store.get_agent(agent_id)
+            if agent.status == "closed":
+                raise AgentClosedError(agent_id)
+            if agent.status == "running" or agent_id in self._active:
+                raise AgentAlreadyRunningError(agent_id)
+            self.pause_controller.assert_can_start(agent.scope_id)
+            agent_type = self.agent_types.get(agent.agent_type)
+            developer_instructions = agent_type.render_developer_instructions(variables)
+            current_prompt = prompt if prompt is not None else agent_type.render_start_prompt(variables)
+            self.store.patch_agent(agent_id, status="running")
+            done_event = threading.Event()
+            active = _ActiveAgentRun(
+                agent_id=agent_id,
+                worker=threading.Thread(target=lambda: None),
+                done_event=done_event,
+            )
+            worker = threading.Thread(
+                target=self._run_agent_worker,
+                kwargs={
+                    "active": active,
+                    "variables": variables,
+                    "current_prompt": current_prompt,
+                    "developer_instructions": developer_instructions,
+                    "env": env,
+                    "workdir": workdir,
+                },
+                daemon=True,
+            )
+            active.worker = worker
+            self._active[agent_id] = active
+            worker.start()
+            return self.store.get_agent(agent_id)
+
+    def _run_agent_worker(
+        self,
+        *,
+        active: _ActiveAgentRun,
+        variables: dict[str, object],
+        current_prompt: str,
+        developer_instructions: str | None,
+        env: dict[str, str] | None,
+        workdir: str | None,
+    ) -> None:
+        agent_id = active.agent_id
+        auto_continue_count = 0
+        try:
+            while True:
+                agent = self.store.get_agent(agent_id)
+                agent_type = self.agent_types.get(agent.agent_type)
+                home = self.home_service.get_home(agent.cli_type, agent.home_id)
+                home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+                provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+                provider = self.providers[agent.cli_type]
+                if agent.thread_id is None:
+                    result = provider.start_thread(
+                        home_id=agent.home_id,
+                        home_root=home_root,
+                        env=provider_env,
+                        workdir=workdir,
+                        prompt=current_prompt,
+                        developer_instructions=developer_instructions,
+                        agent_id=agent_id,
+                    )
+                else:
+                    result = provider.resume_thread(
+                        home_id=agent.home_id,
+                        home_root=home_root,
+                        env=provider_env,
+                        thread_id=agent.thread_id,
+                        workdir=workdir,
+                        prompt=current_prompt,
+                        developer_instructions=developer_instructions,
+                        agent_id=agent_id,
+                    )
+                active.latest_result = result.turn_result
+                self.store.update_thread_locator(
+                    agent_id,
+                    thread_id=result.thread_id,
+                    rollout_relpath=result.rollout_relpath,
+                )
+                agent = self.store.get_agent(agent_id)
+                ctx = AgentCompletionContext(
+                    ark=self.ark_services,
+                    app=self.app_services,
+                    agent=agent,
+                    turn_result=result.turn_result,
+                    auto_continue_count=auto_continue_count,
+                    variables=variables,
+                )
+                try:
+                    decision = agent_type.check_completion(ctx)
+                    record = AgentCompletionRecord(
+                        turn_id=_turn_id(result.turn_result),
+                        decision=decision,
+                        status="complete" if decision.complete else "incomplete",
+                        auto_continue_count=auto_continue_count,
+                        checked_at=utc_now_iso(),
+                    )
+                except BaseException as exc:
+                    record = AgentCompletionRecord(
+                        turn_id=_turn_id(result.turn_result),
+                        decision=CompletionDecision(complete=False, reason=str(exc)),
+                        status="checker_failed",
+                        auto_continue_count=auto_continue_count,
+                        checked_at=utc_now_iso(),
+                        error_message=str(exc),
+                    )
+                    self.store.update_completion(agent_id, record)
+                    active.latest_completion = record
+                    raise AgentCompletionCheckError(str(exc)) from exc
+                self.store.update_completion(agent_id, record)
+                active.latest_completion = record
+                if decision.close_agent:
+                    self.store.patch_agent(agent_id, status="closed")
+                    return
+                if decision.complete:
+                    return
+                max_turns = agent_type.max_auto_continue_turns(ctx)
+                if auto_continue_count >= max_turns:
+                    raise AgentIncompleteError(agent_id, record)
+                auto_continue_count += 1
+                current_prompt = decision.continue_prompt or agent_type.render_continue_prompt(variables, ctx, decision)
+        except BaseException as exc:
+            active.error = exc
+        finally:
+            with self._lock:
+                try:
+                    agent = self.store.get_agent(agent_id)
+                    if agent.status != "closed":
+                        self.store.patch_agent(agent_id, status="idle")
+                finally:
+                    self._active.pop(agent_id, None)
+                    active.done_event.set()
+
+    def wait_agent(self, agent_id: str, timeout_s: float | None = None) -> object:
+        active = self._active.get(agent_id)
+        if active is not None:
+            if not active.done_event.wait(timeout_s):
+                raise TimeoutError(agent_id)
+            if active.error is not None:
+                raise active.error
+            if active.latest_result is not None:
+                return active.latest_result
+        agent = self.store.get_agent(agent_id)
+        if agent.last_completion is not None:
+            if agent.last_completion.status == "incomplete":
+                raise AgentIncompleteError(agent_id, agent.last_completion)
+            if agent.last_completion.status == "checker_failed":
+                raise AgentCompletionCheckError(agent.last_completion.error_message or agent_id)
+        return self.read_latest_turn_result(agent_id)
+
+    def wait_agents(
+        self,
+        agent_ids: list[str],
+        timeout_s: float | None = None,
+        fail_fast: bool = False,
+    ) -> WaitAgentsResult:
+        completed: dict[str, object] = {}
+        errors: dict[str, BaseException] = {}
+        pending: list[str] = []
+        timeout = False
+        for agent_id in agent_ids:
+            try:
+                completed[agent_id] = self.wait_agent(agent_id, timeout_s=timeout_s)
+            except TimeoutError:
+                timeout = True
+                pending.append(agent_id)
+                if fail_fast:
+                    break
+            except BaseException as exc:
+                errors[agent_id] = exc
+                if fail_fast:
+                    break
+        return WaitAgentsResult(completed=completed, errors=errors, pending=tuple(pending), timeout=timeout)
+
+    def interrupt_agent(self, agent_id: str) -> bool:
+        provider = self.providers.get(self.store.get_agent(agent_id).cli_type)
+        if provider is None or not hasattr(provider, "interrupt_agent"):
+            return False
+        return bool(provider.interrupt_agent(agent_id))
+
+    def pause_runs(self, scope_id: str | None = None) -> None:
+        with self._lock:
+            self.pause_controller.pause(scope_id)
+
+    def resume_runs(self, scope_id: str | None = None) -> None:
+        with self._lock:
+            self.pause_controller.resume(scope_id)
+
+    def is_paused(self, scope_id: str | None = None) -> bool:
+        return self.pause_controller.is_paused(scope_id)
+
+    def list_running_agents(self, scope_id: str | None = None) -> list[Agent]:
+        return self.store.list_agents(scope_id=scope_id, status="running")
+
+    def has_running_agents(self, scope_id: str | None = None) -> bool:
+        return bool(self.list_running_agents(scope_id))
+
+    def is_stable(self, scope_id: str | None = None) -> bool:
+        return not self.has_running_agents(scope_id)
+
+    def wait_scope_agents(
+        self,
+        scope_id: str,
+        timeout_s: float | None = None,
+        fail_fast: bool = False,
+    ) -> WaitAgentsResult:
+        return self.wait_agents(
+            [agent.agent_id for agent in self.list_running_agents(scope_id)],
+            timeout_s=timeout_s,
+            fail_fast=fail_fast,
+        )
+
+    def wait_all_active_agents(
+        self,
+        timeout_s: float | None = None,
+        fail_fast: bool = False,
+    ) -> WaitAgentsResult:
+        return self.wait_agents(
+            [agent.agent_id for agent in self.list_running_agents()],
+            timeout_s=timeout_s,
+            fail_fast=fail_fast,
+        )
+
+    def fork_agent(self, source_agent_id: str, *, target_scope_id: str | None = None) -> Agent:
+        with self._lock:
+            source = self.store.get_agent(source_agent_id)
+            if source.status != "idle":
+                raise AgentAlreadyRunningError(source_agent_id)
+            if not source.thread_id:
+                raise AgentHasNoCompletedTurn(source_agent_id)
+            target_scope = target_scope_id or source.scope_id
+            self.pause_controller.assert_can_start(source.scope_id)
+            self.pause_controller.assert_can_start(target_scope)
+        home = self.home_service.get_home(source.cli_type, source.home_id)
+        home_root = self.home_service.resolve_home_root(source.cli_type, source.home_id)
+        provider_env = build_provider_env(home=home, home_root=home_root)
+        forked = self.providers[source.cli_type].fork_thread(
+            home_id=source.home_id,
+            home_root=home_root,
+            env=provider_env,
+            thread_id=source.thread_id,
+            agent_id=source.agent_id,
+        )
+        return self.store.create_agent_record(
+            scope_id=target_scope,
+            agent_type=source.agent_type,
+            cli_type=source.cli_type,
+            home_id=source.home_id,
+            thread_id=forked.thread_id,
+            rollout_relpath=forked.rollout_relpath,
+            fork_source_agent_id=source.agent_id,
+            fork_source_thread_id=source.thread_id,
+        )
+
+    def read_thread(self, agent_id: str, include_turns: bool = True) -> object:
+        agent = self.store.get_agent(agent_id)
+        if not agent.thread_id:
+            raise AgentHasNoCompletedTurn(agent_id)
+        provider = self.providers.get(agent.cli_type)
+        if provider is None:
+            raise RuntimeError(f"no provider registered for {agent.cli_type}")
+        home = self.home_service.get_home(agent.cli_type, agent.home_id)
+        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+        provider_env = build_provider_env(home=home, home_root=home_root)
+        return provider.read_thread(
+            agent,
+            home_root=home_root,
+            env=provider_env,
+            include_turns=include_turns,
+        )
+
+    def list_turns(self, agent_id: str) -> list[object]:
+        thread = self.read_thread(agent_id, include_turns=True)
+        return list(getattr(thread, "turns", []) or [])
+
+    def read_latest_turn_result(self, agent_id: str) -> object:
+        agent = self.store.get_agent(agent_id)
+        if not agent.thread_id:
+            raise AgentHasNoCompletedTurn(agent_id)
+        provider = self.providers.get(agent.cli_type)
+        if provider is None:
+            raise RuntimeError(f"no provider registered for {agent.cli_type}")
+        home = self.home_service.get_home(agent.cli_type, agent.home_id)
+        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+        provider_env = build_provider_env(home=home, home_root=home_root)
+        return provider.read_latest_turn_result(agent, home_root=home_root, env=provider_env)
+
+    def read_rollout_events(self, agent_id: str) -> list[dict]:
+        return self.store.read_rollout_events(agent_id)
+
+    def close_provider_home(self, cli_type: str, home_id: str, *, force: bool = False) -> bool:
+        provider = self.providers.get(cli_type)
+        if provider is None or not hasattr(provider, "close_home"):
+            return True
+        return bool(provider.close_home(home_id, force=force))
+
+    def close(self, *, force_provider_homes: bool = False) -> None:
+        for provider in self.providers.values():
+            close_all = getattr(provider, "close_all", None)
+            if callable(close_all):
+                close_all(force=force_provider_homes)
+
+
+def _turn_id(turn_result: object) -> str:
+    value = getattr(turn_result, "id", None)
+    return str(value or f"turn_{uuid.uuid4().hex}")

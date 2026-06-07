@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-runtime-kit"
+version = "0.1.0"
+description = "A lightweight Python runtime kit for provider-backed agents, scoped persistence, snapshots, and simple orchestration primitives."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/xukp20/agent-runtime-kit"
+Repository = "https://github.com/xukp20/agent-runtime-kit"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+agent_runtime_kit = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+  "real: tests that require external local services or real CLI/runtime configuration",
+  "real_codex: tests that require Codex CLI, Codex SDK, or a usable Codex home",
+  "real_codex_artifact: tests that use local real Codex JSONL artifacts under data/",
+  "slow: tests that may take longer than regular unit tests",
+]
