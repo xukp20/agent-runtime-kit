@@ -4,6 +4,7 @@ import pytest
 
 from agent_runtime_kit.agent.homes import HomeCreateSpec, HomeService, build_provider_env
 from agent_runtime_kit.agent.models import MissingProviderEnvError
+from agent_runtime_kit.agent.skills import SkillSpec
 
 
 def test_create_codex_home_copies_config_auth_and_skills(tmp_path: Path) -> None:
@@ -33,6 +34,119 @@ def test_create_codex_home_copies_config_auth_and_skills(tmp_path: Path) -> None
     assert (home_root / ".codex" / "config.toml").read_text(encoding="utf-8") == "model = 'test'\n"
     assert (home_root / ".codex" / "auth.json").read_text(encoding="utf-8") == '{"token": "x"}\n'
     assert (home_root / ".agents" / "skills" / "lean" / "SKILL.md").exists()
+
+
+def test_create_codex_home_writes_skill_specs(tmp_path: Path) -> None:
+    service = HomeService(tmp_path / ".agent_runtime")
+
+    service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            skill_specs={
+                "mathlib-recon": SkillSpec(
+                    name="mathlib-recon",
+                    description="Use when searching Mathlib.",
+                    body="Search Mathlib carefully.",
+                    files={"references/search.md": "Use exact names.\n"},
+                )
+            },
+        )
+    )
+
+    home_root = service.resolve_home_root("codex", "planner")
+    skill_root = home_root / ".agents" / "skills" / "mathlib-recon"
+    assert 'name: "mathlib-recon"' in (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    assert (skill_root / "references" / "search.md").read_text(encoding="utf-8") == "Use exact names.\n"
+
+
+def test_create_codex_home_supports_path_and_spec_skills_together(tmp_path: Path) -> None:
+    path_skill = tmp_path / "path_skill"
+    path_skill.mkdir()
+    (path_skill / "SKILL.md").write_text("# Path skill\n", encoding="utf-8")
+    service = HomeService(tmp_path / ".agent_runtime")
+
+    service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            skill_paths={"path-skill": path_skill},
+            skill_specs={
+                "spec-skill": SkillSpec(
+                    name="spec-skill",
+                    description="Spec skill.",
+                    body="Spec body.",
+                )
+            },
+        )
+    )
+
+    home_root = service.resolve_home_root("codex", "planner")
+    assert (home_root / ".agents" / "skills" / "path-skill" / "SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "# Path skill\n"
+    assert "Spec body." in (
+        home_root / ".agents" / "skills" / "spec-skill" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_create_codex_home_rejects_duplicate_path_and_spec_skill_names(tmp_path: Path) -> None:
+    path_skill = tmp_path / "path_skill"
+    path_skill.mkdir()
+    (path_skill / "SKILL.md").write_text("# Path skill\n", encoding="utf-8")
+    service = HomeService(tmp_path / ".agent_runtime")
+
+    with pytest.raises(ValueError, match="duplicate skill names"):
+        service.create_home(
+            HomeCreateSpec(
+                cli_type="codex",
+                home_id="planner",
+                skill_paths={"demo": path_skill},
+                skill_specs={"demo": SkillSpec(name="demo", description="Demo.", body="Demo.")},
+            )
+        )
+
+
+def test_create_codex_home_rejects_skill_spec_key_mismatch(tmp_path: Path) -> None:
+    service = HomeService(tmp_path / ".agent_runtime")
+
+    with pytest.raises(ValueError, match="must match SkillSpec.name"):
+        service.create_home(
+            HomeCreateSpec(
+                cli_type="codex",
+                home_id="planner",
+                skill_specs={
+                    "wrong": SkillSpec(name="demo", description="Demo.", body="Demo."),
+                },
+            )
+        )
+
+
+def test_create_codex_home_replaces_existing_spec_skill_directory(tmp_path: Path) -> None:
+    service = HomeService(tmp_path / ".agent_runtime")
+
+    service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            skill_specs={"demo": SkillSpec(name="demo", description="Demo.", body="Old.")},
+        )
+    )
+    home_root = service.resolve_home_root("codex", "planner")
+    extra = home_root / ".agents" / "skills" / "demo" / "old.txt"
+    extra.write_text("old", encoding="utf-8")
+
+    service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            skill_specs={"demo": SkillSpec(name="demo", description="Demo.", body="New.")},
+        )
+    )
+
+    skill_root = home_root / ".agents" / "skills" / "demo"
+    assert not extra.exists()
+    assert "New." in (skill_root / "SKILL.md").read_text(encoding="utf-8")
 
 
 def test_build_provider_env_sets_fake_home_and_codex_home(tmp_path: Path) -> None:

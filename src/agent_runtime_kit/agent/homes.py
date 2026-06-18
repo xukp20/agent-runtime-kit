@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .models import MissingProviderEnvError
+from .skills import SkillSpec, validate_skill_name, write_skill_spec
 from .store_utils import utc_now_iso
 
 
@@ -57,6 +58,7 @@ class HomeCreateSpec:
     base_config_path: Path | None = None
     auth_json_path: Path | None = None
     skill_paths: dict[str, Path] = field(default_factory=dict)
+    skill_specs: dict[str, SkillSpec] = field(default_factory=dict)
     mcp_servers: list[McpServerSpec] = field(default_factory=list)
     fixed_env: dict[str, str] = field(default_factory=dict)
     required_env: set[str] = field(default_factory=set)
@@ -212,11 +214,34 @@ class HomeService:
             shutil.copyfile(spec.base_config_path, codex_root / "config.toml")
         if spec.auth_json_path is not None:
             shutil.copyfile(spec.auth_json_path, codex_root / "auth.json")
+        self._validate_skill_inputs(spec)
         for skill_name, skill_path in spec.skill_paths.items():
-            dest = skills_root / skill_name
+            validated_name = validate_skill_name(skill_name)
+            if not skill_path.exists() or not skill_path.is_dir():
+                raise ValueError(f"skill path must be an existing directory: {skill_path}")
+            dest = skills_root / validated_name
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(skill_path, dest)
+        for skill_name, skill_spec in spec.skill_specs.items():
+            validated_name = validate_skill_name(skill_name)
+            if validated_name != skill_spec.name:
+                raise ValueError(f"skill spec key must match SkillSpec.name: {skill_name} != {skill_spec.name}")
+            write_skill_spec(skill_spec, skills_root / validated_name)
+
+    def _validate_skill_inputs(self, spec: HomeCreateSpec) -> None:
+        path_names = {validate_skill_name(name) for name in spec.skill_paths}
+        spec_names = {validate_skill_name(name) for name in spec.skill_specs}
+        duplicate_names = path_names & spec_names
+        if duplicate_names:
+            duplicates = ", ".join(sorted(duplicate_names))
+            raise ValueError(f"duplicate skill names between skill_paths and skill_specs: {duplicates}")
+        for skill_name in spec.skill_paths:
+            if validate_skill_name(skill_name) != skill_name:
+                raise ValueError(f"invalid skill path name: {skill_name}")
+        for skill_name, skill_spec in spec.skill_specs.items():
+            if validate_skill_name(skill_name) != skill_spec.name:
+                raise ValueError(f"skill spec key must match SkillSpec.name: {skill_name} != {skill_spec.name}")
 
     def get_home(self, cli_type: str, home_id: str) -> HomeRecord:
         return self.store.get_home(cli_type, home_id)
