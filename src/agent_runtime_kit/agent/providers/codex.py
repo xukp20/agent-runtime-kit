@@ -103,6 +103,7 @@ class CodexProvider:
         prompt: str,
         developer_instructions: str | None,
         agent_id: str,
+        overwrite_developer_instructions: bool = False,
     ) -> CodexTurnResult:
         home = self._get_or_start_home(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
         self._begin_agent_run(home, agent_id)
@@ -135,10 +136,28 @@ class CodexProvider:
         prompt: str,
         developer_instructions: str | None,
         agent_id: str,
+        overwrite_developer_instructions: bool = False,
     ) -> CodexTurnResult:
         home = self._get_or_start_home(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
         self._begin_agent_run(home, agent_id, thread_id=thread_id)
         try:
+            if overwrite_developer_instructions:
+                sdk = self._sdk()
+                thread, turn_result = self._resume_and_run_with_developer_instructions_override(
+                    sdk=sdk,
+                    codex=home.codex,
+                    thread_id=thread_id,
+                    workdir=workdir,
+                    prompt=prompt,
+                    developer_instructions=developer_instructions,
+                )
+                rollout_relpath = _find_rollout_relpath(home_root / ".codex", thread.id)
+                return CodexTurnResult(
+                    thread_id=thread.id,
+                    rollout_relpath=rollout_relpath,
+                    turn_result=turn_result,
+                    thread=thread,
+                )
             thread = home.codex.thread_resume(
                 thread_id,
                 cwd=workdir,
@@ -156,6 +175,62 @@ class CodexProvider:
             )
         finally:
             self._finish_agent_run(agent_id)
+
+    def _resume_and_run_with_developer_instructions_override(
+        self,
+        *,
+        sdk,
+        codex: object,
+        thread_id: str,
+        workdir: str | None,
+        prompt: str,
+        developer_instructions: str | None,
+    ) -> tuple[object, object]:
+        client = getattr(codex, "_client", None)
+        if client is None:
+            raise RuntimeError(
+                "Codex developer instruction overwrite requires a Codex SDK object with _client"
+            )
+        resumed = client.thread_resume(
+            thread_id,
+            {
+                "cwd": workdir,
+                "model": self.model,
+                "config": self.thread_config or None,
+            },
+        )
+        response_thread = getattr(resumed, "thread", None)
+        resumed_thread_id = str(getattr(response_thread, "id", thread_id))
+        model = self.model or getattr(resumed, "model", None)
+        if not model:
+            raise RuntimeError(
+                "Codex developer instruction overwrite requires a resolved model from "
+                "CodexProvider.model or thread/resume"
+            )
+        params = {
+            "cwd": workdir,
+            "model": model,
+            "collaborationMode": {
+                "mode": "default",
+                "settings": {
+                    "model": model,
+                    "developer_instructions": developer_instructions,
+                },
+            },
+        }
+        started = client.turn_start(resumed_thread_id, prompt, params=params)
+        turn_handle_type = getattr(sdk, "TurnHandle", None)
+        thread_type = getattr(sdk, "Thread", None)
+        if turn_handle_type is None or thread_type is None:
+            raise RuntimeError(
+                "Codex developer instruction overwrite requires a Codex SDK with "
+                "Thread and TurnHandle"
+            )
+        thread = thread_type(client, resumed_thread_id)
+        turn = getattr(started, "turn", None)
+        turn_id = str(getattr(turn, "id"))
+        turn_result = turn_handle_type(client, resumed_thread_id, turn_id).run()
+        return thread, turn_result
 
     def fork_thread(
         self,

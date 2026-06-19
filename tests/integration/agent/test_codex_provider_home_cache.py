@@ -14,14 +14,66 @@ class FakeCodex:
     def __init__(self, config=None) -> None:
         self.config = config
         self.closed = False
+        self._client = FakeClient()
         FakeCodex.created.append(self)
 
     def close(self) -> None:
         self.closed = True
 
+    def thread_resume(self, thread_id: str, **kwargs):
+        self._client.high_level_resume_calls.append({"thread_id": thread_id, **kwargs})
+        return SimpleNamespace(
+            id=thread_id,
+            run=lambda prompt, **run_kwargs: SimpleNamespace(
+                id="high-level-turn",
+                prompt=prompt,
+                run_kwargs=run_kwargs,
+            ),
+        )
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.thread_resume_calls: list[dict[str, object]] = []
+        self.high_level_resume_calls: list[dict[str, object]] = []
+        self.turn_start_calls: list[dict[str, object]] = []
+
+    def thread_resume(self, thread_id: str, params: dict[str, object] | None = None):
+        self.thread_resume_calls.append({"thread_id": thread_id, "params": params})
+        return SimpleNamespace(thread=SimpleNamespace(id=thread_id), model="fake-model")
+
+    def turn_start(
+        self,
+        thread_id: str,
+        input_items: str,
+        params: dict[str, object] | None = None,
+    ):
+        self.turn_start_calls.append(
+            {"thread_id": thread_id, "input_items": input_items, "params": params}
+        )
+        return SimpleNamespace(turn=SimpleNamespace(id="turn-1"))
+
+
+class FakeThread:
+    def __init__(self, client: FakeClient, thread_id: str) -> None:
+        self._client = client
+        self.id = thread_id
+
+
+class FakeTurnHandle:
+    def __init__(self, client: FakeClient, thread_id: str, turn_id: str) -> None:
+        self._client = client
+        self.thread_id = thread_id
+        self.id = turn_id
+
+    def run(self):
+        return SimpleNamespace(id=self.id, thread_id=self.thread_id, final_response="done")
+
 
 class FakeSdk:
     Codex = FakeCodex
+    Thread = FakeThread
+    TurnHandle = FakeTurnHandle
 
     @staticmethod
     def CodexConfig(**kwargs):
@@ -87,6 +139,83 @@ def test_codex_provider_close_all_force_closes_active(tmp_path: Path) -> None:
 
     assert provider._homes == {}
     assert provider._agent_runs == {}
+
+
+def test_codex_provider_resume_instruction_overwrite_uses_turn_collaboration_mode(
+    tmp_path: Path,
+) -> None:
+    FakeCodex.created.clear()
+    provider = _provider()
+
+    result = provider.resume_thread(
+        home_id="worker",
+        home_root=tmp_path / "home",
+        env={},
+        thread_id="thread-existing",
+        workdir=str(tmp_path),
+        prompt="next prompt",
+        developer_instructions="new developer instruction",
+        agent_id="agent-a",
+        overwrite_developer_instructions=True,
+    )
+
+    codex = FakeCodex.created[0]
+    client = codex._client
+    assert result.thread_id == "thread-existing"
+    assert result.turn_result.id == "turn-1"
+    assert client.high_level_resume_calls == []
+    assert client.thread_resume_calls == [
+        {
+            "thread_id": "thread-existing",
+            "params": {"cwd": str(tmp_path), "model": None, "config": None},
+        }
+    ]
+    assert client.turn_start_calls[0]["thread_id"] == "thread-existing"
+    assert client.turn_start_calls[0]["input_items"] == "next prompt"
+    params = client.turn_start_calls[0]["params"]
+    assert params == {
+        "cwd": str(tmp_path),
+        "model": "fake-model",
+        "collaborationMode": {
+            "mode": "default",
+            "settings": {
+                "model": "fake-model",
+                "developer_instructions": "new developer instruction",
+            },
+        },
+    }
+
+
+def test_codex_provider_resume_without_instruction_overwrite_uses_default_resume(
+    tmp_path: Path,
+) -> None:
+    FakeCodex.created.clear()
+    provider = _provider()
+
+    provider.resume_thread(
+        home_id="worker",
+        home_root=tmp_path / "home",
+        env={},
+        thread_id="thread-existing",
+        workdir=str(tmp_path),
+        prompt="next prompt",
+        developer_instructions="developer instruction",
+        agent_id="agent-a",
+    )
+
+    codex = FakeCodex.created[0]
+    client = codex._client
+    assert client.high_level_resume_calls == [
+        {
+            "thread_id": "thread-existing",
+            "cwd": str(tmp_path),
+            "developer_instructions": "developer instruction",
+            "model": None,
+            "config": None,
+        }
+    ]
+    assert client.thread_resume_calls == []
+    assert client.turn_start_calls == []
 
 
 def _provider(*, max_idle_homes: int = 8) -> CodexProvider:

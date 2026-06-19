@@ -61,6 +61,7 @@ class FakeProvider:
         prompt: str,
         developer_instructions: str | None,
         agent_id: str,
+        overwrite_developer_instructions: bool = False,
     ) -> FakeRunResult:
         with self._lock:
             thread_id = f"thread-{self.next_thread}"
@@ -77,6 +78,7 @@ class FakeProvider:
                 thread_id=thread_id,
                 prompt=prompt,
                 developer_instructions=developer_instructions,
+                overwrite_developer_instructions=overwrite_developer_instructions,
             ),
         )
 
@@ -91,6 +93,7 @@ class FakeProvider:
         prompt: str,
         developer_instructions: str | None,
         agent_id: str,
+        overwrite_developer_instructions: bool = False,
     ) -> FakeRunResult:
         return self._run_with_active_record(
             home_id=home_id,
@@ -104,6 +107,7 @@ class FakeProvider:
                 thread_id=thread_id,
                 prompt=prompt,
                 developer_instructions=developer_instructions,
+                overwrite_developer_instructions=overwrite_developer_instructions,
             ),
         )
 
@@ -192,6 +196,7 @@ class FakeProvider:
         thread_id: str,
         prompt: str,
         developer_instructions: str | None,
+        overwrite_developer_instructions: bool,
     ) -> FakeRunResult:
         if self.run_delay_s:
             time.sleep(self.run_delay_s)
@@ -207,6 +212,7 @@ class FakeProvider:
             "turn_id": turn_id,
             "prompt": prompt,
             "developer_instructions": developer_instructions,
+            "overwrite_developer_instructions": overwrite_developer_instructions,
             "workdir": workdir,
             "env_home": env.get("HOME"),
             "env_codex_home": env.get("CODEX_HOME"),

@@ -53,6 +53,64 @@ def test_agent_service_runs_agent_and_reads_latest_result(tmp_path: Path) -> Non
     assert service.read_latest_turn_result(agent.agent_id).id == result.id
 
 
+def test_agent_service_supports_run_level_template_overrides_on_resume(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("repo:node", "worker")
+
+    first = service.wait_agent(
+        service.start_agent(
+            agent.agent_id,
+            variables={"item": "alpha"},
+            developer_instructions_template_override="Override developer {{item}}.",
+            start_prompt_template_override="Override start {{item}}.",
+        ).agent_id
+    )
+    restored = service.get_agent(agent.agent_id)
+    thread_id = restored.thread_id
+
+    second = service.wait_agent(
+        service.start_agent(
+            agent.agent_id,
+            variables={"item": "beta"},
+            developer_instructions_template_override="Second developer {{item}}.",
+            start_prompt_template_override="Second start {{item}}.",
+        ).agent_id
+    )
+
+    assert isinstance(first, FakeTurnResult)
+    assert first.prompt == "Override start alpha."
+    assert first.developer_instructions == "Override developer alpha."
+    assert isinstance(second, FakeTurnResult)
+    assert second.thread_id == thread_id
+    assert second.prompt == "Second start beta."
+    assert second.developer_instructions == "Second developer beta."
+    assert provider.calls[0]["thread_id"] == provider.calls[1]["thread_id"]
+    assert provider.calls[0]["overwrite_developer_instructions"] is True
+    assert provider.calls[1]["overwrite_developer_instructions"] is True
+
+
+def test_agent_service_prompt_direct_text_still_beats_start_template_override(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, _provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("repo:node", "worker")
+
+    result = service.wait_agent(
+        service.start_agent(
+            agent.agent_id,
+            variables={"item": "alpha"},
+            prompt="Direct prompt.",
+            start_prompt_template_override="Override start {{item}}.",
+        ).agent_id
+    )
+
+    assert isinstance(result, FakeTurnResult)
+    assert result.prompt == "Direct prompt."
+    assert _provider.calls[0]["overwrite_developer_instructions"] is False
+
+
 def test_agent_service_auto_continues_until_completion(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     service, provider = _make_service(runtime_root, OneContinueAgentType())
@@ -68,6 +126,25 @@ def test_agent_service_auto_continues_until_completion(tmp_path: Path) -> None:
     assert restored_agent.last_completion is not None
     assert restored_agent.last_completion.status == "complete"
     assert len(service.list_turns(agent.agent_id)) == 2
+
+
+def test_agent_service_supports_run_level_continue_template_override(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, OneContinueAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+
+    result = service.wait_agent(
+        service.start_agent(
+            agent.agent_id,
+            variables={"item": "goal"},
+            continue_prompt_template_override="Override continue {{item}} after {{reason}}.",
+        ).agent_id
+    )
+
+    assert isinstance(result, FakeTurnResult)
+    assert result.prompt == "Override continue goal after first turn incomplete."
+    assert provider.calls[1]["prompt"] == "Override continue goal after first turn incomplete."
 
 
 def test_agent_service_persists_incomplete_result_for_late_wait(tmp_path: Path) -> None:

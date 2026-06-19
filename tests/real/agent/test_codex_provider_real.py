@@ -74,6 +74,54 @@ def test_real_codex_minimal_run_resume_store_and_pause(tmp_path: Path) -> None:
         service.close(force_provider_homes=True)
 
 
+def test_real_codex_developer_instruction_override_on_resume(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "project" / ".agent_runtime"
+    service = _service(runtime_root)
+    try:
+        _create_codex_home(service, "node_worker")
+        agent = service.create_agent("repo-a:node-root", "node_worker")
+        prompt = "Reply with the current ARK dynamic instruction sentinel and no extra text."
+
+        service.wait_agent(
+            service.start_agent(
+                agent.agent_id,
+                variables={},
+                prompt=prompt,
+                developer_instructions_template_override=(
+                    "This is an ARK dynamic instruction override test. "
+                    "For this turn, the current ARK dynamic instruction sentinel is "
+                    "ARK_DYNAMIC_INSTRUCTION_FIRST. Reply with exactly that sentinel when asked."
+                ),
+            ).agent_id,
+            timeout_s=600,
+        )
+        first_agent = service.get_agent(agent.agent_id)
+        assert first_agent.thread_id
+        first_text = _latest_text(service, agent.agent_id)
+        assert "ARK_DYNAMIC_INSTRUCTION_FIRST" in first_text
+
+        service.wait_agent(
+            service.start_agent(
+                agent.agent_id,
+                variables={},
+                prompt=prompt,
+                developer_instructions_template_override=(
+                    "This is an ARK dynamic instruction override test. "
+                    "For this turn, the current ARK dynamic instruction sentinel is "
+                    "ARK_DYNAMIC_INSTRUCTION_SECOND. This current instruction supersedes any earlier "
+                    "sentinel in the same thread. Reply with exactly that sentinel when asked."
+                ),
+            ).agent_id,
+            timeout_s=600,
+        )
+        second_agent = service.get_agent(agent.agent_id)
+        second_text = _latest_text(service, agent.agent_id)
+        assert second_agent.thread_id == first_agent.thread_id
+        assert "ARK_DYNAMIC_INSTRUCTION_SECOND" in second_text
+    finally:
+        service.close(force_provider_homes=True)
+
+
 def test_real_codex_multi_scope_snapshot_flow(tmp_path: Path) -> None:
     runtime_root = tmp_path / "project" / ".agent_runtime"
     service = _service(runtime_root)
@@ -153,6 +201,13 @@ def _create_codex_home(service: AgentService, home_id: str) -> None:
             else {},
         )
     )
+
+
+def _latest_text(service: AgentService, agent_id: str) -> str:
+    latest = service.read_latest_turn_result(agent_id)
+    text = getattr(latest, "final_response", None)
+    assert isinstance(text, str), f"latest turn has no final response: {latest!r}"
+    return text
 
 
 def _ensure_real_codex_enabled() -> None:

@@ -200,6 +200,9 @@ class AgentService:
         *,
         variables: dict[str, object] | None = None,
         prompt: str | None = None,
+        developer_instructions_template_override: str | None = None,
+        start_prompt_template_override: str | None = None,
+        continue_prompt_template_override: str | None = None,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
     ) -> Agent:
@@ -212,8 +215,17 @@ class AgentService:
                 raise AgentAlreadyRunningError(agent_id)
             self.pause_controller.assert_can_start(agent.scope_id)
             agent_type = self.agent_types.get(agent.agent_type)
-            developer_instructions = agent_type.render_developer_instructions(variables)
-            current_prompt = prompt if prompt is not None else agent_type.render_start_prompt(variables)
+            developer_instructions = _render_developer_instructions(
+                agent_type,
+                variables,
+                developer_instructions_template_override,
+            )
+            overwrite_developer_instructions = developer_instructions_template_override is not None
+            current_prompt = (
+                prompt
+                if prompt is not None
+                else _render_start_prompt(agent_type, variables, start_prompt_template_override)
+            )
             self.store.patch_agent(agent_id, status="running")
             done_event = threading.Event()
             active = _ActiveAgentRun(
@@ -228,6 +240,8 @@ class AgentService:
                     "variables": variables,
                     "current_prompt": current_prompt,
                     "developer_instructions": developer_instructions,
+                    "overwrite_developer_instructions": overwrite_developer_instructions,
+                    "continue_prompt_template_override": continue_prompt_template_override,
                     "env": env,
                     "workdir": workdir,
                 },
@@ -245,6 +259,8 @@ class AgentService:
         variables: dict[str, object],
         current_prompt: str,
         developer_instructions: str | None,
+        overwrite_developer_instructions: bool,
+        continue_prompt_template_override: str | None,
         env: dict[str, str] | None,
         workdir: str | None,
     ) -> None:
@@ -266,6 +282,7 @@ class AgentService:
                         workdir=workdir,
                         prompt=current_prompt,
                         developer_instructions=developer_instructions,
+                        overwrite_developer_instructions=overwrite_developer_instructions,
                         agent_id=agent_id,
                     )
                 else:
@@ -277,6 +294,7 @@ class AgentService:
                         workdir=workdir,
                         prompt=current_prompt,
                         developer_instructions=developer_instructions,
+                        overwrite_developer_instructions=overwrite_developer_instructions,
                         agent_id=agent_id,
                     )
                 active.latest_result = result.turn_result
@@ -326,7 +344,13 @@ class AgentService:
                 if auto_continue_count >= max_turns:
                     raise AgentIncompleteError(agent_id, record)
                 auto_continue_count += 1
-                current_prompt = decision.continue_prompt or agent_type.render_continue_prompt(variables, ctx, decision)
+                current_prompt = decision.continue_prompt or _render_continue_prompt(
+                    agent_type,
+                    variables,
+                    ctx,
+                    decision,
+                    continue_prompt_template_override,
+                )
         except BaseException as exc:
             active.error = exc
         finally:
@@ -512,3 +536,44 @@ class AgentService:
 def _turn_id(turn_result: object) -> str:
     value = getattr(turn_result, "id", None)
     return str(value or f"turn_{uuid.uuid4().hex}")
+
+
+def _render_developer_instructions(
+    agent_type: AgentType,
+    variables: dict[str, object],
+    template_override: str | None,
+) -> str | None:
+    if template_override is not None:
+        return render_template(template_override, variables)
+    return agent_type.render_developer_instructions(variables)
+
+
+def _render_start_prompt(
+    agent_type: AgentType,
+    variables: dict[str, object],
+    template_override: str | None,
+) -> str:
+    if template_override is None:
+        return agent_type.render_start_prompt(variables)
+    rendered = render_template(template_override, variables)
+    if rendered is None:
+        raise ValueError(f"AgentType {agent_type.agent_type} has no start prompt template")
+    return rendered
+
+
+def _render_continue_prompt(
+    agent_type: AgentType,
+    variables: dict[str, object],
+    ctx: AgentCompletionContext,
+    decision: CompletionDecision,
+    template_override: str | None,
+) -> str:
+    if template_override is None:
+        return agent_type.render_continue_prompt(variables, ctx, decision)
+    merged = dict(variables)
+    if decision.reason is not None:
+        merged.setdefault("reason", decision.reason)
+    rendered = render_template(template_override, merged)
+    if rendered is None:
+        raise ValueError(f"AgentType {agent_type.agent_type} has no continue prompt template")
+    return rendered
