@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeCreateSpec, HomeService, build_provider_env
+from agent_runtime_kit.agent.homes import HomeCreateSpec, HomeService, McpServerSpec, build_provider_env
 from agent_runtime_kit.agent.models import MissingProviderEnvError
 from agent_runtime_kit.agent.skills import SkillSpec
 
@@ -58,6 +58,47 @@ def test_create_codex_home_writes_skill_specs(tmp_path: Path) -> None:
     skill_root = home_root / ".agents" / "skills" / "mathlib-recon"
     assert 'name: "mathlib-recon"' in (skill_root / "SKILL.md").read_text(encoding="utf-8")
     assert (skill_root / "references" / "search.md").read_text(encoding="utf-8") == "Use exact names.\n"
+
+
+def test_create_codex_home_renders_mcp_servers_into_config(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("model = 'test'\n", encoding="utf-8")
+    service = HomeService(tmp_path / ".agent_runtime")
+
+    service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            base_config_path=config,
+            mcp_servers=[
+                McpServerSpec(
+                    name="ark_identity",
+                    transport="http",
+                    url="http://127.0.0.1:8765/mcp",
+                    startup_timeout_sec=10,
+                    tool_timeout_sec=20,
+                    required=True,
+                    enabled_tools=["read_identity"],
+                    http_headers={"X-Static": "static"},
+                    env_http_headers={"X-Ark-Step-Id": "ARK_STEP_ID"},
+                )
+            ],
+        )
+    )
+
+    home_root = service.resolve_home_root("codex", "planner")
+    rendered = (home_root / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert "model = 'test'" in rendered
+    assert "[mcp_servers.ark_identity]" in rendered
+    assert 'url = "http://127.0.0.1:8765/mcp"' in rendered
+    assert "startup_timeout_sec = 10" in rendered
+    assert "tool_timeout_sec = 20" in rendered
+    assert "required = true" in rendered
+    assert 'enabled_tools = ["read_identity"]' in rendered
+    assert "[mcp_servers.ark_identity.http_headers]" in rendered
+    assert 'X-Static = "static"' in rendered
+    assert "[mcp_servers.ark_identity.env_http_headers]" in rendered
+    assert 'X-Ark-Step-Id = "ARK_STEP_ID"' in rendered
 
 
 def test_create_codex_home_supports_path_and_spec_skills_together(tmp_path: Path) -> None:

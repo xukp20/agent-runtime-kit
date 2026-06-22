@@ -4,11 +4,18 @@ import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Mapping
 
-from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimeContext
+from agent_runtime_kit.runtime import (
+    ARKServices,
+    AppServices,
+    RuntimeContext,
+    RuntimePausedError,
+    RuntimePauseController,
+)
 
-from .homes import HomeService, build_provider_env
+from .homes import HomeCreateSpec, HomeRecord, HomeService, build_provider_env
 from .models import (
     Agent,
     AgentAlreadyRunningError,
@@ -94,37 +101,7 @@ class AgentCompletionContext(RuntimeContext):
     variables: dict[str, object]
 
 
-@dataclass
-class AgentRunPauseController:
-    global_paused: bool = False
-    paused_scopes: set[str] | None = None
-
-    def __post_init__(self) -> None:
-        if self.paused_scopes is None:
-            self.paused_scopes = set()
-
-    def pause(self, scope_id: str | None = None) -> None:
-        if scope_id is None:
-            self.global_paused = True
-        else:
-            self.paused_scopes.add(scope_id)
-
-    def resume(self, scope_id: str | None = None) -> None:
-        if scope_id is None:
-            self.global_paused = False
-        else:
-            self.paused_scopes.discard(scope_id)
-
-    def is_paused(self, scope_id: str | None = None) -> bool:
-        if self.global_paused:
-            return True
-        if scope_id is None:
-            return False
-        return scope_id in self.paused_scopes
-
-    def assert_can_start(self, scope_id: str) -> None:
-        if self.is_paused(scope_id):
-            raise AgentPausedError(f"agent runs are paused for scope: {scope_id}")
+AgentRunPauseController = RuntimePauseController
 
 
 @dataclass
@@ -158,7 +135,13 @@ class AgentService:
         self.ark_services = ark_services or ARKServices()
         self.ark_services.agent_service = self
         self.app_services = app_services or AppServices()
-        self.pause_controller = AgentRunPauseController(global_paused=start_paused)
+        if self.ark_services.pause_controller is None:
+            self.pause_controller = RuntimePauseController(global_paused=start_paused)
+            self.ark_services.pause_controller = self.pause_controller
+        else:
+            self.pause_controller = self.ark_services.pause_controller
+            if start_paused:
+                self.pause_controller.pause(None)
         self._lock = threading.RLock()
         self._active: dict[str, _ActiveAgentRun] = {}
 
@@ -179,6 +162,48 @@ class AgentService:
             agent_type=agent_type,
             cli_type=cli_type,
             home_id=resolved_home_id,
+        )
+
+    def create_home(
+        self,
+        spec: HomeCreateSpec,
+        *,
+        initialize_provider_home: bool = True,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> HomeRecord:
+        home = self.home_service.create_home(spec)
+        if initialize_provider_home:
+            self.ensure_provider_home_initialized(
+                home.cli_type,
+                home.home_id,
+                env=env,
+                workdir=workdir,
+            )
+        return home
+
+    def ensure_provider_home_initialized(
+        self,
+        cli_type: str,
+        home_id: str,
+        *,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> object | None:
+        provider = self.providers.get(cli_type)
+        if provider is None:
+            raise RuntimeError(f"no provider registered for {cli_type}")
+        ensure = getattr(provider, "ensure_home_initialized", None)
+        if not callable(ensure):
+            return None
+        home = self.home_service.get_home(cli_type, home_id)
+        home_root = self.home_service.resolve_home_root(cli_type, home_id)
+        provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+        return ensure(
+            home_id=home_id,
+            home_root=home_root,
+            env=provider_env,
+            workdir=workdir,
         )
 
     def get_agent(self, agent_id: str) -> Agent:
@@ -213,7 +238,7 @@ class AgentService:
                 raise AgentClosedError(agent_id)
             if agent.status == "running" or agent_id in self._active:
                 raise AgentAlreadyRunningError(agent_id)
-            self.pause_controller.assert_can_start(agent.scope_id)
+            self._assert_agent_can_start(agent.scope_id)
             agent_type = self.agent_types.get(agent.agent_type)
             developer_instructions = _render_developer_instructions(
                 agent_type,
@@ -390,9 +415,17 @@ class AgentService:
         errors: dict[str, BaseException] = {}
         pending: list[str] = []
         timeout = False
-        for agent_id in agent_ids:
+        deadline = None if timeout_s is None else monotonic() + timeout_s
+        for index, agent_id in enumerate(agent_ids):
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    timeout = True
+                    pending.extend(agent_ids[index:])
+                    break
             try:
-                completed[agent_id] = self.wait_agent(agent_id, timeout_s=timeout_s)
+                completed[agent_id] = self.wait_agent(agent_id, timeout_s=remaining)
             except TimeoutError:
                 timeout = True
                 pending.append(agent_id)
@@ -403,6 +436,16 @@ class AgentService:
                 if fail_fast:
                     break
         return WaitAgentsResult(completed=completed, errors=errors, pending=tuple(pending), timeout=timeout)
+
+    def reconcile_stale_running_agents(self, scope_id: str | None = None) -> list[str]:
+        repaired: list[str] = []
+        with self._lock:
+            for agent in self.store.list_agents(scope_id=scope_id, status="running"):
+                if agent.agent_id in self._active:
+                    continue
+                self.store.patch_agent(agent.agent_id, status="idle")
+                repaired.append(agent.agent_id)
+        return repaired
 
     def interrupt_agent(self, agent_id: str) -> bool:
         provider = self.providers.get(self.store.get_agent(agent_id).cli_type)
@@ -461,8 +504,8 @@ class AgentService:
             if not source.thread_id:
                 raise AgentHasNoCompletedTurn(source_agent_id)
             target_scope = target_scope_id or source.scope_id
-            self.pause_controller.assert_can_start(source.scope_id)
-            self.pause_controller.assert_can_start(target_scope)
+            self._assert_agent_can_start(source.scope_id)
+            self._assert_agent_can_start(target_scope)
         home = self.home_service.get_home(source.cli_type, source.home_id)
         home_root = self.home_service.resolve_home_root(source.cli_type, source.home_id)
         provider_env = build_provider_env(home=home, home_root=home_root)
@@ -520,17 +563,17 @@ class AgentService:
     def read_rollout_events(self, agent_id: str) -> list[dict]:
         return self.store.read_rollout_events(agent_id)
 
-    def close_provider_home(self, cli_type: str, home_id: str, *, force: bool = False) -> bool:
-        provider = self.providers.get(cli_type)
-        if provider is None or not hasattr(provider, "close_home"):
-            return True
-        return bool(provider.close_home(home_id, force=force))
-
-    def close(self, *, force_provider_homes: bool = False) -> None:
+    def close(self) -> None:
         for provider in self.providers.values():
-            close_all = getattr(provider, "close_all", None)
-            if callable(close_all):
-                close_all(force=force_provider_homes)
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+
+    def _assert_agent_can_start(self, scope_id: str) -> None:
+        try:
+            self.pause_controller.assert_can_start(scope_id)
+        except RuntimePausedError as exc:
+            raise AgentPausedError(f"agent runs are paused for scope: {scope_id}") from exc
 
 
 def _turn_id(turn_result: object) -> str:

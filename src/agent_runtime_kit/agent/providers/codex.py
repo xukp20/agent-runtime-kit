@@ -5,11 +5,13 @@ import json
 import shutil
 import sys
 import threading
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Mapping
 
-from ..store_utils import utc_now_iso
+from ..store_utils import read_json, utc_now_iso, write_json_atomic
 
 
 class CodexSdkUnavailable(RuntimeError):
@@ -53,13 +55,11 @@ class CodexThreadSnapshot:
 
 
 @dataclass
-class _CodexHomeState:
+class CodexHomeInitializationRecord:
     home_id: str
-    home_root: Path
-    codex: object
-    active_agent_ids: set[str] = field(default_factory=set)
-    last_used_at: str = ""
-    closed: bool = False
+    home_root: str
+    initialized_at: str
+    marker_path: str
 
 
 @dataclass
@@ -73,6 +73,13 @@ class _CodexAgentRun:
 class CodexProvider:
     """Synchronous wrapper around the OpenAI Codex Python SDK."""
 
+    REQUIRED_STATE_DATABASES = (
+        "state_5.sqlite",
+        "logs_2.sqlite",
+        "goals_1.sqlite",
+        "memories_1.sqlite",
+    )
+
     def __init__(
         self,
         *,
@@ -81,16 +88,14 @@ class CodexProvider:
         sdk_python_root: Path | None = None,
         model: str | None = None,
         thread_config: dict[str, object] | None = None,
-        max_idle_homes: int = 8,
     ) -> None:
         self.runtime_root = Path(runtime_root) if runtime_root is not None else None
         self.codex_bin = codex_bin
         self.sdk_python_root = Path(sdk_python_root) if sdk_python_root is not None else None
         self.model = model
         self.thread_config = dict(thread_config or {})
-        self.max_idle_homes = max_idle_homes
-        self._homes: dict[str, _CodexHomeState] = {}
         self._agent_runs: dict[str, _CodexAgentRun] = {}
+        self._home_init_locks: dict[tuple[str, str], threading.Lock] = {}
         self._lock = threading.RLock()
 
     def start_thread(
@@ -105,23 +110,25 @@ class CodexProvider:
         agent_id: str,
         overwrite_developer_instructions: bool = False,
     ) -> CodexTurnResult:
-        home = self._get_or_start_home(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
-        self._begin_agent_run(home, agent_id)
+        self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
+        self._begin_agent_run(home_id=home_id, agent_id=agent_id)
         try:
-            thread = home.codex.thread_start(
-                cwd=workdir,
-                developer_instructions=developer_instructions,
-                model=self.model,
-                config=self.thread_config or None,
-            )
-            turn_result = thread.run(prompt, cwd=workdir, model=self.model)
-            rollout_relpath = _find_rollout_relpath(home_root / ".codex", thread.id)
-            return CodexTurnResult(
-                thread_id=thread.id,
-                rollout_relpath=rollout_relpath,
-                turn_result=turn_result,
-                thread=thread,
-            )
+            sdk = self._sdk()
+            with self._new_codex(sdk, env=env, workdir=workdir) as codex:
+                thread = codex.thread_start(
+                    cwd=workdir,
+                    developer_instructions=developer_instructions,
+                    model=self.model,
+                    config=self.thread_config or None,
+                )
+                turn_result = thread.run(prompt, cwd=workdir, model=self.model)
+                rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
+                return CodexTurnResult(
+                    thread_id=thread.id,
+                    rollout_relpath=rollout_relpath,
+                    turn_result=turn_result,
+                    thread=thread,
+                )
         finally:
             self._finish_agent_run(agent_id)
 
@@ -138,41 +145,42 @@ class CodexProvider:
         agent_id: str,
         overwrite_developer_instructions: bool = False,
     ) -> CodexTurnResult:
-        home = self._get_or_start_home(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
-        self._begin_agent_run(home, agent_id, thread_id=thread_id)
+        self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
+        self._begin_agent_run(home_id=home_id, agent_id=agent_id, thread_id=thread_id)
         try:
-            if overwrite_developer_instructions:
-                sdk = self._sdk()
-                thread, turn_result = self._resume_and_run_with_developer_instructions_override(
-                    sdk=sdk,
-                    codex=home.codex,
-                    thread_id=thread_id,
-                    workdir=workdir,
-                    prompt=prompt,
+            sdk = self._sdk()
+            with self._new_codex(sdk, env=env, workdir=workdir) as codex:
+                if overwrite_developer_instructions:
+                    thread, turn_result = self._resume_and_run_with_developer_instructions_override(
+                        sdk=sdk,
+                        codex=codex,
+                        thread_id=thread_id,
+                        workdir=workdir,
+                        prompt=prompt,
+                        developer_instructions=developer_instructions,
+                    )
+                    rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
+                    return CodexTurnResult(
+                        thread_id=thread.id,
+                        rollout_relpath=rollout_relpath,
+                        turn_result=turn_result,
+                        thread=thread,
+                    )
+                thread = codex.thread_resume(
+                    thread_id,
+                    cwd=workdir,
                     developer_instructions=developer_instructions,
+                    model=self.model,
+                    config=self.thread_config or None,
                 )
-                rollout_relpath = _find_rollout_relpath(home_root / ".codex", thread.id)
+                turn_result = thread.run(prompt, cwd=workdir, model=self.model)
+                rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
                 return CodexTurnResult(
                     thread_id=thread.id,
                     rollout_relpath=rollout_relpath,
                     turn_result=turn_result,
                     thread=thread,
                 )
-            thread = home.codex.thread_resume(
-                thread_id,
-                cwd=workdir,
-                developer_instructions=developer_instructions,
-                model=self.model,
-                config=self.thread_config or None,
-            )
-            turn_result = thread.run(prompt, cwd=workdir, model=self.model)
-            rollout_relpath = _find_rollout_relpath(home_root / ".codex", thread.id)
-            return CodexTurnResult(
-                thread_id=thread.id,
-                rollout_relpath=rollout_relpath,
-                turn_result=turn_result,
-                thread=thread,
-            )
         finally:
             self._finish_agent_run(agent_id)
 
@@ -241,16 +249,18 @@ class CodexProvider:
         thread_id: str,
         agent_id: str,
     ) -> CodexForkResult:
-        home = self._get_or_start_home(home_id=home_id, home_root=home_root, env=env, workdir=None)
-        self._begin_agent_run(home, agent_id, thread_id=thread_id)
+        self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=None)
+        self._begin_agent_run(home_id=home_id, agent_id=agent_id, thread_id=thread_id)
         try:
-            thread = home.codex.thread_fork(
-                thread_id,
-                model=self.model,
-                config=self.thread_config or None,
-            )
-            rollout_relpath = _find_rollout_relpath(home_root / ".codex", thread.id)
-            return CodexForkResult(thread_id=thread.id, rollout_relpath=rollout_relpath, thread=thread)
+            sdk = self._sdk()
+            with self._new_codex(sdk, env=env, workdir=None) as codex:
+                thread = codex.thread_fork(
+                    thread_id,
+                    model=self.model,
+                    config=self.thread_config or None,
+                )
+                rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
+                return CodexForkResult(thread_id=thread.id, rollout_relpath=rollout_relpath, thread=thread)
         finally:
             self._finish_agent_run(agent_id)
 
@@ -264,14 +274,16 @@ class CodexProvider:
     ) -> object:
         if not getattr(agent, "thread_id", None):
             raise RuntimeError("agent has no thread_id")
-        home = self._get_or_start_home(
+        self.ensure_home_initialized(
             home_id=str(agent.home_id),
             home_root=home_root,
             env=env,
             workdir=None,
         )
-        thread = home.codex.thread_resume(str(agent.thread_id), model=self.model)
-        raw_response = thread.read(include_turns=include_turns)
+        sdk = self._sdk()
+        with self._new_codex(sdk, env=env, workdir=None) as codex:
+            thread = codex.thread_resume(str(agent.thread_id), model=self.model)
+            raw_response = thread.read(include_turns=include_turns)
         raw_thread = getattr(raw_response, "thread", raw_response)
         raw_turns = list(getattr(raw_thread, "turns", []) or [])
         turns = _coerce_turns(raw_turns)
@@ -307,72 +319,78 @@ class CodexProvider:
             return bool(result)
         return False
 
-    def close_home(self, home_id: str, *, force: bool = False) -> bool:
-        with self._lock:
-            return self._close_home_locked(home_id, force=force)
-
-    def close_idle_homes(self) -> int:
-        with self._lock:
-            return self._evict_idle_homes_locked(force=True)
-
-    def close_all(self, *, force: bool = False) -> None:
-        with self._lock:
-            for home_id in list(self._homes):
-                self._close_home_locked(home_id, force=force)
-
     def list_active_agents(self, home_id: str | None = None) -> list[str]:
         with self._lock:
-            if home_id is not None:
-                state = self._homes.get(home_id)
-                if state is None:
-                    return []
-                return sorted(state.active_agent_ids)
-            return sorted(self._agent_runs)
+            if home_id is None:
+                return sorted(self._agent_runs)
+            return sorted(
+                agent_id
+                for agent_id, run in self._agent_runs.items()
+                if run.home_id == home_id
+            )
 
-    def _get_or_start_home(
+    def close(self) -> None:
+        return None
+
+    def ensure_home_initialized(
         self,
         *,
         home_id: str,
         home_root: Path,
         env: Mapping[str, str],
         workdir: str | None,
-    ) -> _CodexHomeState:
+    ) -> CodexHomeInitializationRecord:
         resolved_home_root = Path(home_root)
-        with self._lock:
-            state = self._homes.get(home_id)
-            if state is not None and not state.closed:
-                if state.home_root != resolved_home_root:
-                    raise ValueError(
-                        f"home_id {home_id!r} was already started at {state.home_root}, "
-                        f"cannot reuse it at {resolved_home_root}"
-                    )
-                state.last_used_at = utc_now_iso()
-                return state
+        existing = self._read_initialization_marker(home_id, resolved_home_root)
+        if existing is not None:
+            return existing
+        init_lock = self._home_init_lock(home_id, resolved_home_root)
+        with init_lock:
+            existing = self._read_initialization_marker(home_id, resolved_home_root)
+            if existing is not None:
+                return existing
             sdk = self._sdk()
-            codex = sdk.Codex(config=self._sdk_config(sdk, env=env, workdir=workdir))
-            state = _CodexHomeState(
+            codex_root = resolved_home_root / ".codex"
+            codex_root.mkdir(parents=True, exist_ok=True)
+            with self._new_codex(sdk, env=env, workdir=workdir) as codex:
+                account = getattr(codex, "account", None)
+                if callable(account):
+                    account()
+            missing = self._missing_state_databases(resolved_home_root)
+            if missing:
+                joined = ", ".join(missing)
+                raise RuntimeError(f"Codex home initialization did not create required state databases: {joined}")
+            initialized_at = utc_now_iso()
+            marker_path = self._home_marker_path(resolved_home_root)
+            payload = {
+                "schema_version": 1,
+                "object_type": "codex_home_initialization",
+                "home_id": home_id,
+                "home_root": str(resolved_home_root),
+                "initialized_at": initialized_at,
+                "required_state_databases": list(self.REQUIRED_STATE_DATABASES),
+            }
+            write_json_atomic(marker_path, payload)
+            return CodexHomeInitializationRecord(
                 home_id=home_id,
-                home_root=resolved_home_root,
-                codex=codex,
-                last_used_at=utc_now_iso(),
+                home_root=str(resolved_home_root),
+                initialized_at=initialized_at,
+                marker_path=str(marker_path),
             )
-            self._homes[home_id] = state
-            self._evict_idle_homes_locked()
-            return state
 
     def _begin_agent_run(
         self,
-        home: _CodexHomeState,
+        *,
+        home_id: str,
         agent_id: str,
         thread_id: str | None = None,
     ) -> None:
         with self._lock:
             if agent_id in self._agent_runs:
                 raise RuntimeError(f"agent is already active in CodexProvider: {agent_id}")
-            home.active_agent_ids.add(agent_id)
             self._agent_runs[agent_id] = _CodexAgentRun(
                 agent_id=agent_id,
-                home_id=home.home_id,
+                home_id=home_id,
                 thread_id=thread_id,
             )
 
@@ -391,50 +409,61 @@ class CodexProvider:
                 run.thread_id = thread_id
             if turn_id is not None:
                 run.turn_id = turn_id
-            home = self._homes.get(run.home_id)
-            if home is not None:
-                home.active_agent_ids.discard(agent_id)
-                home.last_used_at = utc_now_iso()
-            self._evict_idle_homes_locked()
 
-    def _evict_idle_homes_locked(self, *, force: bool = False) -> int:
-        if not force and len(self._homes) <= self.max_idle_homes:
-            return 0
-        idle = sorted(
-            [state for state in self._homes.values() if not state.active_agent_ids],
-            key=lambda state: state.last_used_at,
+    def _home_init_lock(self, home_id: str, home_root: Path) -> threading.Lock:
+        key = (home_id, str(home_root.resolve()))
+        with self._lock:
+            lock = self._home_init_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._home_init_locks[key] = lock
+            return lock
+
+    def _read_initialization_marker(
+        self,
+        home_id: str,
+        home_root: Path,
+    ) -> CodexHomeInitializationRecord | None:
+        marker_path = self._home_marker_path(home_root)
+        if not marker_path.exists():
+            return None
+        missing = self._missing_state_databases(home_root)
+        if missing:
+            return None
+        payload = read_json(marker_path)
+        if str(payload.get("home_id", "")) != home_id:
+            return None
+        return CodexHomeInitializationRecord(
+            home_id=str(payload["home_id"]),
+            home_root=str(payload.get("home_root", home_root)),
+            initialized_at=str(payload.get("initialized_at", "")),
+            marker_path=str(marker_path),
         )
-        closed = 0
-        for state in idle:
-            if not force and len(self._homes) <= self.max_idle_homes:
-                break
-            if self._close_home_locked(state.home_id, force=False):
-                closed += 1
-        return closed
 
-    def _close_home_locked(self, home_id: str, *, force: bool) -> bool:
-        state = self._homes.get(home_id)
-        if state is None:
-            return True
-        if state.active_agent_ids and not force:
-            return False
-        self._close_codex_object(state.codex)
-        state.closed = True
-        self._homes.pop(home_id, None)
-        if force:
-            for agent_id, run in list(self._agent_runs.items()):
-                if run.home_id == home_id:
-                    self._agent_runs.pop(agent_id, None)
-        return True
+    def _missing_state_databases(self, home_root: Path) -> list[str]:
+        codex_root = Path(home_root) / ".codex"
+        return [name for name in self.REQUIRED_STATE_DATABASES if not (codex_root / name).exists()]
+
+    def _home_marker_path(self, home_root: Path) -> Path:
+        return Path(home_root) / ".ark" / "codex_home_initialized.json"
+
+    @contextmanager
+    def _new_codex(self, sdk, *, env: Mapping[str, str], workdir: str | None) -> Iterator[object]:
+        codex = sdk.Codex(config=self._sdk_config(sdk, env=env, workdir=workdir))
+        enter = getattr(codex, "__enter__", None)
+        if callable(enter):
+            with codex as entered:
+                yield entered
+            return
+        try:
+            yield codex
+        finally:
+            self._close_codex_object(codex)
 
     def _close_codex_object(self, codex: object) -> None:
         close = getattr(codex, "close", None)
         if callable(close):
             close()
-            return
-        exit_method = getattr(codex, "__exit__", None)
-        if callable(exit_method):
-            exit_method(None, None, None)
 
     def _sdk(self):
         if self.sdk_python_root is not None:

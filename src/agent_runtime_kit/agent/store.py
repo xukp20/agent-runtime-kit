@@ -81,7 +81,9 @@ class AgentStoreService:
         if scope_id is not None:
             scope_key = encode_scope_id(scope_id)
             index_path = self._scope_index_path(scope_key)
-            if not index_path.exists():
+            index_exists = index_path.exists()
+            self._ensure_scope_schema(scope_key)
+            if not index_exists:
                 self.rebuild_scope_index(scope_id)
             query = "select agent_relpath from agents"
             params: list[str] = []

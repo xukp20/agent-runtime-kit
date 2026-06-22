@@ -71,7 +71,7 @@ def test_real_codex_minimal_run_resume_store_and_pause(tmp_path: Path) -> None:
         assert len(service.read_rollout_events(agent.agent_id)) > before_events
         assert service.read_latest_turn_result(agent.agent_id) is not None
     finally:
-        service.close(force_provider_homes=True)
+        service.close()
 
 
 def test_real_codex_developer_instruction_override_on_resume(tmp_path: Path) -> None:
@@ -119,7 +119,7 @@ def test_real_codex_developer_instruction_override_on_resume(tmp_path: Path) -> 
         assert second_agent.thread_id == first_agent.thread_id
         assert "ARK_DYNAMIC_INSTRUCTION_SECOND" in second_text
     finally:
-        service.close(force_provider_homes=True)
+        service.close()
 
 
 def test_real_codex_multi_scope_snapshot_flow(tmp_path: Path) -> None:
@@ -167,7 +167,7 @@ def test_real_codex_multi_scope_snapshot_flow(tmp_path: Path) -> None:
         assert snapshot_service.list_scope_snapshots()
         assert snapshot_service.list_runtime_snapshots()
     finally:
-        service.close(force_provider_homes=True)
+        service.close()
 
 
 def _service(runtime_root: Path) -> AgentService:
@@ -217,17 +217,17 @@ def _ensure_real_codex_enabled() -> None:
         pytest.skip("codex binary is not available")
     sdk_root = _sdk_python_root()
     if importlib.util.find_spec("openai_codex") is None and sdk_root is None:
-        pytest.skip("openai_codex is not installed and ARK_CODEX_SDK_PYTHON_ROOT is not set")
+        pytest.skip("openai_codex is not installed and no local SDK root is available")
 
 
 def _sdk_python_root() -> Path | None:
     value = os.environ.get("ARK_CODEX_SDK_PYTHON_ROOT")
-    if not value:
+    root = Path(value) if value else Path("/root/code/tools/codex/sdk/python")
+    if not root.exists():
         return None
-    root = Path(value)
     src = root / "src"
     if not (src / "openai_codex").exists():
-        pytest.skip(f"invalid ARK_CODEX_SDK_PYTHON_ROOT: {root}")
+        pytest.skip(f"invalid Codex SDK Python root: {root}")
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
     return root

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import re
 import shutil
 import sqlite3
 from dataclasses import dataclass, field
@@ -210,8 +212,7 @@ class HomeService:
         skills_root = agents_root / "skills"
         codex_root.mkdir(parents=True, exist_ok=True)
         skills_root.mkdir(parents=True, exist_ok=True)
-        if spec.base_config_path is not None:
-            shutil.copyfile(spec.base_config_path, codex_root / "config.toml")
+        self._write_codex_config(codex_root / "config.toml", spec)
         if spec.auth_json_path is not None:
             shutil.copyfile(spec.auth_json_path, codex_root / "auth.json")
         self._validate_skill_inputs(spec)
@@ -243,6 +244,18 @@ class HomeService:
             if validate_skill_name(skill_name) != skill_spec.name:
                 raise ValueError(f"skill spec key must match SkillSpec.name: {skill_name} != {skill_spec.name}")
 
+    def _write_codex_config(self, config_path: Path, spec: HomeCreateSpec) -> None:
+        if spec.base_config_path is None and not spec.mcp_servers:
+            return
+        if spec.base_config_path is not None:
+            text = spec.base_config_path.read_text(encoding="utf-8")
+        else:
+            text = ""
+        if spec.mcp_servers:
+            text = text.rstrip() + "\n\n" + _render_mcp_servers_toml(spec.mcp_servers)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(text, encoding="utf-8")
+
     def get_home(self, cli_type: str, home_id: str) -> HomeRecord:
         return self.store.get_home(cli_type, home_id)
 
@@ -268,6 +281,69 @@ def build_provider_env(
         env["HOME"] = str(home_root)
         env["CODEX_HOME"] = str(home_root / ".codex")
     return env
+
+
+def _render_mcp_servers_toml(servers: list[McpServerSpec]) -> str:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for server in servers:
+        name = server.name.strip()
+        if not name:
+            raise ValueError("MCP server name must not be empty")
+        if name in seen:
+            raise ValueError(f"duplicate MCP server name: {name}")
+        seen.add(name)
+        lines.append(f"[mcp_servers.{_toml_key(name)}]")
+        if server.transport and server.url and server.transport != "http":
+            lines.append(f"transport = {_toml_value(server.transport)}")
+        for field_name in [
+            "enabled",
+            "url",
+            "command",
+            "args",
+            "cwd",
+            "startup_timeout_sec",
+            "tool_timeout_sec",
+            "required",
+            "enabled_tools",
+            "disabled_tools",
+            "env_vars",
+            "bearer_token_env_var",
+        ]:
+            value = getattr(server, field_name)
+            if value is None:
+                continue
+            if isinstance(value, list) and not value:
+                continue
+            lines.append(f"{field_name} = {_toml_value(value)}")
+        for table_name in ["env", "http_headers", "env_http_headers"]:
+            values = getattr(server, table_name)
+            if not values:
+                continue
+            lines.append("")
+            lines.append(f"[mcp_servers.{_toml_key(name)}.{table_name}]")
+            for key, value in sorted(values.items()):
+                lines.append(f"{_toml_key(key)} = {_toml_value(value)}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _toml_key(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        return value
+    return json.dumps(value)
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    raise TypeError(f"unsupported TOML value: {value!r}")
 
 
 def _home_from_row(row: tuple) -> HomeRecord:

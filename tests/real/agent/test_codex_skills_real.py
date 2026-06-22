@@ -60,7 +60,7 @@ def test_real_codex_developer_instructions_and_skills(tmp_path: Path) -> None:
             expected="ARK_SPEC_SKILL_SEEN",
         )
     finally:
-        service.close(force_provider_homes=True)
+        service.close()
 
 
 def _run_and_assert_latest_text(service: AgentService, agent_id: str, *, prompt: str, expected: str) -> None:
@@ -127,17 +127,17 @@ def _ensure_real_codex_enabled() -> None:
         pytest.skip("codex binary is not available")
     sdk_root = _sdk_python_root()
     if importlib.util.find_spec("openai_codex") is None and sdk_root is None:
-        pytest.skip("openai_codex is not installed and ARK_CODEX_SDK_PYTHON_ROOT is not set")
+        pytest.skip("openai_codex is not installed and no local SDK root is available")
 
 
 def _sdk_python_root() -> Path | None:
     value = os.environ.get("ARK_CODEX_SDK_PYTHON_ROOT")
-    if not value:
+    root = Path(value) if value else Path("/root/code/tools/codex/sdk/python")
+    if not root.exists():
         return None
-    root = Path(value)
     src = root / "src"
     if not (src / "openai_codex").exists():
-        pytest.skip(f"invalid ARK_CODEX_SDK_PYTHON_ROOT: {root}")
+        pytest.skip(f"invalid Codex SDK Python root: {root}")
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
     return root
@@ -150,4 +150,3 @@ def _config_dir() -> Path:
     if not (path / "config.toml").exists() or not (path / "auth.json").exists():
         pytest.skip(f"Codex config dir must contain config.toml and auth.json: {path}")
     return path
-

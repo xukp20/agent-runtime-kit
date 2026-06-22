@@ -94,6 +94,7 @@ class ScopeSnapshotResult:
     scope_id: str
     status: str
     running_agent_ids: tuple[str, ...] = ()
+    running_step_ids: tuple[str, ...] = ()
     errors: dict[str, BaseException] = field(default_factory=dict)
     snapshot_relpath: str | None = None
 
@@ -104,6 +105,7 @@ class RuntimeSnapshotResult:
     status: str
     scope_snapshot_ids: dict[str, str] = field(default_factory=dict)
     blocked_scope_ids: tuple[str, ...] = ()
+    running_step_ids: tuple[str, ...] = ()
     errors: dict[str, BaseException] = field(default_factory=dict)
     snapshot_relpath: str | None = None
 

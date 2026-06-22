@@ -43,8 +43,8 @@ class FakeProvider:
         self.next_thread = 1
         self.next_turn = 1
         self.calls: list[dict[str, object]] = []
-        self.close_home_calls: list[dict[str, object]] = []
-        self.close_all_calls: list[dict[str, object]] = []
+        self.ensure_home_initialized_calls: list[dict[str, object]] = []
+        self.close_calls = 0
         self.interrupt_calls: list[str] = []
         self.active_by_home: dict[str, set[str]] = {}
         self.max_active_by_home: dict[str, int] = {}
@@ -169,12 +169,25 @@ class FakeProvider:
         self.interrupt_calls.append(agent_id)
         return False
 
-    def close_home(self, home_id: str, *, force: bool = False) -> bool:
-        self.close_home_calls.append({"home_id": home_id, "force": force})
-        return True
+    def ensure_home_initialized(
+        self,
+        *,
+        home_id: str,
+        home_root: Path,
+        env: dict[str, str],
+        workdir: str | None,
+    ) -> dict[str, object]:
+        call = {
+            "home_id": home_id,
+            "home_root": str(home_root),
+            "env": dict(env),
+            "workdir": workdir,
+        }
+        self.ensure_home_initialized_calls.append(call)
+        return call
 
-    def close_all(self, *, force: bool = False) -> None:
-        self.close_all_calls.append({"force": force})
+    def close(self) -> None:
+        self.close_calls += 1
 
     def list_active_agents(self, home_id: str | None = None) -> list[str]:
         with self._lock:
@@ -216,6 +229,7 @@ class FakeProvider:
             "workdir": workdir,
             "env_home": env.get("HOME"),
             "env_codex_home": env.get("CODEX_HOME"),
+            "env": dict(env),
             "home_id": home_id,
             "agent_id": agent_id,
         }

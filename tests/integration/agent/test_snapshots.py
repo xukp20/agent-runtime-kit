@@ -69,8 +69,6 @@ def test_scope_restore_replaces_scope_and_rollout_from_snapshot(tmp_path: Path) 
     restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
 
     assert restored.status == "created"
-    provider = service.providers["codex"]
-    assert provider.close_home_calls == [{"home_id": "worker", "force": False}]
     events = service.read_rollout_events(agent.agent_id)
     assert events[-1]["prompt"] == "Start first."
     assert service.get_agent(agent.agent_id).scope_id == "scope-a"
@@ -96,9 +94,6 @@ def test_runtime_synchronized_snapshot_and_restore(tmp_path: Path) -> None:
     restored = snapshot_service.restore_runtime_snapshot(runtime_snapshot.snapshot_id)
 
     assert restored.status == "created"
-    provider = service.providers["codex"]
-    assert len(provider.close_home_calls) >= 1
-    assert {"home_id": "worker", "force": False} in provider.close_home_calls
     assert service.get_agent(agent_b.agent_id).status == "idle"
     assert len(snapshot_service.list_runtime_snapshots()) == 1
 

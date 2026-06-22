@@ -1,4 +1,5 @@
 from pathlib import Path
+from time import monotonic
 
 import pytest
 
@@ -89,6 +90,59 @@ def test_agent_service_supports_run_level_template_overrides_on_resume(tmp_path:
     assert provider.calls[0]["thread_id"] == provider.calls[1]["thread_id"]
     assert provider.calls[0]["overwrite_developer_instructions"] is True
     assert provider.calls[1]["overwrite_developer_instructions"] is True
+
+
+def test_agent_service_passes_run_level_env_on_each_start(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("repo:node", "worker")
+
+    service.wait_agent(
+        service.start_agent(
+            agent.agent_id,
+            variables={"item": "alpha"},
+            env={"ARK_STEP_ID": "step-a", "ARK_RUN_TOKEN": "token-a"},
+        ).agent_id
+    )
+    service.wait_agent(
+        service.start_agent(
+            agent.agent_id,
+            variables={"item": "beta"},
+            env={"ARK_STEP_ID": "step-b", "ARK_RUN_TOKEN": "token-b"},
+        ).agent_id
+    )
+
+    assert provider.calls[0]["env"]["ARK_STEP_ID"] == "step-a"
+    assert provider.calls[0]["env"]["ARK_RUN_TOKEN"] == "token-a"
+    assert provider.calls[1]["env"]["ARK_STEP_ID"] == "step-b"
+    assert provider.calls[1]["env"]["ARK_RUN_TOKEN"] == "token-b"
+    assert provider.calls[0]["env"]["CODEX_HOME"] == str(runtime_root / "homes" / "codex" / "worker" / ".codex")
+    assert provider.calls[1]["env"]["CODEX_HOME"] == str(runtime_root / "homes" / "codex" / "worker" / ".codex")
+
+
+def test_agent_service_create_home_can_initialize_provider_home(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+
+    service.create_home(
+        HomeCreateSpec(cli_type="codex", home_id="worker"),
+        env={"ARK_BOOT_TOKEN": "boot"},
+        workdir=str(tmp_path / "work"),
+    )
+
+    assert provider.ensure_home_initialized_calls == [
+        {
+            "home_id": "worker",
+            "home_root": str(runtime_root / "homes" / "codex" / "worker"),
+            "env": provider.ensure_home_initialized_calls[0]["env"],
+            "workdir": str(tmp_path / "work"),
+        }
+    ]
+    env = provider.ensure_home_initialized_calls[0]["env"]
+    assert env["ARK_BOOT_TOKEN"] == "boot"
+    assert env["HOME"] == str(runtime_root / "homes" / "codex" / "worker")
+    assert env["CODEX_HOME"] == str(runtime_root / "homes" / "codex" / "worker" / ".codex")
 
 
 def test_agent_service_prompt_direct_text_still_beats_start_template_override(tmp_path: Path) -> None:
@@ -217,6 +271,45 @@ def test_agent_service_runs_same_home_agents_concurrently(tmp_path: Path) -> Non
     assert service.is_stable()
 
 
+def test_wait_agents_uses_one_shared_timeout_budget(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, _provider = _make_service(runtime_root, BasicAgentType(), run_delay_s=0.25)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent_a = service.create_agent("scope", "worker")
+    agent_b = service.create_agent("scope", "worker")
+    service.start_agent(agent_a.agent_id, variables={"item": "a"})
+    service.start_agent(agent_b.agent_id, variables={"item": "b"})
+
+    started = monotonic()
+    waited = service.wait_agents([agent_a.agent_id, agent_b.agent_id], timeout_s=0.05)
+    elapsed = monotonic() - started
+
+    assert waited.timeout is True
+    assert set(waited.pending) == {agent_a.agent_id, agent_b.agent_id}
+    assert elapsed < 0.2
+    assert service.wait_agents([agent_a.agent_id, agent_b.agent_id], timeout_s=2).clean
+
+
+def test_reconcile_stale_running_agents_repairs_only_inactive_scope(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, _provider = _make_service(runtime_root, BasicAgentType(), run_delay_s=0.2)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    stale_a = service.create_agent("scope-a", "worker")
+    stale_b = service.create_agent("scope-b", "worker")
+    active = service.create_agent("scope-a", "worker")
+    service.store.patch_agent(stale_a.agent_id, status="running")
+    service.store.patch_agent(stale_b.agent_id, status="running")
+    service.start_agent(active.agent_id, variables={"item": "active"})
+
+    repaired_scope_a = service.reconcile_stale_running_agents(scope_id="scope-a")
+
+    assert repaired_scope_a == [stale_a.agent_id]
+    assert service.get_agent(stale_a.agent_id).status == "idle"
+    assert service.get_agent(stale_b.agent_id).status == "running"
+    assert service.get_agent(active.agent_id).status == "running"
+    assert service.wait_agent(active.agent_id, timeout_s=2).prompt == "Start active."
+
+
 def test_agent_service_interrupt_and_close_delegate_to_provider(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     service, provider = _make_service(runtime_root, BasicAgentType())
@@ -225,10 +318,8 @@ def test_agent_service_interrupt_and_close_delegate_to_provider(tmp_path: Path) 
 
     assert service.interrupt_agent(agent.agent_id) is False
     assert provider.interrupt_calls == [agent.agent_id]
-    assert service.close_provider_home("codex", "worker") is True
-    assert provider.close_home_calls == [{"home_id": "worker", "force": False}]
-    service.close(force_provider_homes=True)
-    assert provider.close_all_calls == [{"force": True}]
+    service.close()
+    assert provider.close_calls == 1
 
 
 def _make_service(
