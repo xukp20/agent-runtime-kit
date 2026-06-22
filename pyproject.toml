@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A lightweight Python runtime kit for provider-backed agents, scoped persistence, snapshots, and simple orchestration primitives."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pydantic>=2,<3"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
