@@ -242,3 +242,75 @@ def test_runtime_snapshot_blocked_scopes_use_final_pending_steps(tmp_path: Path)
     assert result.blocked_scope_ids == ("scope-b",)
     assert result.running_step_ids == ("stale-running-step",)
     assert step_service.wait_step(active_step.step_id, timeout_s=2).status is StepStatus.COMPLETED
+
+
+def test_selective_runtime_snapshot_restore_rebuilds_queue_and_reuses_other_scope(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    flow_service, step_service, scheduler, snapshot_service, ark = make_services(runtime_root)
+    flow_a = flow_service.start_flow(FlowRequest(flow_type="snapshot_flow", scope_id="scope-a", params={}), enqueue=False)
+    flow_b = flow_service.start_flow(FlowRequest(flow_type="snapshot_flow", scope_id="scope-b", params={}), enqueue=False)
+    step_a = flow_service.advance_flow(flow_a)
+    assert step_a is not None
+    initial_b = snapshot_service.create_scope_snapshot("scope-b")
+    assert initial_b.snapshot_id is not None
+
+    runtime_snapshot = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-a"],
+        scope_ids=["scope-a", "scope-b"],
+    )
+
+    assert runtime_snapshot.status == "created"
+    assert runtime_snapshot.snapshot_id is not None
+    assert runtime_snapshot.scope_snapshot_ids["scope-b"] == initial_b.snapshot_id
+    step_service.run_step(step_a)
+    flow_service.store.update_flow_record(
+        flow_a,
+        lambda flow: (setattr(flow, "status", FlowStatus.COMPLETED), setattr(flow, "result", BaseFlowResult(result_type="mutated"))),
+    )
+
+    restored = snapshot_service.restore_runtime_snapshot(runtime_snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    assert ark.pause_controller is not None
+    assert ark.pause_controller.is_paused(None) is True
+    assert flow_service.get_flow(flow_a).status is FlowStatus.CREATED
+    assert step_service.wait_step(step_a).status is StepStatus.CREATED
+
+    ark.pause_controller.resume(None)
+    tick = scheduler.schedule_ready()
+    assert tick.started_step_ids == [step_a]
+    assert step_service.wait_step(step_a).status is StepStatus.COMPLETED
+    assert flow_service.get_flow(flow_b).status is FlowStatus.CREATED
+
+
+def test_selective_runtime_snapshot_does_not_block_on_unrefreshed_running_step(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    flow_service, step_service, _, snapshot_service, _ = make_services(runtime_root)
+    flow_a = flow_service.start_flow(FlowRequest(flow_type="snapshot_flow", scope_id="scope-a", params={}), enqueue=False)
+    flow_b = flow_service.start_flow(FlowRequest(flow_type="snapshot_flow", scope_id="scope-b", params={}), enqueue=False)
+    initial_a = snapshot_service.create_scope_snapshot("scope-a")
+    initial_b = snapshot_service.create_scope_snapshot("scope-b")
+    assert initial_a.snapshot_id is not None
+    assert initial_b.snapshot_id is not None
+    running_b = SnapshotStep(
+        step_id="unrefreshed-running-step",
+        flow_id=flow_b,
+        scope_id="scope-b",
+        status=StepStatus.RUNNING,
+        state=SnapshotStepState(),
+    )
+    step_service.create_step(running_b, enqueue=False)
+    flow_service.store.update_flow_record(
+        flow_b,
+        lambda flow: (flow.step_ids.append(running_b.step_id), setattr(flow, "current_step_id", running_b.step_id)),
+    )
+
+    runtime_snapshot = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-a"],
+        scope_ids=["scope-a", "scope-b"],
+        wait=False,
+    )
+
+    assert runtime_snapshot.status == "created"
+    assert runtime_snapshot.scope_snapshot_ids["scope-a"] != initial_a.snapshot_id
+    assert runtime_snapshot.scope_snapshot_ids["scope-b"] == initial_b.snapshot_id

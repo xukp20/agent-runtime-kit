@@ -30,7 +30,7 @@ from agent_runtime_kit.flow import (
 )
 from agent_runtime_kit.flow.rendering import RenderContext
 from agent_runtime_kit.flow.standard_steps import AgentStep, AgentStepState, DispatchStep
-from agent_runtime_kit.runtime import ARKServices, AppServices
+from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimeMcpToolGateway
 
 
 class CallbackParentParams(BaseModel):
@@ -161,7 +161,9 @@ class CallbackChildFlow(BaseFlow):
 class CallbackAgentService:
     def __init__(self, ark: ARKServices) -> None:
         self.ark = ark
+        self.gateway = RuntimeMcpToolGateway(ark_services=ark, app_services=AppServices())
         self.started: list[dict[str, object]] = []
+        self.agents: dict[str, Agent] = {}
 
     def create_agent(
         self,
@@ -170,13 +172,18 @@ class CallbackAgentService:
         cli_type: str = "codex",
         home_id: str | None = None,
     ) -> Agent:
-        return Agent(
+        agent = Agent(
             agent_id="callback-agent",
             scope_id=scope_id,
             agent_type=agent_type,
             cli_type=cli_type,
             home_id=home_id or agent_type,
         )
+        self.agents[agent.agent_id] = agent
+        return agent
+
+    def get_agent(self, agent_id: str) -> Agent:
+        return self.agents[agent_id]
 
     def start_agent(
         self,
@@ -188,22 +195,20 @@ class CallbackAgentService:
         workdir: str | None = None,
     ) -> Agent:
         assert env is not None
-        step_id = env["ARK_STEP_ID"]
-        step = self.ark.flow_service.get_step(step_id)
+        runtime_ctx = self.gateway.resolve_context_from_env(env, require_running_step=True)
+        step = runtime_ctx.step
         self.started.append(
             {
                 "agent_id": agent_id,
-                "step_id": step_id,
+                "step_id": step.step_id,
                 "prompt": prompt,
                 "prompt_mode": getattr(step.state, "prompt_mode", None),
             }
         )
 
-        def write_submission(current_step):
-            if current_step.submission is not None:
-                return
-            if getattr(current_step.state, "prompt_mode", None) == "callback":
-                current_step.submission = BaseSubmission(
+        if step.submission is None:
+            if getattr(step.state, "prompt_mode", None) == "callback":
+                submission = BaseSubmission(
                     submission_id="callback-submission",
                     submission_type="result",
                     tool_name="submit_callback_result",
@@ -211,7 +216,7 @@ class CallbackAgentService:
                     summary="callback consumed child result",
                 )
             else:
-                current_step.submission = ChildFlowDispatchSubmission(
+                submission = ChildFlowDispatchSubmission(
                     submission_id="dispatch-submission",
                     tool_name="submit_child_flows",
                     submitted_by_agent_id=agent_id,
@@ -220,9 +225,8 @@ class CallbackAgentService:
                     ],
                     summary="dispatch child flow",
                 )
-
-        self.ark.flow_service.store.update_step_record(step_id, write_submission)
-        return Agent(agent_id=agent_id, scope_id="scope", agent_type="planner_type", cli_type="codex", home_id="planner_type")
+            self.gateway.accept_step_submission(runtime_ctx, submission)
+        return self.get_agent(agent_id)
 
     def wait_agent(self, agent_id: str, timeout_s: float | None = None) -> object:
         return SimpleNamespace(id=f"turn-{len(self.started)}")

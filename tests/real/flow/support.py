@@ -59,7 +59,7 @@ from agent_runtime_kit.flow import (
 )
 from agent_runtime_kit.flow.rendering import RenderContext
 from agent_runtime_kit.flow.standard_steps import AgentStep, AgentStepState, DispatchStep
-from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimePauseController
+from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimeMcpToolGateway, RuntimePauseController, RuntimeToolContext
 
 
 pytestmark = pytest.mark.real_codex
@@ -472,6 +472,7 @@ class RealFlowSubmitBridge:
     def __init__(self, *, ark: ARKServices, app: AppServices) -> None:
         self.ark = ark
         self.app = app
+        self.gateway = RuntimeMcpToolGateway(ark_services=ark, app_services=app)
         self.host = "127.0.0.1"
         self.port = _free_tcp_port()
         self.url = f"http://{self.host}:{self.port}/mcp"
@@ -516,7 +517,11 @@ class RealFlowSubmitBridge:
 
         @mcp.tool()
         def ark_submit_result(summary: str, ctx: Context) -> str:
-            identity = bridge._identity_from_context(ctx)
+            identity = bridge._identity_from_context(
+                ctx,
+                require_running_step=True,
+                allowed_submit_tool_name="ark_submit_result",
+            )
             submission = BaseSubmission(
                 submission_id=f"sub_{uuid.uuid4().hex}",
                 submission_type="result",
@@ -530,8 +535,12 @@ class RealFlowSubmitBridge:
 
         @mcp.tool()
         def ark_submit_child_flows(names_csv: str, ctx: Context, child_flow_type: str = "real_logic_child") -> str:
-            identity = bridge._identity_from_context(ctx)
-            step = bridge._flow_service().get_step(identity.step_id)
+            identity = bridge._identity_from_context(
+                ctx,
+                require_running_step=True,
+                allowed_submit_tool_name="ark_submit_child_flows",
+            )
+            step = identity.runtime_ctx.step
             names = [name.strip() for name in names_csv.split(",") if name.strip()]
             submission = ChildFlowDispatchSubmission(
                 submission_id=f"dispatch_{uuid.uuid4().hex}",
@@ -553,7 +562,11 @@ class RealFlowSubmitBridge:
 
         @mcp.tool()
         def ark_sleep_then_submit(seconds: float, summary: str, ctx: Context) -> str:
-            identity = bridge._identity_from_context(ctx)
+            identity = bridge._identity_from_context(
+                ctx,
+                require_running_step=True,
+                allowed_submit_tool_name="ark_sleep_then_submit",
+            )
             bridge.sleep_started.set()
             time.sleep(float(seconds))
             submission = BaseSubmission(
@@ -595,25 +608,29 @@ class RealFlowSubmitBridge:
                 time.sleep(0.05)
         raise TimeoutError(f"MCP bridge did not start on {self.host}:{self.port}")
 
-    def _identity_from_context(self, ctx: Any) -> "_BridgeIdentity":
+    def _identity_from_context(
+        self,
+        ctx: Any,
+        *,
+        require_running_step: bool = False,
+        allowed_submit_tool_name: str | None = None,
+    ) -> "_BridgeIdentity":
         headers = _headers_from_context(ctx)
-        step_id = _header_value(headers, "x-ark-step-id")
-        flow_id = _header_value(headers, "x-ark-flow-id")
-        agent_id = _header_value(headers, "x-ark-agent-id")
-        if not step_id or not flow_id or not agent_id:
-            raise FlowStepValidationError(f"missing ARK identity headers: {headers!r}")
-        return _BridgeIdentity(step_id=step_id, flow_id=flow_id, agent_id=agent_id, headers=headers)
+        runtime_ctx = self.gateway.resolve_context_from_http_headers(
+            headers,
+            require_running_step=require_running_step,
+            allowed_submit_tool_name=allowed_submit_tool_name,
+        )
+        return _BridgeIdentity(
+            step_id=runtime_ctx.identity.step_id,
+            flow_id=runtime_ctx.identity.flow_id,
+            agent_id=runtime_ctx.identity.agent_id,
+            headers=headers,
+            runtime_ctx=runtime_ctx,
+        )
 
     def _accept_submission(self, identity: "_BridgeIdentity", submission: BaseSubmission) -> None:
-        step = self._flow_service().get_step(identity.step_id)
-        ctx = StepRunContext(
-            ark=self.ark,
-            app=self.app,
-            step_id=identity.step_id,
-            flow_id=identity.flow_id,
-            scope_id=step.scope_id,
-        )
-        ctx.accept_step_submission(submission)
+        self.gateway.accept_step_submission(identity.runtime_ctx, submission)
 
     def _record_call(self, tool_name: str, identity: "_BridgeIdentity", args: dict[str, Any]) -> None:
         with self.lock:
@@ -641,6 +658,7 @@ class _BridgeIdentity:
     flow_id: str
     agent_id: str
     headers: dict[str, str]
+    runtime_ctx: RuntimeToolContext
 
 
 def make_real_flow_runtime(
@@ -811,7 +829,3 @@ def _headers_from_context(ctx: Any) -> dict[str, str]:
     except AttributeError:
         items = []
     return {str(key).lower(): str(value) for key, value in items}
-
-
-def _header_value(headers: dict[str, str], name: str) -> str | None:
-    return headers.get(name.lower())

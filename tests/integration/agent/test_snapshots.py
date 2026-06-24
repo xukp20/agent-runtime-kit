@@ -98,6 +98,128 @@ def test_runtime_synchronized_snapshot_and_restore(tmp_path: Path) -> None:
     assert len(snapshot_service.list_runtime_snapshots()) == 1
 
 
+def test_runtime_snapshot_for_scopes_validates_parameters(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    service.create_agent("scope-a", "worker")
+    service.create_agent("scope-b", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+
+    empty = snapshot_service.create_runtime_snapshot_for_scopes(refresh_scope_ids=[])
+    unknown = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-c"],
+        scope_ids=["scope-a", "scope-b"],
+    )
+    missing_latest = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-a"],
+        scope_ids=["scope-a", "scope-b"],
+    )
+    partial = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-a"],
+        scope_ids=["scope-a", "scope-b"],
+        reuse_latest_for_other_scopes=False,
+    )
+
+    assert empty.status == "failed"
+    assert "refresh_scope_ids" in empty.errors
+    assert unknown.status == "failed"
+    assert "refresh_scope_ids" in unknown.errors
+    assert missing_latest.status == "failed"
+    assert "latest_scope_snapshot" in missing_latest.errors
+    assert partial.status == "created"
+    assert partial.snapshot_id is not None
+    assert set(partial.scope_snapshot_ids) == {"scope-a"}
+
+
+def test_runtime_snapshot_for_scopes_refreshes_only_selected_scope(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    service.create_agent("scope-a", "worker")
+    service.create_agent("scope-b", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    initial_a = snapshot_service.create_scope_snapshot("scope-a")
+    initial_b = snapshot_service.create_scope_snapshot("scope-b")
+    assert initial_a.snapshot_id is not None
+    assert initial_b.snapshot_id is not None
+
+    runtime_snapshot = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-a"],
+        scope_ids=["scope-a", "scope-b"],
+    )
+
+    assert runtime_snapshot.status == "created"
+    assert runtime_snapshot.snapshot_id is not None
+    assert set(runtime_snapshot.scope_snapshot_ids) == {"scope-a", "scope-b"}
+    assert runtime_snapshot.scope_snapshot_ids["scope-a"] != initial_a.snapshot_id
+    assert runtime_snapshot.scope_snapshot_ids["scope-b"] == initial_b.snapshot_id
+    assert len(snapshot_service.list_scope_snapshots("scope-b")) == 1
+
+
+def test_runtime_snapshot_for_scopes_does_not_block_on_unrefreshed_running_scope(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    service.create_agent("scope-a", "worker")
+    running_agent = service.create_agent("scope-b", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    initial_a = snapshot_service.create_scope_snapshot("scope-a")
+    initial_b = snapshot_service.create_scope_snapshot("scope-b")
+    assert initial_a.snapshot_id is not None
+    assert initial_b.snapshot_id is not None
+    service.store.patch_agent(running_agent.agent_id, status="running")
+
+    runtime_snapshot = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-a"],
+        scope_ids=["scope-a", "scope-b"],
+        wait=False,
+    )
+
+    assert runtime_snapshot.status == "created"
+    assert runtime_snapshot.scope_snapshot_ids["scope-a"] != initial_a.snapshot_id
+    assert runtime_snapshot.scope_snapshot_ids["scope-b"] == initial_b.snapshot_id
+
+
+def test_runtime_snapshot_for_scopes_blocks_on_refreshed_running_scope(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    running_agent = service.create_agent("scope-a", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    service.store.patch_agent(running_agent.agent_id, status="running")
+
+    runtime_snapshot = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-a"],
+        scope_ids=["scope-a"],
+        wait=False,
+    )
+
+    assert runtime_snapshot.status == "blocked"
+    assert runtime_snapshot.blocked_scope_ids == ("scope-a",)
+
+
+def test_runtime_snapshot_for_scopes_under_global_pause_does_not_leak_direct_scope_pause(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    service.create_agent("scope-a", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    assert snapshot_service.ark.pause_controller is not None
+    snapshot_service.ark.pause_controller.pause(None)
+
+    runtime_snapshot = snapshot_service.create_runtime_snapshot_for_scopes(
+        refresh_scope_ids=["scope-a"],
+        scope_ids=["scope-a"],
+    )
+
+    assert runtime_snapshot.status == "created"
+    assert snapshot_service.ark.pause_controller.is_paused("scope-a") is True
+    assert snapshot_service.ark.pause_controller.is_scope_directly_paused("scope-a") is False
+    snapshot_service.ark.pause_controller.resume(None)
+    assert snapshot_service.ark.pause_controller.is_paused("scope-a") is False
+
+
 def test_scope_snapshot_blocks_when_scope_has_running_agent(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     service = _make_service(runtime_root)

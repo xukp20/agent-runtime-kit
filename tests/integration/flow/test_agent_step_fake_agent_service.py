@@ -21,7 +21,7 @@ from agent_runtime_kit.flow import (
     StepTypeRegistry,
 )
 from agent_runtime_kit.flow.standard_steps import AgentStep, AgentStepState
-from agent_runtime_kit.runtime import ARKServices, AppServices
+from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimeMcpToolGateway
 
 
 class AgentStepIntegrationFlowParams(BaseModel):
@@ -62,7 +62,9 @@ class AgentStepIntegrationFlow(BaseFlow):
 class SubmittingAgentService:
     def __init__(self, ark: ARKServices) -> None:
         self.ark = ark
+        self.gateway = RuntimeMcpToolGateway(ark_services=ark, app_services=AppServices())
         self.started: list[dict[str, object]] = []
+        self.agents: dict[str, Agent] = {}
 
     def create_agent(
         self,
@@ -71,13 +73,18 @@ class SubmittingAgentService:
         cli_type: str = "codex",
         home_id: str | None = None,
     ) -> Agent:
-        return Agent(
+        agent = Agent(
             agent_id="agent-1",
             scope_id=scope_id,
             agent_type=agent_type,
             cli_type=cli_type,
             home_id=home_id or agent_type,
         )
+        self.agents[agent.agent_id] = agent
+        return agent
+
+    def get_agent(self, agent_id: str) -> Agent:
+        return self.agents[agent_id]
 
     def start_agent(
         self,
@@ -90,20 +97,23 @@ class SubmittingAgentService:
     ) -> Agent:
         self.started.append({"agent_id": agent_id, "variables": variables or {}, "env": env or {}})
         assert env is not None
-        step_id = env["ARK_STEP_ID"]
-
-        def write_submission(step):
-            if step.submission is None:
-                step.submission = BaseSubmission(
+        runtime_ctx = self.gateway.resolve_context_from_env(
+            env,
+            require_running_step=True,
+            allowed_submit_tool_name="submit_result",
+        )
+        if runtime_ctx.step.submission is None:
+            self.gateway.accept_step_submission(
+                runtime_ctx,
+                BaseSubmission(
                     submission_id="integration-submission",
                     submission_type="result",
                     tool_name="submit_result",
                     submitted_by_agent_id=agent_id,
                     summary="integration submitted",
-                )
-
-        self.ark.flow_service.store.update_step_record(step_id, write_submission)
-        return Agent(agent_id=agent_id, scope_id="scope", agent_type="worker_type", cli_type="codex", home_id="worker_type")
+                ),
+            )
+        return self.get_agent(agent_id)
 
     def wait_agent(self, agent_id: str) -> object:
         return SimpleNamespace(id="turn-1")

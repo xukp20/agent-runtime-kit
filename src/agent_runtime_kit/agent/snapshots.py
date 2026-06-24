@@ -175,6 +175,170 @@ class AgentSnapshotService:
                 if not was_paused:
                     self._resume(None)
 
+    def create_runtime_snapshot_for_scopes(
+        self,
+        *,
+        refresh_scope_ids: list[str],
+        reuse_latest_for_other_scopes: bool = True,
+        scope_ids: list[str] | None = None,
+        wait: bool = False,
+        timeout_s: float | None = None,
+    ) -> RuntimeSnapshotResult:
+        with self._lock:
+            refresh_scope_ids = self._dedupe_scope_ids(refresh_scope_ids)
+            if not refresh_scope_ids:
+                return RuntimeSnapshotResult(
+                    snapshot_id=None,
+                    status="failed",
+                    errors={"refresh_scope_ids": ValueError("refresh_scope_ids must not be empty")},
+                )
+
+            selected_scope_ids = self._dedupe_scope_ids(scope_ids if scope_ids is not None else self.store.list_scope_ids())
+            selected_scope_set = set(selected_scope_ids)
+            refresh_scope_set = set(refresh_scope_ids)
+            unknown_refresh_scope_ids = sorted(refresh_scope_set - selected_scope_set)
+            if unknown_refresh_scope_ids:
+                return RuntimeSnapshotResult(
+                    snapshot_id=None,
+                    status="failed",
+                    errors={
+                        "refresh_scope_ids": ValueError(
+                            "refresh_scope_ids must be contained in scope_ids: "
+                            + ", ".join(unknown_refresh_scope_ids)
+                        )
+                    },
+                )
+
+            latest_scope_snapshot_ids: dict[str, str] = {}
+            if reuse_latest_for_other_scopes:
+                missing_latest_scope_ids: list[str] = []
+                for selected_scope_id in selected_scope_ids:
+                    if selected_scope_id in refresh_scope_set:
+                        continue
+                    latest = self.get_latest_scope_snapshot(selected_scope_id)
+                    if latest is None:
+                        missing_latest_scope_ids.append(selected_scope_id)
+                    else:
+                        latest_scope_snapshot_ids[selected_scope_id] = latest.snapshot_id
+                if missing_latest_scope_ids:
+                    return RuntimeSnapshotResult(
+                        snapshot_id=None,
+                        status="failed",
+                        errors={
+                            "latest_scope_snapshot": ValueError(
+                                "missing latest scope snapshot for: " + ", ".join(missing_latest_scope_ids)
+                            )
+                        },
+                    )
+
+            was_directly_paused = {
+                refresh_scope_id: self._is_scope_directly_paused(refresh_scope_id)
+                for refresh_scope_id in refresh_scope_ids
+            }
+            deadline = self._deadline(timeout_s)
+            for refresh_scope_id in refresh_scope_ids:
+                self._pause(refresh_scope_id)
+            try:
+                running = self._running_agents_for_scopes(refresh_scope_ids)
+                running_steps = self._running_steps_for_scopes(refresh_scope_ids)
+                if (running or running_steps) and not wait:
+                    return RuntimeSnapshotResult(
+                        snapshot_id=None,
+                        status="blocked",
+                        blocked_scope_ids=tuple(sorted(self._blocked_scope_ids(running, running_steps))),
+                        running_step_ids=tuple(running_steps),
+                    )
+
+                if running:
+                    result = self._wait_selected_agents(
+                        [str(agent.agent_id) for agent in running],
+                        timeout_s=self._remaining(deadline),
+                    )
+                    if not getattr(result, "clean", False):
+                        pending_agent_ids = list(getattr(result, "pending", ()))
+                        error_agent_ids = list(getattr(result, "errors", {}).keys())
+                        running_steps_after_agents = self._running_steps_for_scopes(refresh_scope_ids)
+                        return RuntimeSnapshotResult(
+                            snapshot_id=None,
+                            status="blocked",
+                            blocked_scope_ids=tuple(
+                                sorted(
+                                    self._blocked_scope_ids_from_agent_ids(
+                                        pending_agent_ids + error_agent_ids,
+                                        running_steps_after_agents,
+                                    )
+                                )
+                            ),
+                            running_step_ids=tuple(running_steps_after_agents),
+                            errors=dict(getattr(result, "errors", {})),
+                        )
+
+                if running_steps:
+                    pending_steps = self._wait_steps(running_steps, timeout_s=self._remaining(deadline))
+                    pending_steps = [step_id for step_id in pending_steps if step_id in set(self._running_steps_for_scopes(refresh_scope_ids))]
+                    if pending_steps:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=None,
+                            status="blocked",
+                            blocked_scope_ids=tuple(sorted(self._blocked_scope_ids([], pending_steps))),
+                            running_step_ids=tuple(pending_steps),
+                        )
+
+                restorable_errors: dict[str, BaseException] = {}
+                for refresh_scope_id in refresh_scope_ids:
+                    restorable_error = self._flow_restorable_error(refresh_scope_id)
+                    if restorable_error is not None:
+                        restorable_errors[refresh_scope_id] = restorable_error
+                if restorable_errors:
+                    return RuntimeSnapshotResult(
+                        snapshot_id=None,
+                        status="blocked",
+                        blocked_scope_ids=tuple(sorted(restorable_errors)),
+                        errors=restorable_errors,
+                    )
+
+                refreshed_scope_snapshot_ids: dict[str, str] = {}
+                errors: dict[str, BaseException] = {}
+                for refresh_scope_id in refresh_scope_ids:
+                    try:
+                        scope_result = self._create_scope_snapshot_unlocked(refresh_scope_id)
+                        if scope_result.status != "created" or scope_result.snapshot_id is None:
+                            errors[refresh_scope_id] = RuntimeError(
+                                f"failed to create scope snapshot for {refresh_scope_id}: {scope_result.status}"
+                            )
+                        else:
+                            refreshed_scope_snapshot_ids[refresh_scope_id] = scope_result.snapshot_id
+                    except BaseException as exc:
+                        errors[refresh_scope_id] = exc
+                if errors:
+                    return RuntimeSnapshotResult(
+                        snapshot_id=None,
+                        status="failed",
+                        scope_snapshot_ids=refreshed_scope_snapshot_ids,
+                        errors=errors,
+                    )
+
+                if reuse_latest_for_other_scopes:
+                    scope_snapshot_ids = {
+                        selected_scope_id: (
+                            refreshed_scope_snapshot_ids[selected_scope_id]
+                            if selected_scope_id in refreshed_scope_snapshot_ids
+                            else latest_scope_snapshot_ids[selected_scope_id]
+                        )
+                        for selected_scope_id in selected_scope_ids
+                    }
+                else:
+                    scope_snapshot_ids = {
+                        selected_scope_id: refreshed_scope_snapshot_ids[selected_scope_id]
+                        for selected_scope_id in selected_scope_ids
+                        if selected_scope_id in refreshed_scope_snapshot_ids
+                    }
+                return self._create_runtime_snapshot_unlocked(scope_snapshot_ids, status="created")
+            finally:
+                for refresh_scope_id in refresh_scope_ids:
+                    if not was_directly_paused[refresh_scope_id]:
+                        self._resume(refresh_scope_id)
+
     def restore_scope_snapshot(self, snapshot_id: str, *, leave_paused: bool = True) -> ScopeSnapshotResult:
         with self._lock:
             manifest = self._read_scope_manifest(snapshot_id)
@@ -572,6 +736,45 @@ class AgentSnapshotService:
             except BaseException:
                 pass
         return scope_ids | self._blocked_scope_ids([], running_step_ids)
+
+    def _dedupe_scope_ids(self, scope_ids: list[str] | tuple[str, ...]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for scope_id in scope_ids:
+            scope_key = str(scope_id)
+            if scope_key in seen:
+                continue
+            seen.add(scope_key)
+            deduped.append(scope_key)
+        return deduped
+
+    def _running_agents_for_scopes(self, scope_ids: list[str]) -> list[Any]:
+        running: list[Any] = []
+        seen: set[str] = set()
+        for scope_id in scope_ids:
+            for agent in self._running_agents(scope_id):
+                agent_id = str(agent.agent_id)
+                if agent_id in seen:
+                    continue
+                seen.add(agent_id)
+                running.append(agent)
+        return running
+
+    def _running_steps_for_scopes(self, scope_ids: list[str]) -> list[str]:
+        running: list[str] = []
+        seen: set[str] = set()
+        for scope_id in scope_ids:
+            for step_id in self._running_steps(scope_id):
+                if step_id in seen:
+                    continue
+                seen.add(step_id)
+                running.append(step_id)
+        return running
+
+    def _wait_selected_agents(self, agent_ids: list[str], timeout_s: float | None) -> Any:
+        if self.agent_service is None or not hasattr(self.agent_service, "wait_agents"):
+            raise RuntimeError("agent_service with wait_agents is required")
+        return self.agent_service.wait_agents(agent_ids, timeout_s=timeout_s)
 
     def _deadline(self, timeout_s: float | None) -> float | None:
         return None if timeout_s is None else monotonic() + timeout_s
