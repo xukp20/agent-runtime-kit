@@ -277,6 +277,7 @@ def test_standard_dispatch_callback_pattern_runs_end_to_end(tmp_path: Path) -> N
     assert [type(step).__name__ for step in steps] == ["AgentStep", "DispatchStep", "AgentStep"]
     assert steps[0].status is StepStatus.COMPLETED
     assert steps[1].status is StepStatus.COMPLETED
+    assert getattr(steps[1].result, "continuation", None) == "wait_for_callback"
     assert steps[2].status is StepStatus.COMPLETED
     assert len(children) == 1
     assert children[0].status is FlowStatus.COMPLETED

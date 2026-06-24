@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     from mcp.server.fastmcp import Context, FastMCP
@@ -58,7 +58,7 @@ from agent_runtime_kit.flow import (
     on_exit_standard_dispatch_wait,
 )
 from agent_runtime_kit.flow.rendering import RenderContext
-from agent_runtime_kit.flow.standard_steps import AgentStep, AgentStepState, DispatchStep
+from agent_runtime_kit.flow.standard_steps import AgentStep, AgentStepState, DispatchStep, DispatchStepResult
 from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimeMcpToolGateway, RuntimePauseController, RuntimeToolContext
 
 
@@ -286,6 +286,104 @@ class RealDispatchParentFlow(BaseFlow):
         super().on_exit_waiting(ctx)
 
 
+class RealTerminalHandoffParentParams(BaseModel):
+    names_csv: str = "alpha"
+    child_flow_type: str = "real_logic_child"
+
+
+class RealTerminalHandoffParentInput(BaseFlowInput):
+    input_type: str = "real_terminal_handoff_parent_input"
+    names_csv: str
+    child_flow_type: str
+
+    def render_for_agent(self, ctx: RenderContext) -> str:
+        return f"Input: hand off {self.names_csv} as {self.child_flow_type}"
+
+
+class RealTerminalHandoffParentState(BaseFlowState):
+    state_type: str = "real_terminal_handoff_parent_state"
+    handoff_dispatch_step_id: str | None = None
+    handoff_child_flow_ids: list[str] = Field(default_factory=list)
+
+
+class RealTerminalHandoffParentResult(BaseFlowResult):
+    result_type: str = "real_terminal_handoff_parent_done"
+    child_flow_ids: list[str]
+
+    def render_for_agent(self, ctx: RenderContext) -> str:
+        return "Result: terminal handoff dispatched " + ",".join(self.child_flow_ids)
+
+
+class RealTerminalHandoffParentFlow(BaseFlow):
+    flow_type: ClassVar[str] = "real_terminal_handoff_parent"
+    Params: ClassVar[type[BaseModel]] = RealTerminalHandoffParentParams
+    Input: ClassVar[type[BaseFlowInput]] = RealTerminalHandoffParentInput
+    Result: ClassVar[type[BaseFlowResult]] = RealTerminalHandoffParentResult
+    State: ClassVar[type[BaseFlowState]] = RealTerminalHandoffParentState
+
+    @classmethod
+    def build_from_request(cls, ctx: FlowBuildContext) -> "RealTerminalHandoffParentFlow":
+        params = ctx.params
+        assert isinstance(params, RealTerminalHandoffParentParams)
+        return cls(
+            flow_id=ctx.flow_id,
+            scope_id=ctx.scope_id,
+            input=RealTerminalHandoffParentInput(
+                names_csv=params.names_csv,
+                child_flow_type=params.child_flow_type,
+            ),
+            state=RealTerminalHandoffParentState(),
+        )
+
+    def create_next_step(self, ctx: FlowContext) -> str | None:
+        if not isinstance(self.input, RealTerminalHandoffParentInput):
+            raise FlowStepValidationError("RealTerminalHandoffParentFlow has no input")
+        if not self.step_ids:
+            prompt = (
+                "Call MCP tool ark_submit_child_flows exactly once with "
+                f"names_csv='{self.input.names_csv}', child_flow_type='{self.input.child_flow_type}', "
+                "and continuation='terminal_handoff'. Reply with exactly the returned tool result."
+            )
+            return ctx.create_step(
+                AgentStep(
+                    step_id=f"{self.flow_id}-initial-agent",
+                    flow_id=self.flow_id,
+                    scope_id=self.scope_id,
+                    state=AgentStepState(
+                        agent_role="planner",
+                        agent_type=REAL_AGENT_TYPE,
+                        home_id=SUBMIT_HOME_ID,
+                        create_agent_if_missing=True,
+                        bind_created_agent_to="flow",
+                        variables={"prompt": prompt},
+                        prompt_override=prompt,
+                        max_auto_continue_turns=1,
+                        agent_wait_timeout_s=DEFAULT_AGENT_TIMEOUT_S,
+                    ),
+                )
+            )
+        standard_step_id = create_standard_next_step_if_applicable(self, ctx)
+        if standard_step_id is not None:
+            return standard_step_id
+        return None
+
+    def on_step_terminal(self, ctx: FlowStepContext) -> None:
+        if isinstance(ctx.step, DispatchStep) and isinstance(ctx.step.result, DispatchStepResult):
+            if ctx.step.result.outcome == "dispatched" and ctx.step.result.continuation == "terminal_handoff":
+                assert isinstance(self.state, RealTerminalHandoffParentState)
+                self.state.handoff_dispatch_step_id = ctx.step.step_id
+                self.state.handoff_child_flow_ids = list(ctx.step.result.child_flow_ids)
+                self.result = RealTerminalHandoffParentResult(
+                    summary="terminal handoff dispatched",
+                    child_flow_ids=list(ctx.step.result.child_flow_ids),
+                )
+                super().on_step_terminal(ctx)
+                return
+        if handle_standard_step_terminal(self, ctx):
+            return
+        super().on_step_terminal(ctx)
+
+
 class RealLogicChildParams(BaseModel):
     name: str
 
@@ -443,6 +541,7 @@ def build_real_flow_registries() -> tuple[FlowTypeRegistry, StepTypeRegistry]:
     step_registry = StepTypeRegistry()
     flow_registry.register(RealSingleAgentFlow)
     flow_registry.register(RealDispatchParentFlow)
+    flow_registry.register(RealTerminalHandoffParentFlow)
     flow_registry.register(RealLogicChildFlow)
     flow_registry.register(RealAgentChildFlow)
     step_registry.register(AgentStep)
@@ -534,7 +633,12 @@ class RealFlowSubmitBridge:
             return f"ARK_SUBMIT_ACCEPTED::{identity.step_id}::{submission.submission_id}"
 
         @mcp.tool()
-        def ark_submit_child_flows(names_csv: str, ctx: Context, child_flow_type: str = "real_logic_child") -> str:
+        def ark_submit_child_flows(
+            names_csv: str,
+            ctx: Context,
+            child_flow_type: str = "real_logic_child",
+            continuation: str = "wait_for_callback",
+        ) -> str:
             identity = bridge._identity_from_context(
                 ctx,
                 require_running_step=True,
@@ -542,10 +646,13 @@ class RealFlowSubmitBridge:
             )
             step = identity.runtime_ctx.step
             names = [name.strip() for name in names_csv.split(",") if name.strip()]
+            if continuation not in {"wait_for_callback", "terminal_handoff"}:
+                raise ValueError(f"unsupported dispatch continuation: {continuation}")
             submission = ChildFlowDispatchSubmission(
                 submission_id=f"dispatch_{uuid.uuid4().hex}",
                 tool_name="ark_submit_child_flows",
                 submitted_by_agent_id=identity.agent_id,
+                continuation=continuation,
                 summary=f"dispatch {','.join(names)}",
                 requests=[
                     FlowRequest(flow_type=child_flow_type, scope_id=step.scope_id, params={"name": name})
@@ -556,7 +663,7 @@ class RealFlowSubmitBridge:
             bridge._record_call(
                 "ark_submit_child_flows",
                 identity,
-                {"names_csv": names_csv, "child_flow_type": child_flow_type},
+                {"names_csv": names_csv, "child_flow_type": child_flow_type, "continuation": continuation},
             )
             return f"ARK_DISPATCH_ACCEPTED::{identity.step_id}::{submission.submission_id}"
 

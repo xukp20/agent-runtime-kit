@@ -48,6 +48,7 @@ def create_dispatch_step_from_agent_submission(
             source_step_id=source_agent_step_id,
             source_submission_id=source_step.submission.submission_id,
             requests=source_step.submission.requests,
+            continuation=source_step.submission.continuation,
         ),
     )
     return ctx.create_step(dispatch_step)
@@ -66,6 +67,11 @@ def create_followup_agent_step_from_dispatch(
         raise FlowStepValidationError(f"dispatch step {dispatch_step_id} is not completed")
     if not isinstance(dispatch_step.result, DispatchStepResult) or dispatch_step.result.outcome != "dispatched":
         raise FlowStepValidationError(f"dispatch step {dispatch_step_id} did not dispatch child flows")
+    if dispatch_step.result.continuation != "wait_for_callback":
+        raise FlowStepValidationError(
+            f"dispatch step {dispatch_step_id} uses continuation {dispatch_step.result.continuation!r}, "
+            "not wait_for_callback"
+        )
     if not isinstance(dispatch_step.state, DispatchStepState) or not dispatch_step.state.created_children:
         raise FlowStepValidationError(f"dispatch step {dispatch_step_id} has no created child flows")
     if not _all_children_terminal(ctx, dispatch_step):
@@ -105,6 +111,8 @@ def handle_standard_step_terminal(flow: BaseFlow, ctx: FlowStepContext) -> bool:
     if isinstance(ctx.step, DispatchStep):
         if not isinstance(ctx.step.result, DispatchStepResult) or ctx.step.result.outcome != "dispatched":
             return False
+        if ctx.step.result.continuation != "wait_for_callback":
+            return False
         if not hasattr(flow.state, "waiting_dispatch_step_id"):
             raise FlowStepValidationError(
                 f"flow {flow.flow_id} state has no waiting_dispatch_step_id for standard dispatch wait"
@@ -124,6 +132,10 @@ def can_exit_standard_dispatch_wait(flow: BaseFlow, ctx: FlowContext | FlowReadC
     dispatch_step = _get_step_for_current_flow(ctx, dispatch_step_id)
     if not isinstance(dispatch_step, DispatchStep):
         raise FlowStepValidationError(f"waiting dispatch step {dispatch_step_id} is not a DispatchStep")
+    if _dispatch_continuation(dispatch_step) != "wait_for_callback":
+        raise FlowStepValidationError(
+            f"waiting dispatch step {dispatch_step_id} is not a wait_for_callback dispatch"
+        )
     return _all_children_terminal(ctx, dispatch_step)
 
 
@@ -175,10 +187,19 @@ def _dispatch_ready_for_callback(ctx: FlowContext, step) -> bool:
         and step.status is StepStatus.COMPLETED
         and isinstance(step.result, DispatchStepResult)
         and step.result.outcome == "dispatched"
+        and step.result.continuation == "wait_for_callback"
         and isinstance(step.state, DispatchStepState)
         and bool(step.state.created_children)
         and _all_children_terminal(ctx, step)
     )
+
+
+def _dispatch_continuation(dispatch_step: DispatchStep) -> str:
+    if isinstance(dispatch_step.result, DispatchStepResult):
+        return dispatch_step.result.continuation
+    if isinstance(dispatch_step.state, DispatchStepState):
+        return dispatch_step.state.continuation
+    raise FlowStepValidationError(f"dispatch step {dispatch_step.step_id} does not have dispatch state/result")
 
 
 def _all_children_terminal(ctx: FlowContext | FlowReadContext, dispatch_step: DispatchStep) -> bool:

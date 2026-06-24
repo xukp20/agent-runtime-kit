@@ -45,6 +45,7 @@ def test_real_dispatch_callback_with_logic_child(tmp_path: Path) -> None:
 
     initial_step, callback_step = agent_steps
     assert isinstance(initial_step.submission, ChildFlowDispatchSubmission)
+    assert initial_step.submission.continuation == "wait_for_callback"
     assert initial_step.submission.requests
     assert initial_step.agent_bindings.get("planner") == callback_step.agent_bindings.get("planner")
     assert getattr(callback_step.state, "prompt_mode", None) == "callback"
@@ -53,6 +54,7 @@ def test_real_dispatch_callback_with_logic_child(tmp_path: Path) -> None:
     dispatch_step = dispatch_steps[0]
     assert isinstance(dispatch_step.result, DispatchStepResult)
     assert dispatch_step.result.outcome == "dispatched"
+    assert dispatch_step.result.continuation == "wait_for_callback"
     assert len(dispatch_step.result.child_flow_ids) == 2
     assert len(child_flows) == 2
     assert {child.parent_flow_id for child in child_flows} == {flow_id}

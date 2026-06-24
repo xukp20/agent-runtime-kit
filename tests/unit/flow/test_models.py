@@ -5,12 +5,14 @@ from agent_runtime_kit.flow import (
     BaseFlow,
     BaseStep,
     ChildFlowDispatchSubmission,
+    DispatchContinuation,
     FlowRequest,
     FlowStatus,
     ManualPauseState,
     StepStatus,
     StepTerminalReceipt,
 )
+from agent_runtime_kit.flow.standard_steps import DispatchStepResult, DispatchStepState
 
 
 def test_status_enum_values_match_design() -> None:
@@ -56,7 +58,45 @@ def test_child_flow_dispatch_submission_saves_flow_requests() -> None:
 
     assert submission.submission_type == "child_flow_dispatch"
     assert submission.requests == [request]
+    assert submission.continuation == "wait_for_callback"
     assert submission.submitted_at
+
+
+def test_dispatch_continuation_defaults_and_explicit_handoff() -> None:
+    request = FlowRequest(flow_type="child", scope_id="child-scope", params={})
+    default_submission = ChildFlowDispatchSubmission(
+        submission_id="sub-default",
+        tool_name="submit_child_flows",
+        requests=[request],
+    )
+    handoff_submission = ChildFlowDispatchSubmission(
+        submission_id="sub-handoff",
+        tool_name="submit_child_flows",
+        requests=[request],
+        continuation="terminal_handoff",
+    )
+    state = DispatchStepState(
+        source_step_id="source",
+        source_submission_id="sub-default",
+        requests=[request],
+    )
+    result = DispatchStepResult(
+        outcome="dispatched",
+        source_step_id="source",
+        source_submission_id="sub-default",
+    )
+
+    assert default_submission.continuation == "wait_for_callback"
+    assert handoff_submission.continuation == "terminal_handoff"
+    assert state.continuation == "wait_for_callback"
+    assert result.continuation == "wait_for_callback"
+    assert handoff_submission.model_dump()["continuation"] == "terminal_handoff"
+
+
+def test_dispatch_continuation_type_is_exported() -> None:
+    value: DispatchContinuation = "terminal_handoff"
+
+    assert value == "terminal_handoff"
 
 
 def test_step_terminal_receipt_allows_completed_and_failed_statuses() -> None:

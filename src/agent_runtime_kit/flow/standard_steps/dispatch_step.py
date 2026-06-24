@@ -10,6 +10,7 @@ from agent_runtime_kit.flow.models import (
     BaseStepResult,
     BaseStepState,
     CreatedChildFlow,
+    DispatchContinuation,
     DispatchRequestFailure,
     FlowRequest,
     FlowStepValidationError,
@@ -22,6 +23,7 @@ class DispatchStepState(BaseStepState):
     source_step_id: str
     source_submission_id: str
     requests: list[FlowRequest]
+    continuation: DispatchContinuation = "wait_for_callback"
     created_children: list[CreatedChildFlow] = Field(default_factory=list)
     failed_requests: list[DispatchRequestFailure] = Field(default_factory=list)
 
@@ -29,6 +31,7 @@ class DispatchStepState(BaseStepState):
 class DispatchStepResult(BaseStepResult):
     result_type: str = "dispatch_step"
     outcome: Literal["dispatched", "empty", "failed"]
+    continuation: DispatchContinuation = "wait_for_callback"
     source_step_id: str
     source_submission_id: str
     child_flow_ids: list[str] = Field(default_factory=list)
@@ -47,6 +50,7 @@ class DispatchStep(BaseStep):
             return ctx.complete_step(
                 DispatchStepResult(
                     outcome="empty",
+                    continuation=state.continuation,
                     source_step_id=state.source_step_id,
                     source_submission_id=state.source_submission_id,
                     summary="no child flow requests",
@@ -59,6 +63,7 @@ class DispatchStep(BaseStep):
             return ctx.complete_step(
                 DispatchStepResult(
                     outcome="failed",
+                    continuation=state.continuation,
                     source_step_id=state.source_step_id,
                     source_submission_id=state.source_submission_id,
                     failed_request_indices=[failure.request_index for failure in failed_requests],
@@ -82,6 +87,7 @@ class DispatchStep(BaseStep):
         return ctx.complete_step(
             DispatchStepResult(
                 outcome="dispatched",
+                continuation=latest_state.continuation,
                 source_step_id=latest_state.source_step_id,
                 source_submission_id=latest_state.source_submission_id,
                 child_flow_ids=child_flow_ids,

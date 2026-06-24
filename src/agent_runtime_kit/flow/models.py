@@ -117,6 +117,9 @@ class FlowRequest(StrictModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+DispatchContinuation = Literal["wait_for_callback", "terminal_handoff"]
+
+
 class BaseSubmission(StrictModel):
     submission_id: str
     submission_type: str
@@ -129,6 +132,7 @@ class BaseSubmission(StrictModel):
 class ChildFlowDispatchSubmission(BaseSubmission):
     submission_type: Literal["child_flow_dispatch"] = "child_flow_dispatch"
     requests: list[FlowRequest]
+    continuation: DispatchContinuation = "wait_for_callback"
 
 
 class CreatedChildFlow(StrictModel):

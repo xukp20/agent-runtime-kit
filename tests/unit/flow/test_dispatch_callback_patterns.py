@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
 from pydantic import BaseModel
 
 from agent_runtime_kit.flow import (
@@ -15,6 +16,7 @@ from agent_runtime_kit.flow import (
     FlowService,
     FlowStatus,
     FlowStepContext,
+    FlowStepValidationError,
     RuntimeScheduleService,
     StepService,
     StepStatus,
@@ -115,23 +117,24 @@ def attach_step(flow_service: FlowService, flow_id: str, step) -> str:
     return step.step_id
 
 
-def make_dispatch_submission() -> ChildFlowDispatchSubmission:
+def make_dispatch_submission(*, continuation: str = "wait_for_callback") -> ChildFlowDispatchSubmission:
     return ChildFlowDispatchSubmission(
         submission_id="dispatch-submission",
         tool_name="submit_child_flows",
+        continuation=continuation,
         requests=[FlowRequest(flow_type="pattern_child", scope_id="scope", params={})],
         summary="dispatch child",
     )
 
 
-def attach_source_agent_step(flow_service: FlowService, flow_id: str) -> AgentStep:
+def attach_source_agent_step(flow_service: FlowService, flow_id: str, *, continuation: str = "wait_for_callback") -> AgentStep:
     source = AgentStep(
         step_id="source-agent-step",
         flow_id=flow_id,
         scope_id="scope",
         status=StepStatus.COMPLETED,
         state=AgentStepState(agent_role="planner", agent_type="planner_type"),
-        submission=make_dispatch_submission(),
+        submission=make_dispatch_submission(continuation=continuation),
         result=AgentStepResult(result_type="agent_step_submission", outcome="submitted", submission_id="dispatch-submission"),
     )
     source.agent_bindings.by_role["planner"] = "agent-planner"
@@ -169,6 +172,24 @@ def test_agent_dispatch_submission_creates_dispatch_step_once(tmp_path: Path) ->
     dispatch = dispatch_steps[0]
     assert isinstance(dispatch.state, DispatchStepState)
     assert dispatch.state.source_submission_id == "dispatch-submission"
+    assert dispatch.state.continuation == "wait_for_callback"
+
+
+def test_agent_dispatch_submission_copies_terminal_handoff_continuation(tmp_path: Path) -> None:
+    flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
+    parent_id = start_parent(flow_service)
+    source = attach_source_agent_step(flow_service, parent_id, continuation="terminal_handoff")
+
+    tx, ctx = flow_ctx(flow_service, parent_id)
+    try:
+        dispatch_id = create_dispatch_step_from_agent_submission(ctx, source_agent_step_id=source.step_id)
+    finally:
+        tx.__exit__(None, None, None)
+
+    dispatch = flow_service.get_step(dispatch_id)
+    assert isinstance(dispatch, DispatchStep)
+    assert isinstance(dispatch.state, DispatchStepState)
+    assert dispatch.state.continuation == "terminal_handoff"
 
 
 def test_create_followup_waits_until_all_child_flows_terminal(tmp_path: Path) -> None:
@@ -275,3 +296,60 @@ def test_standard_terminal_and_waiting_helpers(tmp_path: Path) -> None:
         assert flow.status is FlowStatus.RUNNING
         assert isinstance(flow.state, PatternParentState)
         assert flow.state.waiting_dispatch_step_id is None
+
+
+def test_terminal_handoff_dispatch_is_not_handled_by_standard_waiting_helpers(tmp_path: Path) -> None:
+    flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
+    parent_id = start_parent(flow_service)
+    source = attach_source_agent_step(flow_service, parent_id, continuation="terminal_handoff")
+    child_id = start_child(flow_service, terminal=True)
+    dispatch = DispatchStep(
+        step_id="dispatch-step",
+        flow_id=parent_id,
+        scope_id="scope",
+        status=StepStatus.COMPLETED,
+        state=DispatchStepState(
+            source_step_id=source.step_id,
+            source_submission_id="dispatch-submission",
+            requests=[],
+            continuation="terminal_handoff",
+            created_children=[CreatedChildFlow(request_index=0, child_flow_id=child_id)],
+        ),
+        result=DispatchStepResult(
+            outcome="dispatched",
+            continuation="terminal_handoff",
+            source_step_id=source.step_id,
+            source_submission_id="dispatch-submission",
+            child_flow_ids=[child_id],
+        ),
+    )
+    attach_step(flow_service, parent_id, dispatch)
+
+    with flow_service.store.edit_session("scope") as tx:
+        flow = tx.load_flow_for_update(parent_id)
+        step = tx.load_step_for_update(dispatch.step_id)
+        ctx = FlowStepContext(ark=flow_service.ark, app=AppServices(), flow=flow, step=step, tx=tx)
+        assert handle_standard_step_terminal(flow, ctx) is False
+        assert isinstance(flow.state, PatternParentState)
+        assert flow.state.waiting_dispatch_step_id is None
+
+    with flow_service.store.edit_session("scope") as tx:
+        flow = tx.load_flow_for_update(parent_id)
+        ctx = FlowContext(ark=flow_service.ark, app=AppServices(), flow=flow, tx=tx)
+        assert create_standard_next_step_if_applicable(ctx.flow, ctx) is None
+        with pytest.raises(FlowStepValidationError):
+            create_followup_agent_step_from_dispatch(
+                ctx,
+                source_agent_step_id=source.step_id,
+                dispatch_step_id=dispatch.step_id,
+            )
+
+    flow_service.store.update_flow_record(
+        parent_id,
+        lambda flow: setattr(flow.state, "waiting_dispatch_step_id", dispatch.step_id),
+    )
+    with flow_service.store.edit_session("scope") as tx:
+        flow = tx.load_flow_for_update(parent_id)
+        ctx = FlowContext(ark=flow_service.ark, app=AppServices(), flow=flow, tx=tx)
+        with pytest.raises(FlowStepValidationError):
+            can_exit_standard_dispatch_wait(flow, ctx)
