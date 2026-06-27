@@ -28,12 +28,21 @@ def create_dispatch_step_from_agent_submission(
     source_step = _get_step_for_current_flow(ctx, source_agent_step_id)
     if not isinstance(source_step, AgentStep):
         raise FlowStepValidationError(f"source step {source_agent_step_id} is not an AgentStep")
+    return create_dispatch_step_from_step_submission(ctx, source_step_id=source_agent_step_id)
+
+
+def create_dispatch_step_from_step_submission(
+    ctx: FlowContext,
+    *,
+    source_step_id: str,
+) -> str:
+    source_step = _get_step_for_current_flow(ctx, source_step_id)
     if source_step.status is not StepStatus.COMPLETED:
-        raise FlowStepValidationError(f"source step {source_agent_step_id} is not completed")
+        raise FlowStepValidationError(f"source step {source_step_id} is not completed")
     if not isinstance(source_step.submission, ChildFlowDispatchSubmission):
-        raise FlowStepValidationError(f"source step {source_agent_step_id} has no child flow dispatch submission")
+        raise FlowStepValidationError(f"source step {source_step_id} has no child flow dispatch submission")
     if not source_step.submission.requests:
-        raise FlowStepValidationError(f"source step {source_agent_step_id} dispatch submission has no requests")
+        raise FlowStepValidationError(f"source step {source_step_id} dispatch submission has no requests")
 
     existing = _find_dispatch_step_for_submission(ctx, source_step.submission.submission_id)
     if existing is not None:
@@ -45,7 +54,7 @@ def create_dispatch_step_from_agent_submission(
         flow_id=ctx.flow.flow_id,
         scope_id=ctx.flow.scope_id,
         state=DispatchStepState(
-            source_step_id=source_agent_step_id,
+            source_step_id=source_step_id,
             source_submission_id=source_step.submission.submission_id,
             requests=source_step.submission.requests,
             continuation=source_step.submission.continuation,
@@ -89,8 +98,8 @@ def create_followup_agent_step_from_dispatch(
 
 def create_standard_next_step_if_applicable(flow: BaseFlow, ctx: FlowContext) -> str | None:
     latest_step = _latest_terminal_step(flow, ctx)
-    if isinstance(latest_step, AgentStep) and isinstance(latest_step.submission, ChildFlowDispatchSubmission):
-        return create_dispatch_step_from_agent_submission(ctx, source_agent_step_id=latest_step.step_id)
+    if latest_step is not None and isinstance(latest_step.submission, ChildFlowDispatchSubmission):
+        return create_dispatch_step_from_step_submission(ctx, source_step_id=latest_step.step_id)
     if isinstance(latest_step, DispatchStep):
         if _dispatch_ready_for_callback(ctx, latest_step):
             assert isinstance(latest_step.state, DispatchStepState)
@@ -103,7 +112,7 @@ def create_standard_next_step_if_applicable(flow: BaseFlow, ctx: FlowContext) ->
 
 
 def handle_standard_step_terminal(flow: BaseFlow, ctx: FlowStepContext) -> bool:
-    if isinstance(ctx.step, AgentStep) and isinstance(ctx.step.submission, ChildFlowDispatchSubmission):
+    if isinstance(ctx.step.submission, ChildFlowDispatchSubmission):
         flow.current_step_id = None
         flow.status = FlowStatus.RUNNING
         flow.updated_at = utc_now_iso()

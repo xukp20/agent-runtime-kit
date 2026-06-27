@@ -30,6 +30,7 @@ from .models import (
 from .patterns import (
     can_exit_standard_dispatch_wait,
     create_dispatch_step_from_agent_submission,
+    create_dispatch_step_from_step_submission,
     create_followup_agent_step_from_dispatch,
     create_standard_next_step_if_applicable,
     handle_standard_step_terminal,
@@ -108,6 +109,7 @@ __all__ = [
     "build_followup_agent_step_from_dispatch",
     "can_exit_standard_dispatch_wait",
     "create_dispatch_step_from_agent_submission",
+    "create_dispatch_step_from_step_submission",
     "create_followup_agent_step_from_dispatch",
     "create_standard_next_step_if_applicable",
     "handle_standard_step_terminal",

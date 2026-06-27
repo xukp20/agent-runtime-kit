@@ -8,6 +8,9 @@ from agent_runtime_kit.flow import (
     BaseFlow,
     BaseFlowResult,
     BaseFlowState,
+    BaseStep,
+    BaseStepResult,
+    BaseStepState,
     ChildFlowDispatchSubmission,
     CreatedChildFlow,
     FlowBuildContext,
@@ -24,6 +27,7 @@ from agent_runtime_kit.flow import (
     FlowTypeRegistry,
     can_exit_standard_dispatch_wait,
     create_dispatch_step_from_agent_submission,
+    create_dispatch_step_from_step_submission,
     create_followup_agent_step_from_dispatch,
     create_standard_next_step_if_applicable,
     handle_standard_step_terminal,
@@ -77,6 +81,14 @@ class PatternChildFlow(BaseFlow):
         return cls(flow_id=ctx.flow_id, scope_id=ctx.scope_id, state=PatternChildState())
 
 
+class PatternLogicDispatchSourceStep(BaseStep):
+    step_type: ClassVar[str] = "logic_dispatch_source"
+    State: ClassVar[type[BaseStepState]] = BaseStepState
+    Submissions: ClassVar[dict[str, type[ChildFlowDispatchSubmission]]] = {
+        "child_flow_dispatch": ChildFlowDispatchSubmission
+    }
+
+
 def make_services(runtime_root: Path) -> tuple[FlowService, StepService, RuntimeScheduleService]:
     flow_registry = FlowTypeRegistry()
     step_registry = StepTypeRegistry()
@@ -84,6 +96,7 @@ def make_services(runtime_root: Path) -> tuple[FlowService, StepService, Runtime
     flow_registry.register(PatternChildFlow)
     step_registry.register(AgentStep)
     step_registry.register(DispatchStep)
+    step_registry.register(PatternLogicDispatchSourceStep)
     ark = ARKServices()
     flow_service = FlowService(
         runtime_root,
@@ -142,6 +155,19 @@ def attach_source_agent_step(flow_service: FlowService, flow_id: str, *, continu
     return source
 
 
+def attach_source_base_step(flow_service: FlowService, flow_id: str, *, continuation: str = "terminal_handoff") -> BaseStep:
+    source = PatternLogicDispatchSourceStep(
+        step_id="source-logic-step",
+        flow_id=flow_id,
+        scope_id="scope",
+        status=StepStatus.COMPLETED,
+        submission=make_dispatch_submission(continuation=continuation),
+        result=BaseStepResult(result_type="logic_dispatch_source_done"),
+    )
+    attach_step(flow_service, flow_id, source)
+    return source
+
+
 def flow_ctx(flow_service: FlowService, flow_id: str):
     tx = flow_service.store.edit_session("scope")
     tx.__enter__()
@@ -156,8 +182,8 @@ def test_agent_dispatch_submission_creates_dispatch_step_once(tmp_path: Path) ->
 
     tx, ctx = flow_ctx(flow_service, parent_id)
     try:
-        first_id = create_dispatch_step_from_agent_submission(ctx, source_agent_step_id=source.step_id)
-        second_id = create_dispatch_step_from_agent_submission(ctx, source_agent_step_id=source.step_id)
+        first_id = create_dispatch_step_from_step_submission(ctx, source_step_id=source.step_id)
+        second_id = create_dispatch_step_from_step_submission(ctx, source_step_id=source.step_id)
     finally:
         tx.__exit__(None, None, None)
 
@@ -175,6 +201,23 @@ def test_agent_dispatch_submission_creates_dispatch_step_once(tmp_path: Path) ->
     assert dispatch.state.continuation == "wait_for_callback"
 
 
+def test_agent_dispatch_submission_wrapper_remains_available(tmp_path: Path) -> None:
+    flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
+    parent_id = start_parent(flow_service)
+    source = attach_source_agent_step(flow_service, parent_id)
+
+    tx, ctx = flow_ctx(flow_service, parent_id)
+    try:
+        dispatch_id = create_dispatch_step_from_agent_submission(ctx, source_agent_step_id=source.step_id)
+    finally:
+        tx.__exit__(None, None, None)
+
+    dispatch = flow_service.get_step(dispatch_id)
+    assert isinstance(dispatch, DispatchStep)
+    assert isinstance(dispatch.state, DispatchStepState)
+    assert dispatch.state.source_step_id == source.step_id
+
+
 def test_agent_dispatch_submission_copies_terminal_handoff_continuation(tmp_path: Path) -> None:
     flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
     parent_id = start_parent(flow_service)
@@ -190,6 +233,60 @@ def test_agent_dispatch_submission_copies_terminal_handoff_continuation(tmp_path
     assert isinstance(dispatch, DispatchStep)
     assert isinstance(dispatch.state, DispatchStepState)
     assert dispatch.state.continuation == "terminal_handoff"
+
+
+def test_non_agent_step_dispatch_submission_creates_terminal_handoff_dispatch_step(tmp_path: Path) -> None:
+    flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
+    parent_id = start_parent(flow_service)
+    source = attach_source_base_step(flow_service, parent_id, continuation="terminal_handoff")
+
+    tx, ctx = flow_ctx(flow_service, parent_id)
+    try:
+        dispatch_id = create_dispatch_step_from_step_submission(ctx, source_step_id=source.step_id)
+    finally:
+        tx.__exit__(None, None, None)
+
+    dispatch = flow_service.get_step(dispatch_id)
+    assert isinstance(dispatch, DispatchStep)
+    assert isinstance(dispatch.state, DispatchStepState)
+    assert dispatch.state.source_step_id == source.step_id
+    assert dispatch.state.source_submission_id == "dispatch-submission"
+    assert dispatch.state.continuation == "terminal_handoff"
+    assert len(dispatch.state.requests) == 1
+
+
+def test_standard_next_step_accepts_non_agent_dispatch_source(tmp_path: Path) -> None:
+    flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
+    parent_id = start_parent(flow_service)
+    source = attach_source_base_step(flow_service, parent_id, continuation="terminal_handoff")
+
+    tx, ctx = flow_ctx(flow_service, parent_id)
+    try:
+        dispatch_id = create_standard_next_step_if_applicable(ctx.flow, ctx)
+    finally:
+        tx.__exit__(None, None, None)
+
+    assert dispatch_id is not None
+    dispatch = flow_service.get_step(dispatch_id)
+    assert isinstance(dispatch, DispatchStep)
+    assert isinstance(dispatch.state, DispatchStepState)
+    assert dispatch.state.source_step_id == source.step_id
+    assert dispatch.state.continuation == "terminal_handoff"
+
+
+def test_standard_terminal_helper_accepts_non_agent_dispatch_source(tmp_path: Path) -> None:
+    flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
+    parent_id = start_parent(flow_service)
+    source = attach_source_base_step(flow_service, parent_id, continuation="terminal_handoff")
+
+    with flow_service.store.edit_session("scope") as tx:
+        flow = tx.load_flow_for_update(parent_id)
+        flow.current_step_id = source.step_id
+        step = tx.load_step_for_update(source.step_id)
+        ctx = FlowStepContext(ark=flow_service.ark, app=AppServices(), flow=flow, step=step, tx=tx)
+        assert handle_standard_step_terminal(flow, ctx) is True
+        assert flow.current_step_id is None
+        assert flow.status is FlowStatus.RUNNING
 
 
 def test_create_followup_waits_until_all_child_flows_terminal(tmp_path: Path) -> None:
