@@ -92,9 +92,11 @@ class SubmittingAgentService:
         *,
         variables: dict[str, object] | None = None,
         prompt: str | None = None,
+        developer_instructions_template_override: str | None = None,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
     ) -> Agent:
+        del developer_instructions_template_override
         self.started.append({"agent_id": agent_id, "variables": variables or {}, "env": env or {}})
         assert env is not None
         runtime_ctx = self.gateway.resolve_context_from_env(

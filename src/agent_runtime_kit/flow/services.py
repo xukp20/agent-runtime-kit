@@ -36,6 +36,7 @@ class ActiveStepRun(BaseModel):
     worker_ref: Any | None = None
     done_event: Event | None = None
     exception: Any | None = None
+    bypass_pause: bool = False
 
 
 class FlowService:
@@ -410,8 +411,19 @@ class StepService:
                 return False
             return flow.current_step_id == step_id
 
-    def start_step(self, step_id: str) -> ActiveStepRun:
-        if not self.can_run_step(step_id):
+    def start_step(self, step_id: str, *, bypass_pause: bool = False) -> ActiveStepRun:
+        pause_controller = self.ark.pause_controller
+        bypass_context = (
+            pause_controller.bypass_current_thread()
+            if bypass_pause and pause_controller is not None and hasattr(pause_controller, "bypass_current_thread")
+            else None
+        )
+        if bypass_context is None:
+            can_run = self.can_run_step(step_id)
+        else:
+            with bypass_context:
+                can_run = self.can_run_step(step_id)
+        if not can_run:
             raise FlowStepValidationError(f"step cannot run: {step_id}")
         step = self.store.get_step(step_id)
         flow = self.store.get_flow(step.flow_id)
@@ -422,6 +434,7 @@ class StepService:
             scope_id=step.scope_id,
             started_at=utc_now_iso(),
             done_event=done_event,
+            bypass_pause=bypass_pause,
         )
         with self.lock:
             if step_id in self.active_steps:
@@ -433,8 +446,8 @@ class StepService:
         worker.start()
         return active
 
-    def run_step(self, step_id: str) -> None:
-        active = self.start_step(step_id)
+    def run_step(self, step_id: str, *, bypass_pause: bool = False) -> None:
+        active = self.start_step(step_id, bypass_pause=bypass_pause)
         if active.done_event is not None:
             active.done_event.wait()
         if active.exception is not None:
@@ -445,40 +458,17 @@ class StepService:
         flow = self.store.get_flow(step.flow_id)
         ctx = StepRunContext(ark=self.ark, app=self.app, step_id=step.step_id, flow_id=flow.flow_id, scope_id=step.scope_id)
         try:
-            self._mark_step_running(step_id)
-            step_impl = self.store.get_step(step_id)
-            try:
-                receipt = step_impl.run(ctx)
-            except Exception as exc:
-                receipt = ctx.fail_step(
-                    BaseStepError(
-                        error_type="step_run_exception",
-                        message=str(exc) or type(exc).__name__,
-                        details={"exception_type": type(exc).__name__},
-                    )
-                )
+            pause_controller = self.ark.pause_controller
+            bypass_context = (
+                pause_controller.bypass_current_thread()
+                if active.bypass_pause and pause_controller is not None and hasattr(pause_controller, "bypass_current_thread")
+                else None
+            )
+            if bypass_context is None:
+                self._run_step_body_with_context(step_id, step, ctx)
             else:
-                if not isinstance(receipt, StepTerminalReceipt):
-                    receipt = self._force_fail_step(
-                        ctx,
-                        BaseStepError(
-                            error_type="step_not_terminal",
-                            message=f"step {step_id} did not return StepTerminalReceipt",
-                        ),
-                    )
-                elif not self._receipt_matches(receipt, step):
-                    receipt = self._force_fail_step(
-                        ctx,
-                        BaseStepError(
-                            error_type="invalid_terminal_receipt",
-                            message=f"step {step_id} returned invalid terminal receipt",
-                        ),
-                    )
-            self._validate_terminal_receipt(receipt, step)
-            flow_service = self.ark.flow_service
-            if flow_service is None or not hasattr(flow_service, "handle_step_terminal"):
-                raise FlowStepValidationError("ctx.ark.flow_service.handle_step_terminal is not available")
-            flow_service.handle_step_terminal(step_id)
+                with bypass_context:
+                    self._run_step_body_with_context(step_id, step, ctx)
         except Exception as exc:
             active.exception = exc
         finally:
@@ -486,6 +476,42 @@ class StepService:
                 self.active_steps.pop(step_id, None)
                 if active.done_event is not None:
                     active.done_event.set()
+
+    def _run_step_body_with_context(self, step_id: str, step: BaseStep, ctx: StepRunContext) -> None:
+        self._mark_step_running(step_id)
+        step_impl = self.store.get_step(step_id)
+        try:
+            receipt = step_impl.run(ctx)
+        except Exception as exc:
+            receipt = ctx.fail_step(
+                BaseStepError(
+                    error_type="step_run_exception",
+                    message=str(exc) or type(exc).__name__,
+                    details={"exception_type": type(exc).__name__},
+                )
+            )
+        else:
+            if not isinstance(receipt, StepTerminalReceipt):
+                receipt = self._force_fail_step(
+                    ctx,
+                    BaseStepError(
+                        error_type="step_not_terminal",
+                        message=f"step {step_id} did not return StepTerminalReceipt",
+                    )
+                )
+            elif not self._receipt_matches(receipt, step):
+                receipt = self._force_fail_step(
+                    ctx,
+                    BaseStepError(
+                        error_type="invalid_terminal_receipt",
+                        message=f"step {step_id} returned invalid terminal receipt",
+                    )
+                )
+        self._validate_terminal_receipt(receipt, step)
+        flow_service = self.ark.flow_service
+        if flow_service is None or not hasattr(flow_service, "handle_step_terminal"):
+            raise FlowStepValidationError("ctx.ark.flow_service.handle_step_terminal is not available")
+        flow_service.handle_step_terminal(step_id)
 
     def wait_step(self, step_id: str, *, timeout_s: float | None = None) -> BaseStep:
         active = self.active_steps.get(step_id)

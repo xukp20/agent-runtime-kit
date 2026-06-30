@@ -91,32 +91,53 @@ class AgentStep(BaseStep):
         latest = self._latest_agent_step(ctx)
         state = self._agent_step_state(latest)
         role = state.agent_role
-        agent_id = latest.agent_bindings.get(role)
-        if agent_id is None:
-            flow = self._flow_service(ctx).get_flow(ctx.flow_id)
-            agent_id = flow.agent_bindings.get(role)
+        agent_id = latest.resolve_bound_agent_id(ctx, role)
         created = False
         if agent_id is None:
-            if not state.create_agent_if_missing:
-                raise FlowStepValidationError(f"agent role {role!r} is not bound for step {ctx.step_id}")
-            if state.agent_type is None:
-                raise FlowStepValidationError(
-                    f"agent_type is required when create_agent_if_missing=True for step {ctx.step_id}"
-                )
-            agent_service = self._agent_service(ctx)
-            agent = agent_service.create_agent(
-                ctx.scope_id,
-                state.agent_type,
-                cli_type=state.cli_type,
-                home_id=state.home_id,
-            )
-            agent_id = agent.agent_id
+            agent_id = latest.create_agent_for_step(ctx, state)
             created = True
 
         if created and state.bind_created_agent_to == "flow":
-            ctx.update_flow(lambda flow: flow.agent_bindings.by_role.__setitem__(role, agent_id or ""))
-        ctx.update_step(lambda step: step.agent_bindings.by_role.__setitem__(role, agent_id or ""))
+            latest.bind_agent_to_flow(ctx, role, agent_id)
+        latest.bind_agent_to_step(ctx, role, agent_id)
         return agent_id
+
+    def resolve_bound_agent_id(self, ctx: StepRunContext, role: str) -> str | None:
+        agent_id = self.resolve_step_bound_agent_id(ctx, role)
+        if agent_id is not None:
+            return agent_id
+        return self.resolve_flow_bound_agent_id(ctx, role)
+
+    def resolve_step_bound_agent_id(self, ctx: StepRunContext, role: str) -> str | None:
+        latest = self._latest_agent_step(ctx)
+        return latest.agent_bindings.get(role)
+
+    def resolve_flow_bound_agent_id(self, ctx: StepRunContext, role: str) -> str | None:
+        flow = self._flow_service(ctx).get_flow(ctx.flow_id)
+        return flow.agent_bindings.get(role)
+
+    def create_agent_for_step(self, ctx: StepRunContext, state: AgentStepState) -> str:
+        role = state.agent_role
+        if not state.create_agent_if_missing:
+            raise FlowStepValidationError(f"agent role {role!r} is not bound for step {ctx.step_id}")
+        if state.agent_type is None:
+            raise FlowStepValidationError(
+                f"agent_type is required when create_agent_if_missing=True for step {ctx.step_id}"
+            )
+        agent_service = self._agent_service(ctx)
+        agent = agent_service.create_agent(
+            ctx.scope_id,
+            state.agent_type,
+            cli_type=state.cli_type,
+            home_id=state.home_id,
+        )
+        return str(agent.agent_id)
+
+    def bind_agent_to_step(self, ctx: StepRunContext, role: str, agent_id: str) -> None:
+        ctx.update_step(lambda step: step.agent_bindings.by_role.__setitem__(role, agent_id))
+
+    def bind_agent_to_flow(self, ctx: StepRunContext, role: str, agent_id: str) -> None:
+        ctx.update_flow(lambda flow: flow.agent_bindings.by_role.__setitem__(role, agent_id))
 
     def _bound_agent_id(self, ctx: StepRunContext) -> str | None:
         latest = self._latest_agent_step(ctx)
@@ -210,6 +231,9 @@ class AgentStep(BaseStep):
         latest = self._latest_agent_step(ctx)
         return self._agent_step_state(latest).workdir_override
 
+    def build_developer_instructions_override(self, ctx: StepRunContext, agent_id: str) -> str | None:
+        return None
+
     def check_completion(
         self,
         ctx: StepRunContext,
@@ -268,11 +292,13 @@ class AgentStep(BaseStep):
             state = self._agent_step_state(latest)
             env = latest.build_agent_env(ctx, agent_id)
             workdir = latest.resolve_workdir(ctx, agent_id)
+            developer_instructions_override = latest.build_developer_instructions_override(ctx, agent_id)
             agent_service = self._agent_service(ctx)
             agent_service.start_agent(
                 agent_id,
                 variables=state.variables,
                 prompt=prompt,
+                developer_instructions_template_override=developer_instructions_override,
                 env=env,
                 workdir=workdir,
             )

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from threading import RLock
+from threading import RLock, local
 
 
 class RuntimePausedError(RuntimeError):
@@ -13,6 +15,7 @@ class RuntimePauseController:
     global_paused: bool = False
     paused_scopes: set[str] = field(default_factory=set)
     _lock: RLock = field(default_factory=RLock, init=False, repr=False)
+    _thread_local: local = field(default_factory=local, init=False, repr=False)
 
     def pause(self, scope_id: str | None = None) -> None:
         with self._lock:
@@ -29,6 +32,8 @@ class RuntimePauseController:
                 self.paused_scopes.discard(scope_id)
 
     def is_paused(self, scope_id: str | None = None) -> bool:
+        if self._bypass_depth() > 0:
+            return False
         with self._lock:
             if self.global_paused:
                 return True
@@ -43,6 +48,22 @@ class RuntimePauseController:
     def assert_can_start(self, scope_id: str) -> None:
         if self.is_paused(scope_id):
             raise RuntimePausedError(f"runtime is paused for scope: {scope_id}")
+
+    @contextmanager
+    def bypass_current_thread(self) -> Iterator[None]:
+        depth = self._bypass_depth()
+        self._thread_local.pause_bypass_depth = depth + 1
+        try:
+            yield
+        finally:
+            if depth <= 0:
+                if hasattr(self._thread_local, "pause_bypass_depth"):
+                    delattr(self._thread_local, "pause_bypass_depth")
+            else:
+                self._thread_local.pause_bypass_depth = depth
+
+    def _bypass_depth(self) -> int:
+        return int(getattr(self._thread_local, "pause_bypass_depth", 0))
 
 
 class AppServices:

@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
 from pydantic import BaseModel
 
 from agent_runtime_kit.flow import (
@@ -121,3 +122,19 @@ def test_scope_pause_blocks_only_matching_scope(tmp_path: Path) -> None:
     assert paused_flow_id not in tick.advanced_flow_ids
     assert runnable_flow_id in tick.advanced_flow_ids
     assert paused_flow_id in scheduler.queued_flow_ids
+
+
+def test_step_service_bypass_pause_starts_one_step_without_resuming_runtime(tmp_path: Path) -> None:
+    flow_service, step_service, _, pause = make_services(tmp_path / ".agent_runtime")
+    flow_id = flow_service.start_flow(FlowRequest(flow_type="pause_flow", scope_id="scope", params={}), enqueue=False)
+    step_id = flow_service.advance_flow(flow_id)
+    assert step_id is not None
+
+    pause.pause(None)
+    with pytest.raises(Exception, match="step cannot run"):
+        step_service.run_step(step_id)
+
+    step_service.run_step(step_id, bypass_pause=True)
+
+    assert pause.is_paused()
+    assert step_service.wait_step(step_id).status is StepStatus.COMPLETED

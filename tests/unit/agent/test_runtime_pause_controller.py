@@ -41,6 +41,31 @@ def test_runtime_pause_controller_global_and_scope_semantics() -> None:
     assert controller.is_paused("scope-b") is False
 
 
+def test_runtime_pause_controller_bypass_current_thread_is_nested_and_non_destructive() -> None:
+    controller = RuntimePauseController(global_paused=True)
+    controller.pause("scope-a")
+
+    assert controller.is_paused() is True
+    assert controller.is_paused("scope-a") is True
+    assert controller.is_scope_directly_paused("scope-a") is True
+
+    with controller.bypass_current_thread():
+        assert controller.is_paused() is False
+        assert controller.is_paused("scope-a") is False
+        assert controller.is_scope_directly_paused("scope-a") is True
+        controller.assert_can_start("scope-a")
+        with controller.bypass_current_thread():
+            assert controller.is_paused("scope-a") is False
+            controller.assert_can_start("scope-a")
+        assert controller.is_paused("scope-a") is False
+
+    assert controller.is_paused() is True
+    assert controller.is_paused("scope-a") is True
+    assert controller.is_scope_directly_paused("scope-a") is True
+    with pytest.raises(RuntimePausedError):
+        controller.assert_can_start("scope-a")
+
+
 def test_agent_run_pause_controller_is_runtime_alias() -> None:
     assert AgentRunPauseController is RuntimePauseController
 

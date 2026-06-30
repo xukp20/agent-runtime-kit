@@ -93,6 +93,7 @@ class FakeAgentService:
         *,
         variables: dict[str, object] | None = None,
         prompt: str | None = None,
+        developer_instructions_template_override: str | None = None,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
     ) -> Agent:
@@ -100,6 +101,7 @@ class FakeAgentService:
             "agent_id": agent_id,
             "variables": variables or {},
             "prompt": prompt,
+            "developer_instructions_template_override": developer_instructions_template_override,
             "env": env or {},
             "workdir": workdir,
         }
@@ -247,6 +249,30 @@ def test_prepare_agent_can_create_and_bind_to_flow(tmp_path: Path) -> None:
     assert latest_flow.agent_bindings.by_role["worker"] == "agent-1"
 
 
+def test_prepare_agent_helper_split_preserves_step_binding_precedence(tmp_path: Path) -> None:
+    flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
+    flow_id = create_flow(flow_service)
+    flow_service.store.update_flow_record(
+        flow_id,
+        lambda flow: flow.agent_bindings.by_role.__setitem__("worker", "agent-flow-bound"),
+    )
+    step = AgentStep(
+        step_id="agent-step",
+        flow_id=flow_id,
+        scope_id="scope",
+        state=AgentStepState(agent_role="worker"),
+    )
+    step.agent_bindings.by_role["worker"] = "agent-step-bound"
+    step_id = attach_agent_step(flow_service, flow_id, step)
+    ctx = make_ctx(step_id, flow_id, flow_service.ark)
+    latest = flow_service.get_step(step_id)
+
+    assert latest.resolve_step_bound_agent_id(ctx, "worker") == "agent-step-bound"
+    assert latest.resolve_flow_bound_agent_id(ctx, "worker") == "agent-flow-bound"
+    assert latest.resolve_bound_agent_id(ctx, "worker") == "agent-step-bound"
+    assert latest.prepare_agent(ctx) == "agent-step-bound"
+
+
 def test_build_agent_env_preserves_identity_over_overrides(tmp_path: Path) -> None:
     flow_service, _, _ = make_services(tmp_path / ".agent_runtime")
     flow_id = create_flow(flow_service)
@@ -376,6 +402,38 @@ def test_run_completes_from_latest_submission_truth(tmp_path: Path) -> None:
     assert latest.submission is not None
     assert agent_service.start_calls[0]["variables"] == {"goal": "demo"}
     assert agent_service.start_calls[0]["workdir"] == "/tmp/demo"
+
+
+class InstructionOverrideAgentStep(AgentStep):
+    step_type: ClassVar[str] = "instruction_override_agent_step"
+
+    def build_developer_instructions_override(self, ctx: StepRunContext, agent_id: str) -> str | None:
+        del ctx, agent_id
+        return "Controlled instructions for {{goal}}."
+
+
+def test_agent_step_passes_developer_instruction_override_to_agent_service(tmp_path: Path) -> None:
+    flow_service, step_service, agent_service = make_services(tmp_path / ".agent_runtime", submit_on_start=True)
+    step_service.step_registry.register(InstructionOverrideAgentStep)
+    flow_id = create_flow(flow_service)
+    step = InstructionOverrideAgentStep(
+        step_id="agent-step",
+        flow_id=flow_id,
+        scope_id="scope",
+        state=AgentStepState(
+            agent_role="worker",
+            agent_type="worker_type",
+            create_agent_if_missing=True,
+            variables={"goal": "testing"},
+        ),
+    )
+    step_id = attach_agent_step(flow_service, flow_id, step)
+
+    step_service.run_step(step_id)
+    latest = step_service.wait_step(step_id)
+
+    assert latest.status is StepStatus.COMPLETED
+    assert agent_service.start_calls[0]["developer_instructions_template_override"] == "Controlled instructions for {{goal}}."
 
 
 def test_run_passes_agent_wait_timeout_to_agent_service(tmp_path: Path) -> None:
