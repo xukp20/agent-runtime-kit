@@ -14,6 +14,15 @@ from .models import (
     to_jsonable,
 )
 from .store_utils import encode_scope_id, read_json, utc_now_iso, write_json_atomic
+from .trace import (
+    AgentRolloutInfo,
+    AgentTraceEventView,
+    AgentTraceReader,
+    AgentTraceReport,
+    AgentTurnSummary,
+    AgentResponseTextView,
+    AgentToolCallView,
+)
 
 
 class AgentStoreService:
@@ -186,6 +195,111 @@ class AgentStoreService:
             if line.strip():
                 events.append(json.loads(line))
         return events
+
+    def trace_reader(self, agent_id: str) -> AgentTraceReader:
+        return AgentTraceReader(
+            agent=self.get_agent(agent_id),
+            rollout_path=self.locate_rollout(agent_id),
+            events=self.read_rollout_events(agent_id),
+        )
+
+    def get_rollout_info(self, agent_id: str) -> AgentRolloutInfo:
+        return self.trace_reader(agent_id).get_rollout_info()
+
+    def list_trace_turns(self, agent_id: str) -> list[AgentTurnSummary]:
+        return self.trace_reader(agent_id).list_turns()
+
+    def get_trace_turn(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        index: int | None = None,
+        latest: bool = False,
+    ) -> AgentTurnSummary | None:
+        return self.trace_reader(agent_id).get_turn(turn_id=turn_id, index=index, latest=latest)
+
+    def get_trace_event(
+        self,
+        agent_id: str,
+        *,
+        index: int | None = None,
+        last: bool = False,
+    ) -> AgentTraceEventView | None:
+        return self.trace_reader(agent_id).get_event(index=index, last=last)
+
+    def tail_trace_events(
+        self,
+        agent_id: str,
+        *,
+        limit: int = 20,
+        event_type: str | None = None,
+        payload_type: str | None = None,
+    ) -> list[AgentTraceEventView]:
+        return self.trace_reader(agent_id).tail_events(
+            limit=limit,
+            event_type=event_type,
+            payload_type=payload_type,
+        )
+
+    def list_response_texts(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        latest: bool = False,
+    ) -> list[AgentResponseTextView]:
+        return self.trace_reader(agent_id).list_response_texts(turn_id=turn_id, latest=latest)
+
+    def get_latest_response_text(self, agent_id: str) -> str | None:
+        return self.trace_reader(agent_id).get_latest_response_text()
+
+    def list_tool_calls(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        latest: bool = False,
+    ) -> list[AgentToolCallView]:
+        return self.trace_reader(agent_id).list_tool_calls(turn_id=turn_id, latest=latest)
+
+    def get_tool_call(
+        self,
+        agent_id: str,
+        *,
+        call_id: str | None = None,
+        index: int | None = None,
+        last: bool = False,
+    ) -> AgentToolCallView | None:
+        return self.trace_reader(agent_id).get_tool_call(call_id=call_id, index=index, last=last)
+
+    def build_trace_report(
+        self,
+        agent_id: str,
+        *,
+        artifact_path: str | Path | None = None,
+        slow_call_limit: int = 20,
+    ) -> AgentTraceReport:
+        return self.trace_reader(agent_id).build_trace_report(
+            artifact_path=artifact_path,
+            slow_call_limit=slow_call_limit,
+        )
+
+    def export_trace_report(
+        self,
+        agent_id: str,
+        *,
+        output_path: str | Path,
+        format: str = "json",
+        artifact_path: str | Path | None = None,
+        slow_call_limit: int = 20,
+    ) -> AgentTraceReport:
+        return self.trace_reader(agent_id).export_trace_report(
+            output_path=output_path,
+            format=format,
+            artifact_path=artifact_path,
+            slow_call_limit=slow_call_limit,
+        )
 
     def read_thread(self, agent_id: str, include_turns: bool = True) -> object:
         agent = self.get_agent(agent_id)

@@ -88,12 +88,14 @@ class CodexProvider:
         sdk_python_root: Path | None = None,
         model: str | None = None,
         thread_config: dict[str, object] | None = None,
+        approval_mode: str = "deny_all",
     ) -> None:
         self.runtime_root = Path(runtime_root) if runtime_root is not None else None
         self.codex_bin = codex_bin
         self.sdk_python_root = Path(sdk_python_root) if sdk_python_root is not None else None
         self.model = model
         self.thread_config = dict(thread_config or {})
+        self.approval_mode = approval_mode
         self._agent_runs: dict[str, _CodexAgentRun] = {}
         self._home_init_locks: dict[tuple[str, str], threading.Lock] = {}
         self._lock = threading.RLock()
@@ -120,6 +122,7 @@ class CodexProvider:
                     developer_instructions=developer_instructions,
                     model=self.model,
                     config=self.thread_config or None,
+                    approval_mode=self._sdk_approval_mode(sdk),
                 )
                 turn_result = thread.run(prompt, cwd=workdir, model=self.model)
                 rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
@@ -485,6 +488,15 @@ class CodexProvider:
             cwd=workdir,
             env=dict(env),
         )
+
+    def _sdk_approval_mode(self, sdk):
+        approval_mode_type = getattr(sdk, "ApprovalMode", None)
+        if approval_mode_type is None:
+            return self.approval_mode
+        try:
+            return approval_mode_type(self.approval_mode)
+        except (TypeError, ValueError):
+            return getattr(approval_mode_type, self.approval_mode)
 
     def _agent_home_root(self, agent) -> Path:
         if self.runtime_root is None:

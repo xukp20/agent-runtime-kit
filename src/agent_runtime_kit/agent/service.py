@@ -563,6 +563,110 @@ class AgentService:
     def read_rollout_events(self, agent_id: str) -> list[dict]:
         return self.store.read_rollout_events(agent_id)
 
+    def trace_reader(self, agent_id: str):
+        return self.store.trace_reader(agent_id)
+
+    def get_rollout_info(self, agent_id: str):
+        return self.store.get_rollout_info(agent_id)
+
+    def list_trace_turns(self, agent_id: str):
+        return self.store.list_trace_turns(agent_id)
+
+    def get_trace_turn(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        index: int | None = None,
+        latest: bool = False,
+    ):
+        return self.store.get_trace_turn(agent_id, turn_id=turn_id, index=index, latest=latest)
+
+    def get_trace_event(
+        self,
+        agent_id: str,
+        *,
+        index: int | None = None,
+        last: bool = False,
+    ):
+        return self.store.get_trace_event(agent_id, index=index, last=last)
+
+    def tail_trace_events(
+        self,
+        agent_id: str,
+        *,
+        limit: int = 20,
+        event_type: str | None = None,
+        payload_type: str | None = None,
+    ):
+        return self.store.tail_trace_events(
+            agent_id,
+            limit=limit,
+            event_type=event_type,
+            payload_type=payload_type,
+        )
+
+    def list_response_texts(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        latest: bool = False,
+    ):
+        return self.store.list_response_texts(agent_id, turn_id=turn_id, latest=latest)
+
+    def get_latest_response_text(self, agent_id: str) -> str | None:
+        return self.store.get_latest_response_text(agent_id)
+
+    def list_tool_calls(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        latest: bool = False,
+    ):
+        return self.store.list_tool_calls(agent_id, turn_id=turn_id, latest=latest)
+
+    def get_tool_call(
+        self,
+        agent_id: str,
+        *,
+        call_id: str | None = None,
+        index: int | None = None,
+        last: bool = False,
+    ):
+        return self.store.get_tool_call(agent_id, call_id=call_id, index=index, last=last)
+
+    def build_trace_report(
+        self,
+        agent_id: str,
+        *,
+        artifact_path: str | Path | None = None,
+        slow_call_limit: int = 20,
+    ):
+        return self.store.build_trace_report(
+            agent_id,
+            artifact_path=artifact_path,
+            slow_call_limit=slow_call_limit,
+        )
+
+    def export_trace_report(
+        self,
+        agent_id: str,
+        *,
+        output_path: str | Path,
+        format: str = "json",
+        artifact_path: str | Path | None = None,
+        slow_call_limit: int = 20,
+    ):
+        return self.store.export_trace_report(
+            agent_id,
+            output_path=output_path,
+            format=format,
+            artifact_path=artifact_path,
+            slow_call_limit=slow_call_limit,
+        )
+
     def close(self) -> None:
         for provider in self.providers.values():
             close = getattr(provider, "close", None)

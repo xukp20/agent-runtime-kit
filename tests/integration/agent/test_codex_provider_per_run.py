@@ -150,6 +150,8 @@ def test_codex_provider_initializes_home_once_then_uses_per_run_codex(tmp_path: 
     assert second_run_codex.config["env"]["ARK_RUN_TOKEN"] == "second"
     assert first_run_codex.config["cwd"] == str(tmp_path / "work-a")
     assert second_run_codex.config["cwd"] == str(tmp_path / "work-b")
+    assert first_run_codex._client.thread_start_calls[0]["approval_mode"] == "deny_all"
+    assert second_run_codex._client.thread_start_calls[0]["approval_mode"] == "deny_all"
     assert (home_root / ".ark" / "codex_home_initialized.json").exists()
 
 
