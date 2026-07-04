@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from agent_runtime_kit.agent.homes import HomeCreateSpec
@@ -41,6 +42,14 @@ def test_scope_snapshot_copies_scope_metadata_and_only_scope_rollouts(tmp_path: 
         / ".codex"
         / service.get_agent(agent_a.agent_id).rollout_relpath
     ).exists()
+    assert (
+        snapshot_dir
+        / "files"
+        / "reports"
+        / "agents"
+        / agent_a.agent_id
+        / "latest.json"
+    ).exists()
     assert not (
         snapshot_dir
         / "files"
@@ -49,6 +58,14 @@ def test_scope_snapshot_copies_scope_metadata_and_only_scope_rollouts(tmp_path: 
         / "worker"
         / ".codex"
         / service.get_agent(agent_b.agent_id).rollout_relpath
+    ).exists()
+    assert not (
+        snapshot_dir
+        / "files"
+        / "reports"
+        / "agents"
+        / agent_b.agent_id
+        / "latest.json"
     ).exists()
 
 
@@ -64,13 +81,17 @@ def test_scope_restore_replaces_scope_and_rollout_from_snapshot(tmp_path: Path) 
     assert snapshot.snapshot_id is not None
     rollout_path = service.store.locate_rollout(agent.agent_id)
     assert rollout_path is not None
+    report_path = service.store.report_dir(agent.agent_id) / "latest.json"
+    assert report_path.exists()
     rollout_path.write_text('{"type": "turn_result", "thread_id": "bad", "turn_id": "bad", "prompt": "bad"}\n', encoding="utf-8")
+    report_path.write_text('{"bad": true}\n', encoding="utf-8")
 
     restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
 
     assert restored.status == "created"
     events = service.read_rollout_events(agent.agent_id)
     assert events[-1]["prompt"] == "Start first."
+    assert json.loads(report_path.read_text(encoding="utf-8"))["rollout"]["agent_id"] == agent.agent_id
     assert service.get_agent(agent.agent_id).scope_id == "scope-a"
 
 

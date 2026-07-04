@@ -90,6 +90,17 @@ class AgentTraceReport:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class AgentTraceReportPaths:
+    agent_id: str
+    reports_root: str
+    latest_json_path: str
+    latest_markdown_path: str
+    turn_json_path: str | None = None
+    turn_markdown_path: str | None = None
+    written_paths: list[str] = field(default_factory=list)
+
+
 class AgentTraceReader:
     """Read-only parser for provider rollout JSONL events."""
 

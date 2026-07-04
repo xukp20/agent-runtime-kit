@@ -48,6 +48,9 @@ def test_agent_service_runs_agent_and_reads_latest_result(tmp_path: Path) -> Non
     assert restored_agent.status == "idle"
     assert restored_agent.thread_id == "thread-1"
     assert restored_agent.rollout_relpath == "sessions/fake/rollout-thread-1.jsonl"
+    report_paths = service.get_default_trace_report_paths(agent.agent_id)
+    assert Path(report_paths.latest_json_path).exists()
+    assert service.read_default_trace_report(agent.agent_id)["latest_turn"]["turn_id"] == result.id
     assert provider.calls[0]["env_home"] == str(runtime_root / "homes" / "codex" / "worker")
     assert provider.calls[0]["home_id"] == "worker"
     assert provider.calls[0]["agent_id"] == agent.agent_id

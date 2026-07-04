@@ -144,6 +144,7 @@ class AgentService:
                 self.pause_controller.pause(None)
         self._lock = threading.RLock()
         self._active: dict[str, _ActiveAgentRun] = {}
+        self.trace_report_errors: list[dict[str, str]] = []
 
     def create_agent(
         self,
@@ -356,9 +357,11 @@ class AgentService:
                         error_message=str(exc),
                     )
                     self.store.update_completion(agent_id, record)
+                    self._export_trace_reports_best_effort(agent_id)
                     active.latest_completion = record
                     raise AgentCompletionCheckError(str(exc)) from exc
                 self.store.update_completion(agent_id, record)
+                self._export_trace_reports_best_effort(agent_id)
                 active.latest_completion = record
                 if decision.close_agent:
                     self.store.patch_agent(agent_id, status="closed")
@@ -667,11 +670,42 @@ class AgentService:
             slow_call_limit=slow_call_limit,
         )
 
+    def get_default_trace_report_paths(self, agent_id: str):
+        return self.store.get_default_trace_report_paths(agent_id)
+
+    def export_default_trace_reports(
+        self,
+        agent_id: str,
+        *,
+        artifact_path: str | Path | None = None,
+        slow_call_limit: int = 20,
+    ):
+        return self.store.export_default_trace_reports(
+            agent_id,
+            artifact_path=artifact_path,
+            slow_call_limit=slow_call_limit,
+        )
+
+    def read_default_trace_report(self, agent_id: str, *, format: str = "json") -> object | None:
+        return self.store.read_default_trace_report(agent_id, format=format)
+
     def close(self) -> None:
         for provider in self.providers.values():
             close = getattr(provider, "close", None)
             if callable(close):
                 close()
+
+    def _export_trace_reports_best_effort(self, agent_id: str) -> None:
+        try:
+            self.store.export_default_trace_reports(agent_id)
+        except BaseException as exc:  # noqa: BLE001 - report generation must not fail Agent turns.
+            self.trace_report_errors.append(
+                {
+                    "agent_id": agent_id,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc) or type(exc).__name__,
+                }
+            )
 
     def _assert_agent_can_start(self, scope_id: str) -> None:
         try:

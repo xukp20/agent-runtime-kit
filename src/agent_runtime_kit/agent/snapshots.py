@@ -360,10 +360,13 @@ class AgentSnapshotService:
                 scope_key = str(manifest["scope_key"])
                 restored_scope_dir = files_root / "scopes" / scope_key
                 current_scope_dir = self.runtime_root / "scopes" / scope_key
+                old_agents = list(self.store.list_agents(scope_id=scope_id))
                 if current_scope_dir.exists():
                     shutil.rmtree(current_scope_dir)
                 if restored_scope_dir.exists():
                     shutil.copytree(restored_scope_dir, current_scope_dir)
+                self._remove_report_files_for_agents(old_agents)
+                self._restore_report_files(files_root)
                 self._restore_home_files(files_root)
                 self._discard_codex_state_databases(files_root)
                 self.store.rebuild_scope_index(scope_id)
@@ -412,10 +415,13 @@ class AgentSnapshotService:
                         scope_key = str(scope_manifest["scope_key"])
                         current_scope_dir = self.runtime_root / "scopes" / scope_key
                         restored_scope_dir = files_root / "scopes" / scope_key
+                        old_agents = list(self.store.list_agents(scope_id=scope_id))
                         if current_scope_dir.exists():
                             shutil.rmtree(current_scope_dir)
                         if restored_scope_dir.exists():
                             shutil.copytree(restored_scope_dir, current_scope_dir)
+                        self._remove_report_files_for_agents(old_agents)
+                        self._restore_report_files(files_root)
                         self._restore_home_files(files_root)
                     except BaseException as exc:
                         errors[scope_id] = exc
@@ -515,11 +521,13 @@ class AgentSnapshotService:
         for agent in self.store.list_agents(scope_id=scope_id):
             rollout = self.store.locate_rollout(agent.agent_id)
             if rollout is None or not rollout.exists():
+                self._copy_report_files(agent.agent_id, files_root)
                 continue
             relpath = rollout.relative_to(self.runtime_root)
             target = files_root / relpath
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(rollout, target)
+            self._copy_report_files(agent.agent_id, files_root)
         created_at = utc_now_iso()
         write_json_atomic(
             snapshot_dir / "snapshot.json",
@@ -593,6 +601,27 @@ class AgentSnapshotService:
         if not homes_root.exists():
             return
         shutil.copytree(homes_root, self.runtime_root / "homes", dirs_exist_ok=True)
+
+    def _copy_report_files(self, agent_id: str, files_root: Path) -> None:
+        source = self.store.report_dir(agent_id)
+        if not source.exists():
+            return
+        target = files_root / source.relative_to(self.runtime_root)
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target)
+
+    def _restore_report_files(self, files_root: Path) -> None:
+        reports_root = files_root / "reports"
+        if not reports_root.exists():
+            return
+        shutil.copytree(reports_root, self.runtime_root / "reports", dirs_exist_ok=True)
+
+    def _remove_report_files_for_agents(self, agents: list[Any]) -> None:
+        for agent in agents:
+            report_dir = self.store.report_dir(str(agent.agent_id))
+            if report_dir.exists():
+                shutil.rmtree(report_dir)
 
     def _discard_codex_state_databases(self, files_root: Path) -> None:
         codex_homes_root = files_root / "homes" / "codex"

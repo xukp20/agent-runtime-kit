@@ -210,6 +210,29 @@ def test_trace_builds_report_and_exports_json_and_markdown(tmp_path: Path) -> No
     assert "Agent Trace Report" in markdown_path.read_text(encoding="utf-8")
 
 
+def test_trace_exports_and_reads_default_reports(tmp_path: Path) -> None:
+    store, agent_id = _store_with_rollout(
+        tmp_path,
+        [
+            {"type": "turn_context", "payload": {"turn_id": "turn/with/slash"}},
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn/with/slash", "last_agent_message": "ok"},
+            },
+        ],
+    )
+
+    paths = store.export_default_trace_reports(agent_id)
+
+    assert Path(paths.latest_json_path).exists()
+    assert Path(paths.latest_markdown_path).exists()
+    assert paths.turn_json_path is not None
+    assert paths.turn_markdown_path is not None
+    assert Path(paths.turn_json_path).name == "turn_with_slash.json"
+    assert store.read_default_trace_report(agent_id)["latest_turn"]["final_response"] == "ok"
+    assert "Agent Trace Report" in store.read_default_trace_report(agent_id, format="markdown")
+
+
 def _store_with_rollout(
     tmp_path: Path,
     events: list[dict[str, object]],

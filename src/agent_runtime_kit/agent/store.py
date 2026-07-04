@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import uuid
 from pathlib import Path
@@ -19,6 +20,7 @@ from .trace import (
     AgentTraceEventView,
     AgentTraceReader,
     AgentTraceReport,
+    AgentTraceReportPaths,
     AgentTurnSummary,
     AgentResponseTextView,
     AgentToolCallView,
@@ -301,6 +303,74 @@ class AgentStoreService:
             slow_call_limit=slow_call_limit,
         )
 
+    def get_default_trace_report_paths(self, agent_id: str) -> AgentTraceReportPaths:
+        reports_root = self.report_dir(agent_id)
+        return AgentTraceReportPaths(
+            agent_id=agent_id,
+            reports_root=str(reports_root),
+            latest_json_path=str(reports_root / "latest.json"),
+            latest_markdown_path=str(reports_root / "latest.md"),
+        )
+
+    def report_dir(self, agent_id: str) -> Path:
+        return self.runtime_root / "reports" / "agents" / _safe_report_key(agent_id)
+
+    def export_default_trace_reports(
+        self,
+        agent_id: str,
+        *,
+        artifact_path: str | Path | None = None,
+        slow_call_limit: int = 20,
+    ) -> AgentTraceReportPaths:
+        reports_root = self.report_dir(agent_id)
+        latest_json = reports_root / "latest.json"
+        latest_markdown = reports_root / "latest.md"
+        reports_root.mkdir(parents=True, exist_ok=True)
+        report = self.export_trace_report(
+            agent_id,
+            output_path=latest_json,
+            format="json",
+            artifact_path=artifact_path,
+            slow_call_limit=slow_call_limit,
+        )
+        self.export_trace_report(
+            agent_id,
+            output_path=latest_markdown,
+            format="markdown",
+            artifact_path=artifact_path,
+            slow_call_limit=slow_call_limit,
+        )
+        written = [str(latest_json), str(latest_markdown)]
+        turn_json = None
+        turn_markdown = None
+        if report.latest_turn is not None:
+            turn_key = _safe_report_key(report.latest_turn.turn_id)
+            turn_json = reports_root / "turns" / f"{turn_key}.json"
+            turn_markdown = reports_root / "turns" / f"{turn_key}.md"
+            turn_json.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(latest_json, turn_json)
+            shutil.copyfile(latest_markdown, turn_markdown)
+            written.extend([str(turn_json), str(turn_markdown)])
+        return AgentTraceReportPaths(
+            agent_id=agent_id,
+            reports_root=str(reports_root),
+            latest_json_path=str(latest_json),
+            latest_markdown_path=str(latest_markdown),
+            turn_json_path=str(turn_json) if turn_json is not None else None,
+            turn_markdown_path=str(turn_markdown) if turn_markdown is not None else None,
+            written_paths=written,
+        )
+
+    def read_default_trace_report(self, agent_id: str, *, format: str = "json") -> object | None:
+        paths = self.get_default_trace_report_paths(agent_id)
+        if format == "json":
+            path = Path(paths.latest_json_path)
+            return read_json(path) if path.exists() else None
+        if format == "markdown":
+            path = Path(paths.latest_markdown_path)
+            return path.read_text(encoding="utf-8") if path.exists() else None
+        raise ValueError(f"unsupported trace report format: {format}")
+
     def read_thread(self, agent_id: str, include_turns: bool = True) -> object:
         agent = self.get_agent(agent_id)
         if not agent.thread_id:
@@ -472,3 +542,10 @@ def _upsert_agent_row(conn: sqlite3.Connection, agent: Agent, scope_key: str, ag
             agent.updated_at,
         ),
     )
+
+
+def _safe_report_key(value: str) -> str:
+    text = str(value).strip()
+    if not text:
+        return "unknown"
+    return "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in text)
