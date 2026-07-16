@@ -38,7 +38,7 @@ from .patterns import (
 )
 from .registry import FlowTypeRegistry, StepTypeRegistry
 from .rendering import RenderContext
-from .scheduler import RuntimeScheduleService, SchedulerTickResult
+from .scheduler import RuntimeScheduleService, SchedulerRunBudget, SchedulerRunControlView, SchedulerTickResult
 from .services import ActiveStepRun, FlowService, StepService
 from .standard_steps import (
     AgentStep,
@@ -99,6 +99,8 @@ __all__ = [
     "ManualPauseState",
     "RenderContext",
     "RuntimeScheduleService",
+    "SchedulerRunBudget",
+    "SchedulerRunControlView",
     "SchedulerTickResult",
     "StepTypeRegistry",
     "StepStatus",

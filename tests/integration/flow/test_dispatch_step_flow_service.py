@@ -11,12 +11,13 @@ from agent_runtime_kit.flow import (
     FlowService,
     FlowTypeRegistry,
     RuntimeScheduleService,
+    SchedulerRunBudget,
     StepService,
     StepStatus,
     StepTypeRegistry,
 )
 from agent_runtime_kit.flow.standard_steps import DispatchStep, DispatchStepState
-from agent_runtime_kit.runtime import ARKServices, AppServices
+from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimePauseController
 
 
 class IntegrationParentParams(BaseModel):
@@ -151,3 +152,49 @@ def test_dispatch_step_preserves_terminal_handoff_continuation(tmp_path: Path) -
     assert len(children) == 1
     assert children[0].parent_flow_id == parent_id
     assert children[0].parent_dispatch_step_id == step.step_id
+
+
+def test_bounded_dispatch_step_does_not_grant_child_flow_advance_budget(tmp_path: Path) -> None:
+    flow_service, step_service, scheduler = make_services(tmp_path / ".agent_runtime")
+    pause = RuntimePauseController(global_paused=True)
+    scheduler.ark.pause_controller = pause
+    parent_id = flow_service.start_flow(
+        FlowRequest(flow_type="dispatch_integration_parent", scope_id="scope", params={}),
+        enqueue=False,
+    )
+    step = DispatchStep(
+        step_id="dispatch-step",
+        flow_id=parent_id,
+        scope_id="scope",
+        state=DispatchStepState(
+            source_step_id="source-step",
+            source_submission_id="submission-1",
+            requests=[
+                FlowRequest(flow_type="dispatch_integration_child", scope_id="scope", params={"name": "a"}),
+            ],
+        ),
+    )
+    step_service.create_step(step, enqueue=False)
+    flow_service.store.update_flow_record(
+        parent_id,
+        lambda flow: (flow.step_ids.append(step.step_id), setattr(flow, "current_step_id", step.step_id)),
+    )
+    scheduler.enqueue_step(step.step_id)
+    scheduler.configure_run_budget(SchedulerRunBudget(flow_advances=0, step_starts=1))
+    pause.resume(None)
+
+    tick = scheduler.schedule_ready()
+
+    terminal = step_service.wait_step(step.step_id)
+    settled_tick = tick if tick.auto_paused else scheduler.schedule_ready()
+    children = flow_service.store.list_child_flows(parent_flow_id=parent_id, parent_dispatch_step_id=step.step_id)
+    assert terminal.status is StepStatus.COMPLETED
+    assert len(children) == 1
+    assert children[0].status.value == "created"
+    assert children[0].flow_id in scheduler.queued_flow_ids
+    assert tick.advanced_flow_ids == []
+    assert tick.started_step_ids == [step.step_id]
+    assert settled_tick.auto_paused is True
+    assert settled_tick.run_control is not None
+    assert settled_tick.run_control.remaining_flow_advances == 0
+    assert pause.is_paused(None)
