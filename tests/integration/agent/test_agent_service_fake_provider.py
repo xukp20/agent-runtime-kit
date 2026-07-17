@@ -5,6 +5,7 @@ import pytest
 
 from agent_runtime_kit.agent.homes import HomeCreateSpec
 from agent_runtime_kit.agent.models import AgentIncompleteError, AgentPausedError, CompletionDecision
+from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy, TraceReportPersistence
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 
 from .fakes import FakeProvider, FakeTurnResult
@@ -50,11 +51,50 @@ def test_agent_service_runs_agent_and_reads_latest_result(tmp_path: Path) -> Non
     assert restored_agent.rollout_relpath == "sessions/fake/rollout-thread-1.jsonl"
     report_paths = service.get_default_trace_report_paths(agent.agent_id)
     assert Path(report_paths.latest_json_path).exists()
+    assert not (Path(report_paths.reports_root) / "turns").exists()
     assert service.read_default_trace_report(agent.agent_id)["latest_turn"]["turn_id"] == result.id
     assert provider.calls[0]["env_home"] == str(runtime_root / "homes" / "codex" / "worker")
     assert provider.calls[0]["home_id"] == "worker"
     assert provider.calls[0]["agent_id"] == agent.agent_id
     assert service.read_latest_turn_result(agent.agent_id).id == result.id
+
+
+@pytest.mark.parametrize(
+    ("persistence", "expect_latest", "expect_turns"),
+    [
+        (TraceReportPersistence.DISABLED, False, False),
+        (TraceReportPersistence.LATEST_ONLY, True, False),
+        (TraceReportPersistence.LATEST_AND_TURNS, True, True),
+    ],
+)
+def test_agent_service_applies_automatic_trace_report_persistence(
+    tmp_path: Path,
+    persistence: TraceReportPersistence,
+    expect_latest: bool,
+    expect_turns: bool,
+) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    registry = AgentTypeRegistry()
+    registry.register(BasicAgentType())
+    provider = FakeProvider(runtime_root)
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        providers={"codex": provider},
+        trace_report_policy=AgentTraceReportPolicy(persistence=persistence),
+    )
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("repo:node", "worker")
+
+    service.start_agent(agent.agent_id, variables={"item": "lemma"})
+    result = service.wait_agent(agent.agent_id)
+
+    paths = service.get_default_trace_report_paths(agent.agent_id)
+    assert Path(paths.latest_json_path).exists() is expect_latest
+    assert (Path(paths.reports_root) / "turns" / f"{result.id}.json").exists() is expect_turns
+    explicit_path = runtime_root / "explicit.json"
+    service.export_trace_report(agent.agent_id, output_path=explicit_path)
+    assert explicit_path.exists()
 
 
 def test_agent_service_supports_run_level_template_overrides_on_resume(tmp_path: Path) -> None:

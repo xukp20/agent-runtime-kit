@@ -12,6 +12,7 @@ from typing import Any
 from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimePauseController
 
 from .models import RuntimeSnapshotInfo, RuntimeSnapshotResult, ScopeSnapshotInfo, ScopeSnapshotResult
+from .report_policy import AgentTraceReportPolicy
 from .store import AgentStoreService
 from .store_utils import encode_scope_id, read_json, utc_now_iso, write_json_atomic
 
@@ -25,6 +26,7 @@ class AgentSnapshotService:
         agent_service: object | None = None,
         ark_services: ARKServices | None = None,
         app_services: AppServices | None = None,
+        trace_report_policy: AgentTraceReportPolicy | None = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.store = store
@@ -32,6 +34,8 @@ class AgentSnapshotService:
         self.ark = ark_services or inferred_ark or ARKServices()
         self.app = app_services or getattr(agent_service, "app_services", None) or AppServices()
         self.agent_service = agent_service or self.ark.agent_service
+        inferred_report_policy = getattr(self.agent_service, "trace_report_policy", None)
+        self.trace_report_policy = trace_report_policy or inferred_report_policy or AgentTraceReportPolicy()
         if self.agent_service is not None and self.ark.agent_service is None:
             self.ark.agent_service = self.agent_service
         if self.ark.pause_controller is None:
@@ -658,6 +662,8 @@ class AgentSnapshotService:
         shutil.copytree(homes_root, self.runtime_root / "homes", dirs_exist_ok=True)
 
     def _copy_report_files(self, agent_id: str, files_root: Path) -> None:
+        if not self.trace_report_policy.include_in_snapshots:
+            return
         source = self.store.report_dir(agent_id)
         if not source.exists():
             return

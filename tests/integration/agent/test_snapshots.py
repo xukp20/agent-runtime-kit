@@ -3,6 +3,7 @@ from pathlib import Path
 
 from agent_runtime_kit.agent.homes import HomeCreateSpec
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
+from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
 from agent_runtime_kit.agent.store_utils import encode_scope_id
 
@@ -42,7 +43,7 @@ def test_scope_snapshot_copies_scope_metadata_and_only_scope_rollouts(tmp_path: 
         / ".codex"
         / service.get_agent(agent_a.agent_id).rollout_relpath
     ).exists()
-    assert (
+    assert not (
         snapshot_dir
         / "files"
         / "reports"
@@ -76,7 +77,12 @@ def test_scope_restore_replaces_scope_and_rollout_from_snapshot(tmp_path: Path) 
     agent = service.create_agent("scope-a", "worker")
     service.start_agent(agent.agent_id, variables={"item": "first"})
     service.wait_agent(agent.agent_id)
-    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    snapshot_service = AgentSnapshotService(
+        runtime_root,
+        store=service.store,
+        agent_service=service,
+        trace_report_policy=AgentTraceReportPolicy(include_in_snapshots=True),
+    )
     snapshot = snapshot_service.create_scope_snapshot("scope-a")
     assert snapshot.snapshot_id is not None
     rollout_path = service.store.locate_rollout(agent.agent_id)
@@ -93,6 +99,30 @@ def test_scope_restore_replaces_scope_and_rollout_from_snapshot(tmp_path: Path) 
     assert events[-1]["prompt"] == "Start first."
     assert json.loads(report_path.read_text(encoding="utf-8"))["rollout"]["agent_id"] == agent.agent_id
     assert service.get_agent(agent.agent_id).scope_id == "scope-a"
+
+
+def test_scope_restore_without_reports_removes_stale_live_reports(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope-a", "worker")
+    service.start_agent(agent.agent_id, variables={"item": "first"})
+    service.wait_agent(agent.agent_id)
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    snapshot = snapshot_service.create_scope_snapshot("scope-a")
+    assert snapshot.snapshot_id is not None
+    report_dir = service.store.report_dir(agent.agent_id)
+    assert report_dir.exists()
+    assert not (runtime_root / str(snapshot.snapshot_relpath) / "files" / "reports").exists()
+
+    (report_dir / "latest.json").write_text('{"stale": true}\n', encoding="utf-8")
+    restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    assert not report_dir.exists()
+    rebuilt = service.export_default_trace_reports(agent.agent_id)
+    assert Path(rebuilt.latest_json_path).exists()
+    assert service.read_default_trace_report(agent.agent_id)["rollout"]["agent_id"] == agent.agent_id
 
 
 def test_scope_restore_rejects_corrupted_archive_before_mutating_live_scope(tmp_path: Path) -> None:

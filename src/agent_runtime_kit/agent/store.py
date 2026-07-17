@@ -321,6 +321,7 @@ class AgentStoreService:
         *,
         artifact_path: str | Path | None = None,
         slow_call_limit: int = 20,
+        include_turn_history: bool = True,
     ) -> AgentTraceReportPaths:
         reports_root = self.report_dir(agent_id)
         latest_json = reports_root / "latest.json"
@@ -343,7 +344,7 @@ class AgentStoreService:
         written = [str(latest_json), str(latest_markdown)]
         turn_json = None
         turn_markdown = None
-        if report.latest_turn is not None:
+        if include_turn_history and report.latest_turn is not None:
             turn_key = _safe_report_key(report.latest_turn.turn_id)
             turn_json = reports_root / "turns" / f"{turn_key}.json"
             turn_markdown = reports_root / "turns" / f"{turn_key}.md"

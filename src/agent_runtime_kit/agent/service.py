@@ -29,6 +29,7 @@ from .models import (
     WaitAgentsResult,
 )
 from .providers.codex import CodexProvider
+from .report_policy import AgentTraceReportPolicy, TraceReportPersistence
 from .store import AgentStoreService
 from .store_utils import utc_now_iso
 from .templates import render_template
@@ -126,6 +127,7 @@ class AgentService:
         ark_services: ARKServices | None = None,
         app_services: AppServices | None = None,
         start_paused: bool = False,
+        trace_report_policy: AgentTraceReportPolicy | None = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.agent_types = agent_types or AgentTypeRegistry()
@@ -135,6 +137,7 @@ class AgentService:
         self.ark_services = ark_services or ARKServices()
         self.ark_services.agent_service = self
         self.app_services = app_services or AppServices()
+        self.trace_report_policy = trace_report_policy or AgentTraceReportPolicy()
         if self.ark_services.pause_controller is None:
             self.pause_controller = RuntimePauseController(global_paused=start_paused)
             self.ark_services.pause_controller = self.pause_controller
@@ -696,8 +699,15 @@ class AgentService:
                 close()
 
     def _export_trace_reports_best_effort(self, agent_id: str) -> None:
+        if self.trace_report_policy.persistence == TraceReportPersistence.DISABLED:
+            return
         try:
-            self.store.export_default_trace_reports(agent_id)
+            self.store.export_default_trace_reports(
+                agent_id,
+                include_turn_history=(
+                    self.trace_report_policy.persistence == TraceReportPersistence.LATEST_AND_TURNS
+                ),
+            )
         except BaseException as exc:  # noqa: BLE001 - report generation must not fail Agent turns.
             self.trace_report_errors.append(
                 {

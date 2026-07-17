@@ -8,6 +8,7 @@ from .models import (
     CompletionDecision,
     WaitAgentsResult,
 )
+from .report_policy import AgentTraceReportPolicy, TraceReportPersistence
 from .service import AgentCompletionContext
 from .skills import SkillService, SkillSpec, write_skill_spec
 from .snapshots import AgentSnapshotService
@@ -30,6 +31,7 @@ __all__ = [
     "AgentArtifactView",
     "AgentResponseTextView",
     "AgentRuntimeKitError",
+    "AgentTraceReportPolicy",
     "AgentSnapshotService",
     "AgentRolloutInfo",
     "AgentToolCallView",
@@ -43,6 +45,7 @@ __all__ = [
     "SkillSpec",
     "TemplateVariableError",
     "TextFragment",
+    "TraceReportPersistence",
     "WaitAgentsResult",
     "render_template",
     "write_skill_spec",
