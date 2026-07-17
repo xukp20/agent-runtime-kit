@@ -125,6 +125,61 @@ def test_scope_restore_without_reports_removes_stale_live_reports(tmp_path: Path
     assert service.read_default_trace_report(agent.agent_id)["rollout"]["agent_id"] == agent.agent_id
 
 
+def test_scope_snapshot_without_reports_reduces_report_heavy_payload_by_at_least_75_percent(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope-a", "worker")
+    service.start_agent(agent.agent_id, variables={"item": "first"})
+    service.wait_agent(agent.agent_id)
+    report_dir = service.store.report_dir(agent.agent_id)
+    turns_dir = report_dir / "turns"
+    turns_dir.mkdir(parents=True, exist_ok=True)
+    (turns_dir / "large.json").write_bytes(b"x" * (4 * 1024 * 1024))
+
+    with_reports = AgentSnapshotService(
+        runtime_root,
+        store=service.store,
+        agent_service=service,
+        trace_report_policy=AgentTraceReportPolicy(include_in_snapshots=True),
+    ).create_scope_snapshot("scope-a")
+    without_reports = AgentSnapshotService(
+        runtime_root,
+        store=service.store,
+        agent_service=service,
+    ).create_scope_snapshot("scope-a")
+
+    assert with_reports.snapshot_id is not None
+    assert without_reports.snapshot_id is not None
+    with_reports_dir = runtime_root / str(with_reports.snapshot_relpath)
+    without_reports_dir = runtime_root / str(without_reports.snapshot_relpath)
+    with_reports_bytes = sum(path.stat().st_size for path in with_reports_dir.rglob("*") if path.is_file())
+    without_reports_bytes = sum(path.stat().st_size for path in without_reports_dir.rglob("*") if path.is_file())
+    assert without_reports_bytes <= with_reports_bytes * 0.25
+    assert not (without_reports_dir / "files" / "reports").exists()
+
+
+def test_scope_restore_accepts_legacy_v1_manifest_without_file_checksums(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope-a", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    snapshot = snapshot_service.create_scope_snapshot("scope-a")
+    assert snapshot.snapshot_id is not None
+    manifest_path = runtime_root / str(snapshot.snapshot_relpath) / "snapshot.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 1
+    manifest.pop("files")
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    service.store.patch_agent(agent.agent_id, status="closed")
+
+    restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    assert service.get_agent(agent.agent_id).status == "idle"
+
+
 def test_scope_restore_rejects_corrupted_archive_before_mutating_live_scope(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     service = _make_service(runtime_root)
