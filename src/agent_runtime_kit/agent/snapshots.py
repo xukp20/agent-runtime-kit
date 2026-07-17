@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import sqlite3
 import threading
@@ -343,6 +344,15 @@ class AgentSnapshotService:
         with self._lock:
             manifest = self._read_scope_manifest(snapshot_id)
             scope_id = str(manifest["scope_id"])
+            try:
+                self._preflight_scope_snapshot(snapshot_id, manifest=manifest)
+            except BaseException as exc:
+                return ScopeSnapshotResult(
+                    snapshot_id=snapshot_id,
+                    scope_id=scope_id,
+                    status="failed",
+                    errors={"snapshot_archive": exc},
+                )
             was_paused = self._is_scope_directly_paused(scope_id)
             self._pause(scope_id)
             try:
@@ -366,6 +376,7 @@ class AgentSnapshotService:
                 if restored_scope_dir.exists():
                     shutil.copytree(restored_scope_dir, current_scope_dir)
                 self._remove_report_files_for_agents(old_agents)
+                self._remove_rollout_files_for_agents(old_agents)
                 self._restore_report_files(files_root)
                 self._restore_home_files(files_root)
                 self._discard_codex_state_databases(files_root)
@@ -391,9 +402,35 @@ class AgentSnapshotService:
                 if not leave_paused and not was_paused:
                     self._resume(scope_id)
 
-    def restore_runtime_snapshot(self, snapshot_id: str, *, leave_paused: bool = True) -> RuntimeSnapshotResult:
+    def restore_runtime_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        leave_paused: bool = True,
+        prune_extra_scopes: bool = False,
+    ) -> RuntimeSnapshotResult:
         with self._lock:
             manifest = self._read_runtime_manifest(snapshot_id)
+            scope_snapshot_ids = dict(manifest["scope_snapshot_ids"])
+            preflight_errors: dict[str, BaseException] = {}
+            for scope_id, scope_snapshot_id in scope_snapshot_ids.items():
+                try:
+                    scope_manifest = self._read_scope_manifest(str(scope_snapshot_id))
+                    if str(scope_manifest.get("scope_id")) != str(scope_id):
+                        raise RuntimeError(
+                            f"runtime snapshot scope {scope_id} points to a snapshot for "
+                            f"{scope_manifest.get('scope_id')}"
+                        )
+                    self._preflight_scope_snapshot(str(scope_snapshot_id), manifest=scope_manifest)
+                except BaseException as exc:
+                    preflight_errors[str(scope_id)] = exc
+            if preflight_errors:
+                return RuntimeSnapshotResult(
+                    snapshot_id=snapshot_id,
+                    status="failed",
+                    scope_snapshot_ids=scope_snapshot_ids,
+                    errors=preflight_errors,
+                )
             was_paused = self._is_paused(None)
             self._pause(None)
             try:
@@ -406,8 +443,21 @@ class AgentSnapshotService:
                         blocked_scope_ids=tuple(sorted(self._blocked_scope_ids(running, running_steps))),
                         running_step_ids=tuple(running_steps),
                     )
-                scope_snapshot_ids = dict(manifest["scope_snapshot_ids"])
                 errors: dict[str, BaseException] = {}
+                pruned_scope_ids: list[str] = []
+                if prune_extra_scopes:
+                    extra_scope_ids = sorted(set(self.store.list_scope_ids()) - set(scope_snapshot_ids))
+                    for scope_id in extra_scope_ids:
+                        try:
+                            old_agents = list(self.store.list_agents(scope_id=scope_id))
+                            self._remove_report_files_for_agents(old_agents)
+                            self._remove_rollout_files_for_agents(old_agents)
+                            scope_dir = self.runtime_root / "scopes" / encode_scope_id(scope_id)
+                            if scope_dir.exists():
+                                shutil.rmtree(scope_dir)
+                            pruned_scope_ids.append(scope_id)
+                        except BaseException as exc:
+                            errors[f"prune:{scope_id}"] = exc
                 for scope_id, scope_snapshot_id in scope_snapshot_ids.items():
                     try:
                         scope_manifest = self._read_scope_manifest(str(scope_snapshot_id))
@@ -421,6 +471,7 @@ class AgentSnapshotService:
                         if restored_scope_dir.exists():
                             shutil.copytree(restored_scope_dir, current_scope_dir)
                         self._remove_report_files_for_agents(old_agents)
+                        self._remove_rollout_files_for_agents(old_agents)
                         self._restore_report_files(files_root)
                         self._restore_home_files(files_root)
                     except BaseException as exc:
@@ -443,12 +494,14 @@ class AgentSnapshotService:
                         status="failed",
                         scope_snapshot_ids=scope_snapshot_ids,
                         errors=errors,
+                        pruned_scope_ids=tuple(pruned_scope_ids),
                     )
                 return RuntimeSnapshotResult(
                     snapshot_id=snapshot_id,
                     status="created",
                     scope_snapshot_ids=scope_snapshot_ids,
                     snapshot_relpath=str(self._runtime_snapshot_dir(snapshot_id).relative_to(self.runtime_root)),
+                    pruned_scope_ids=tuple(pruned_scope_ids),
                 )
             finally:
                 if not leave_paused and not was_paused:
@@ -529,15 +582,17 @@ class AgentSnapshotService:
             shutil.copyfile(rollout, target)
             self._copy_report_files(agent.agent_id, files_root)
         created_at = utc_now_iso()
+        files = self._snapshot_file_entries(files_root)
         write_json_atomic(
             snapshot_dir / "snapshot.json",
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "object_type": "scope_snapshot",
                 "snapshot_id": snapshot_id,
                 "scope_id": scope_id,
                 "scope_key": scope_key,
                 "created_at": created_at,
+                "files": files,
             },
         )
         snapshot_relpath = str(snapshot_dir.relative_to(self.runtime_root))
@@ -623,6 +678,24 @@ class AgentSnapshotService:
             if report_dir.exists():
                 shutil.rmtree(report_dir)
 
+    def _remove_rollout_files_for_agents(self, agents: list[Any]) -> None:
+        for agent in agents:
+            if str(getattr(agent, "cli_type", "")) != "codex":
+                continue
+            rollout_relpath = getattr(agent, "rollout_relpath", None)
+            if not rollout_relpath:
+                continue
+            rollout = (
+                self.runtime_root
+                / "homes"
+                / "codex"
+                / str(getattr(agent, "home_id", ""))
+                / ".codex"
+                / str(rollout_relpath)
+            )
+            if rollout.is_file():
+                rollout.unlink()
+
     def _discard_codex_state_databases(self, files_root: Path) -> None:
         codex_homes_root = files_root / "homes" / "codex"
         if not codex_homes_root.exists():
@@ -650,6 +723,54 @@ class AgentSnapshotService:
 
     def _read_runtime_manifest(self, snapshot_id: str) -> dict[str, Any]:
         return read_json(self._runtime_snapshot_dir(snapshot_id) / "snapshot.json")
+
+    def _snapshot_file_entries(self, files_root: Path) -> list[dict[str, object]]:
+        if not files_root.exists():
+            return []
+        entries: list[dict[str, object]] = []
+        for path in sorted(files_root.rglob("*")):
+            if not path.is_file():
+                continue
+            entries.append(
+                {
+                    "relpath": path.relative_to(files_root).as_posix(),
+                    "size": path.stat().st_size,
+                    "sha256": self._sha256_file(path),
+                }
+            )
+        return entries
+
+    def _preflight_scope_snapshot(self, snapshot_id: str, *, manifest: dict[str, Any]) -> None:
+        entries = manifest.get("files")
+        if entries is None:
+            return
+        if not isinstance(entries, list):
+            raise RuntimeError(f"scope snapshot {snapshot_id} has an invalid files manifest")
+        files_root = self._scope_snapshot_dir(snapshot_id) / "files"
+        for index, raw_entry in enumerate(entries):
+            if not isinstance(raw_entry, dict):
+                raise RuntimeError(f"scope snapshot {snapshot_id} file entry {index} is invalid")
+            relpath = str(raw_entry.get("relpath") or "")
+            candidate = Path(relpath)
+            if not relpath or candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+                raise RuntimeError(f"scope snapshot {snapshot_id} file entry {index} has an unsafe path")
+            path = files_root / candidate
+            if not path.is_file():
+                raise RuntimeError(f"scope snapshot {snapshot_id} is missing {relpath}")
+            expected_size = int(raw_entry.get("size", -1))
+            if path.stat().st_size != expected_size:
+                raise RuntimeError(f"scope snapshot {snapshot_id} size mismatch for {relpath}")
+            expected_sha256 = str(raw_entry.get("sha256") or "")
+            if not expected_sha256 or self._sha256_file(path) != expected_sha256:
+                raise RuntimeError(f"scope snapshot {snapshot_id} checksum mismatch for {relpath}")
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _scope_snapshot_dir(self, snapshot_id: str) -> Path:
         return self.scope_snapshots_root / snapshot_id

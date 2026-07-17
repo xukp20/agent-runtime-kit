@@ -108,6 +108,7 @@ class RuntimeSnapshotResult:
     running_step_ids: tuple[str, ...] = ()
     errors: dict[str, BaseException] = field(default_factory=dict)
     snapshot_relpath: str | None = None
+    pruned_scope_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

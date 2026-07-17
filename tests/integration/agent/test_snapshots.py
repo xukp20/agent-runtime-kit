@@ -95,6 +95,34 @@ def test_scope_restore_replaces_scope_and_rollout_from_snapshot(tmp_path: Path) 
     assert service.get_agent(agent.agent_id).scope_id == "scope-a"
 
 
+def test_scope_restore_rejects_corrupted_archive_before_mutating_live_scope(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope-a", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    snapshot = snapshot_service.create_scope_snapshot("scope-a")
+    assert snapshot.snapshot_id is not None
+    service.store.patch_agent(agent.agent_id, status="closed")
+    snapshot_agent = (
+        runtime_root
+        / str(snapshot.snapshot_relpath)
+        / "files"
+        / "scopes"
+        / encode_scope_id("scope-a")
+        / "agents"
+        / agent.agent_id
+        / "agent.json"
+    )
+    snapshot_agent.write_text("{}\n", encoding="utf-8")
+
+    restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "failed"
+    assert "snapshot_archive" in restored.errors
+    assert service.get_agent(agent.agent_id).status == "closed"
+
+
 def test_runtime_synchronized_snapshot_and_restore(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     service = _make_service(runtime_root)
@@ -117,6 +145,35 @@ def test_runtime_synchronized_snapshot_and_restore(tmp_path: Path) -> None:
     assert restored.status == "created"
     assert service.get_agent(agent_b.agent_id).status == "idle"
     assert len(snapshot_service.list_runtime_snapshots()) == 1
+
+
+def test_runtime_restore_can_prune_scopes_and_artifacts_created_after_snapshot(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    service.create_agent("scope-a", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    runtime_snapshot = snapshot_service.create_runtime_snapshot_synchronized()
+    assert runtime_snapshot.snapshot_id is not None
+
+    late_agent = service.create_agent("scope-late", "worker")
+    service.start_agent(late_agent.agent_id, variables={"item": "late"})
+    service.wait_agent(late_agent.agent_id)
+    late_rollout = service.store.locate_rollout(late_agent.agent_id)
+    late_report = service.store.report_dir(late_agent.agent_id)
+    assert late_rollout is not None and late_rollout.exists()
+    assert late_report.exists()
+
+    restored = snapshot_service.restore_runtime_snapshot(
+        runtime_snapshot.snapshot_id,
+        prune_extra_scopes=True,
+    )
+
+    assert restored.status == "created"
+    assert restored.pruned_scope_ids == ("scope-late",)
+    assert service.store.list_scope_ids() == ["scope-a"]
+    assert not late_rollout.exists()
+    assert not late_report.exists()
 
 
 def test_runtime_snapshot_for_scopes_validates_parameters(tmp_path: Path) -> None:
