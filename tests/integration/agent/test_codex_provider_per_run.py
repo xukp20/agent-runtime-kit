@@ -4,7 +4,9 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+from agent_runtime_kit.agent.homes import HomeCreateSpec
 from agent_runtime_kit.agent.providers.codex import CodexProvider
+from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 
 
 class FakeCodex:
@@ -54,10 +56,17 @@ class FakeCodex:
 
 
 class FakeHighLevelThread:
+    run_started: threading.Event | None = None
+    run_release: threading.Event | None = None
+
     def __init__(self, thread_id: str) -> None:
         self.id = thread_id
 
     def run(self, prompt: str, **kwargs):
+        if self.run_started is not None:
+            self.run_started.set()
+        if self.run_release is not None:
+            assert self.run_release.wait(timeout=5)
         return SimpleNamespace(id=f"turn-{prompt}", prompt=prompt, run_kwargs=kwargs)
 
     def read(self, include_turns: bool = True):
@@ -115,10 +124,17 @@ class FakeSdk:
         return dict(kwargs)
 
 
+class LiveLocatorAgentType(AgentType):
+    agent_type = "live-locator"
+    developer_instructions_template = "Observe {{item}}."
+    start_prompt_template = "Start {{item}}."
+
+
 def test_codex_provider_initializes_home_once_then_uses_per_run_codex(tmp_path: Path) -> None:
     _reset_fake_codex()
     provider = _provider()
     home_root = tmp_path / "home"
+    started_thread_ids: list[str] = []
 
     first = provider.start_thread(
         home_id="worker",
@@ -128,6 +144,7 @@ def test_codex_provider_initializes_home_once_then_uses_per_run_codex(tmp_path: 
         prompt="first",
         developer_instructions="developer first",
         agent_id="agent-a",
+        on_thread_started=started_thread_ids.append,
     )
     second = provider.start_thread(
         home_id="worker",
@@ -140,6 +157,7 @@ def test_codex_provider_initializes_home_once_then_uses_per_run_codex(tmp_path: 
     )
 
     assert first.thread_id == "thread-started"
+    assert started_thread_ids == ["thread-started"]
     assert second.thread_id == "thread-started"
     assert FakeCodex.account_calls == 1
     assert len(FakeCodex.created) == 3
@@ -192,6 +210,38 @@ def test_codex_provider_tracks_active_agents_without_home_cache(tmp_path: Path) 
 
     provider._finish_agent_run("agent-b")
     assert provider.list_active_agents("worker") == ["agent-a"]
+
+
+def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
+    tmp_path: Path,
+) -> None:
+    _reset_fake_codex()
+    started = threading.Event()
+    release = threading.Event()
+    FakeHighLevelThread.run_started = started
+    FakeHighLevelThread.run_release = release
+    provider = _provider()
+    registry = AgentTypeRegistry()
+    registry.register(LiveLocatorAgentType())
+    service = AgentService(
+        tmp_path / "runtime",
+        agent_types=registry,
+        providers={"codex": provider},
+    )
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="live-locator"))
+    agent = service.create_agent("scope", "live-locator")
+
+    service.start_agent(agent.agent_id, variables={"item": "state"})
+    assert started.wait(timeout=5)
+
+    running = service.get_agent(agent.agent_id)
+    assert running.status == "running"
+    assert running.thread_id == "thread-started"
+    assert provider.list_active_agents("live-locator") == [agent.agent_id]
+
+    release.set()
+    service.wait_agent(agent.agent_id)
+    assert provider.list_active_agents("live-locator") == []
 
 
 def test_codex_provider_resume_instruction_overwrite_uses_fresh_run_codex(
@@ -288,3 +338,5 @@ def _reset_fake_codex() -> None:
     FakeCodex.created.clear()
     FakeCodex.account_calls = 0
     FakeCodex.account_delay_s = 0.0
+    FakeHighLevelThread.run_started = None
+    FakeHighLevelThread.run_release = None

@@ -353,6 +353,37 @@ def test_reconcile_stale_running_agents_repairs_only_inactive_scope(tmp_path: Pa
     assert service.wait_agent(active.agent_id, timeout_s=2).prompt == "Start active."
 
 
+def test_running_agent_audit_requires_explicit_review_for_persisted_locator(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, _provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+    service.store.patch_agent(agent.agent_id, status="running")
+    service.store.update_thread_locator(
+        agent.agent_id,
+        thread_id="thread-stale",
+        rollout_relpath="sessions/stale.jsonl",
+    )
+
+    audit = service.audit_running_agents(scope_id="scope")
+
+    assert len(audit) == 1
+    assert audit[0].classification == "requires_review"
+    assert service.reconcile_stale_running_agents(scope_id="scope") == []
+    dry_run = service.repair_running_agent(
+        agent.agent_id,
+        expected_scope_id="scope",
+        expected_thread_id="thread-stale",
+        expected_rollout_relpath="sessions/stale.jsonl",
+        action="mark_idle",
+        dry_run=True,
+    )
+    assert dry_run.repaired is False
+    assert service.get_agent(agent.agent_id).status == "running"
+
+
 def test_agent_service_interrupt_and_close_delegate_to_provider(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     service, provider = _make_service(runtime_root, BasicAgentType())

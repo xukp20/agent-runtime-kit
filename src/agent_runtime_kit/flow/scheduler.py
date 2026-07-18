@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from threading import RLock
-from typing import Literal
+from typing import Callable, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -24,12 +26,34 @@ class SchedulerRunBudget(BaseModel):
 
 
 class SchedulerRunControlView(BaseModel):
-    mode: Literal["unbounded", "bounded", "draining", "paused"]
+    mode: Literal["unbounded", "bounded", "semantic", "draining", "paused"]
+    run_plan: Literal["unbounded", "bounded", "semantic"] = "unbounded"
+    lease_id: str | None = None
+    semantic_policy: str | None = None
     requested_flow_advances: int | None = None
     requested_step_starts: int | None = None
     remaining_flow_advances: int | None = None
     remaining_step_starts: int | None = None
+    completed_flow_advances: int = 0
+    completed_step_starts: int = 0
     pause_reason: str | None = None
+
+
+class SchedulerRunDecision(BaseModel):
+    action: Literal["continue", "drain", "pause", "fail"] = "continue"
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SchedulerSemanticRunPolicy:
+    """Process-local admission and stopping policy without application semantics."""
+
+    name: str
+    allow_flow_advance: Callable[[object], bool]
+    allow_step_start: Callable[[object], bool]
+    decide: Callable[["RuntimeScheduleService"], SchedulerRunDecision]
+    max_flow_advances: int = 1000
+    max_step_starts: int = 1000
 
 
 class SchedulerTickResult(BaseModel):
@@ -71,16 +95,50 @@ class RuntimeScheduleService:
         self._bounded_run_active = False
         self._bounded_run_draining = False
         self._bounded_pause_reason: str | None = None
+        self._semantic_policy: SchedulerSemanticRunPolicy | None = None
+        self._semantic_lease_id: str | None = None
+        self._semantic_run_active = False
+        self._semantic_run_draining = False
+        self._semantic_flow_advances = 0
+        self._semantic_step_starts = 0
         self.ark.schedule_service = self
 
     def configure_run_budget(self, budget: SchedulerRunBudget) -> SchedulerRunControlView:
         with self.lock:
+            if self._semantic_run_active:
+                raise FlowStepValidationError("cannot configure a numeric budget while a semantic run lease is active")
             self._requested_run_budget = budget.model_copy(deep=True)
             self._remaining_flow_advances = budget.flow_advances
             self._remaining_step_starts = budget.step_starts
             self._bounded_run_active = True
             self._bounded_run_draining = False
             self._bounded_pause_reason = None
+            self._semantic_policy = None
+            self._semantic_lease_id = None
+            self._semantic_flow_advances = 0
+            self._semantic_step_starts = 0
+        return self.get_run_control_view()
+
+    def configure_semantic_run(self, policy: SchedulerSemanticRunPolicy) -> SchedulerRunControlView:
+        if not policy.name.strip():
+            raise FlowStepValidationError("semantic scheduler policy name must be non-empty")
+        if policy.max_flow_advances < 0 or policy.max_step_starts < 0:
+            raise FlowStepValidationError("semantic scheduler safety caps must be non-negative")
+        if policy.max_flow_advances == 0 and policy.max_step_starts == 0:
+            raise FlowStepValidationError("semantic scheduler safety caps must allow at least one action")
+        with self.lock:
+            if self._bounded_run_active or self._semantic_run_active:
+                raise FlowStepValidationError("a scheduler run plan is already active")
+            self._semantic_policy = policy
+            self._semantic_lease_id = f"lease_{uuid4().hex}"
+            self._semantic_run_active = True
+            self._semantic_run_draining = False
+            self._semantic_flow_advances = 0
+            self._semantic_step_starts = 0
+            self._bounded_pause_reason = None
+            self._requested_run_budget = None
+            self._remaining_flow_advances = None
+            self._remaining_step_starts = None
         return self.get_run_control_view()
 
     def clear_run_budget(self, *, reason: str | None = None) -> SchedulerRunControlView:
@@ -92,26 +150,49 @@ class RuntimeScheduleService:
                 self._remaining_flow_advances = None
                 self._remaining_step_starts = None
             self._bounded_pause_reason = reason
+            self._semantic_run_active = False
+            self._semantic_run_draining = False
+            if reason is None:
+                self._semantic_policy = None
+                self._semantic_lease_id = None
+                self._semantic_flow_advances = 0
+                self._semantic_step_starts = 0
         return self.get_run_control_view()
 
     def get_run_control_view(self) -> SchedulerRunControlView:
         paused = self._is_globally_paused()
         with self.lock:
+            if self._semantic_policy is not None:
+                run_plan: Literal["unbounded", "bounded", "semantic"] = "semantic"
+            elif self._requested_run_budget is not None:
+                run_plan = "bounded"
+            else:
+                run_plan = "unbounded"
             if paused:
-                mode: Literal["unbounded", "bounded", "draining", "paused"] = "paused"
-            elif self._bounded_run_active and self._bounded_run_draining:
+                mode: Literal["unbounded", "bounded", "semantic", "draining", "paused"] = "paused"
+            elif (self._bounded_run_active and self._bounded_run_draining) or (
+                self._semantic_run_active and self._semantic_run_draining
+            ):
                 mode = "draining"
             elif self._bounded_run_active:
                 mode = "bounded"
+            elif self._semantic_run_active:
+                mode = "semantic"
             else:
                 mode = "unbounded"
             requested = self._requested_run_budget
+            semantic = self._semantic_policy
             return SchedulerRunControlView(
                 mode=mode,
+                run_plan=run_plan,
+                lease_id=self._semantic_lease_id,
+                semantic_policy=None if semantic is None else semantic.name,
                 requested_flow_advances=None if requested is None else requested.flow_advances,
                 requested_step_starts=None if requested is None else requested.step_starts,
                 remaining_flow_advances=self._remaining_flow_advances,
                 remaining_step_starts=self._remaining_step_starts,
+                completed_flow_advances=self._semantic_flow_advances,
+                completed_step_starts=self._semantic_step_starts,
                 pause_reason=self._bounded_pause_reason,
             )
 
@@ -177,7 +258,9 @@ class RuntimeScheduleService:
 
         if not result.advanced_flow_ids and not result.started_step_ids:
             result.reason = "no_runnable_candidate"
-        result.auto_paused = self._settle_bounded_run()
+        result.auto_paused = self._settle_run_control(
+            made_progress=bool(result.advanced_flow_ids or result.started_step_ids)
+        )
         result.run_control = self.get_run_control_view()
         return result
 
@@ -207,6 +290,12 @@ class RuntimeScheduleService:
                     continue
 
             if not flow_service.can_advance_flow(flow_id):
+                skipped += 1
+                self._requeue_flow_if_non_terminal(flow_id)
+                continue
+
+            flow = flow_service.get_flow(flow_id)
+            if not self._semantic_flow_allowed(flow):
                 skipped += 1
                 self._requeue_flow_if_non_terminal(flow_id)
                 continue
@@ -267,6 +356,12 @@ class RuntimeScheduleService:
                 return None, skipped
 
             if not step_service.can_run_step(step_id):
+                skipped += 1
+                self._requeue_step_if_created(step_id)
+                continue
+
+            step = step_service.store.get_step(step_id)
+            if not self._semantic_step_allowed(step):
                 skipped += 1
                 self._requeue_step_if_created(step_id)
                 continue
@@ -339,6 +434,11 @@ class RuntimeScheduleService:
         self.queued_step_ids = kept_step_ids
 
     def _flow_budget_available_locked(self) -> bool:
+        if self._semantic_run_active:
+            if self._semantic_run_draining:
+                return False
+            policy = self._semantic_policy
+            return policy is not None and self._semantic_flow_advances < policy.max_flow_advances
         if not self._bounded_run_active:
             return True
         if self._bounded_run_draining:
@@ -346,6 +446,11 @@ class RuntimeScheduleService:
         return bool(self._remaining_flow_advances and self._remaining_flow_advances > 0)
 
     def _step_budget_available_locked(self) -> bool:
+        if self._semantic_run_active:
+            if self._semantic_run_draining:
+                return False
+            policy = self._semantic_policy
+            return policy is not None and self._semantic_step_starts < policy.max_step_starts
         if not self._bounded_run_active:
             return True
         if self._bounded_run_draining:
@@ -353,20 +458,33 @@ class RuntimeScheduleService:
         return bool(self._remaining_step_starts and self._remaining_step_starts > 0)
 
     def _reserve_flow_budget_locked(self) -> None:
+        if self._semantic_run_active:
+            self._semantic_flow_advances += 1
         if self._bounded_run_active and self._remaining_flow_advances is not None:
             self._remaining_flow_advances -= 1
 
     def _refund_flow_budget_locked(self) -> None:
+        if self._semantic_run_active and self._semantic_flow_advances > 0:
+            self._semantic_flow_advances -= 1
         if self._bounded_run_active and self._remaining_flow_advances is not None:
             self._remaining_flow_advances += 1
 
     def _reserve_step_budget_locked(self) -> None:
+        if self._semantic_run_active:
+            self._semantic_step_starts += 1
         if self._bounded_run_active and self._remaining_step_starts is not None:
             self._remaining_step_starts -= 1
 
     def _refund_step_budget_locked(self) -> None:
+        if self._semantic_run_active and self._semantic_step_starts > 0:
+            self._semantic_step_starts -= 1
         if self._bounded_run_active and self._remaining_step_starts is not None:
             self._remaining_step_starts += 1
+
+    def _settle_run_control(self, *, made_progress: bool) -> bool:
+        if self._semantic_run_active:
+            return self._settle_semantic_run(made_progress=made_progress)
+        return self._settle_bounded_run()
 
     def _settle_bounded_run(self) -> bool:
         with self.lock:
@@ -391,6 +509,69 @@ class RuntimeScheduleService:
             self._bounded_run_draining = False
             self._bounded_pause_reason = reason
         return True
+
+    def _settle_semantic_run(self, *, made_progress: bool) -> bool:
+        with self.lock:
+            if not self._semantic_run_active:
+                return False
+            policy = self._semantic_policy
+            exhausted = bool(
+                policy is not None
+                and (
+                    (
+                        policy.max_flow_advances > 0
+                        and self._semantic_flow_advances >= policy.max_flow_advances
+                    )
+                    or (
+                        policy.max_step_starts > 0
+                        and self._semantic_step_starts >= policy.max_step_starts
+                    )
+                )
+            )
+            draining = self._semantic_run_draining
+        if policy is None:
+            raise FlowStepValidationError("semantic scheduler run is active without a policy")
+
+        decision = policy.decide(self)
+        should_stop = draining or exhausted or decision.action in {"drain", "pause", "fail"}
+        reason = (
+            "semantic_safety_cap_exhausted"
+            if exhausted
+            else self._bounded_pause_reason or decision.reason or ("semantic_boundary_reached" if should_stop else None)
+        )
+
+        if self._has_active_work():
+            if should_stop:
+                with self.lock:
+                    if self._semantic_run_active:
+                        self._semantic_run_draining = True
+                        self._bounded_pause_reason = reason
+            return False
+
+        if not should_stop and made_progress:
+            return False
+        if not should_stop:
+            reason = decision.reason or "no_runnable_candidate"
+
+        pause_controller = self.ark.pause_controller
+        if pause_controller is None or not hasattr(pause_controller, "pause"):
+            raise FlowStepValidationError("semantic scheduler run requires a pause controller")
+        pause_controller.pause(None)
+        with self.lock:
+            self._semantic_run_active = False
+            self._semantic_run_draining = False
+            self._bounded_pause_reason = reason
+        return True
+
+    def _semantic_flow_allowed(self, flow: object) -> bool:
+        with self.lock:
+            policy = self._semantic_policy if self._semantic_run_active else None
+        return True if policy is None else bool(policy.allow_flow_advance(flow))
+
+    def _semantic_step_allowed(self, step: object) -> bool:
+        with self.lock:
+            policy = self._semantic_policy if self._semantic_run_active else None
+        return True if policy is None else bool(policy.allow_step_start(step))
 
     def _has_active_work(self) -> bool:
         with self.lock:

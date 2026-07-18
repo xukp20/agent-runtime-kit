@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterator
-from typing import Mapping
+from typing import Callable, Mapping
 
 from ..store_utils import read_json, utc_now_iso, write_json_atomic
 
@@ -111,6 +111,7 @@ class CodexProvider:
         developer_instructions: str | None,
         agent_id: str,
         overwrite_developer_instructions: bool = False,
+        on_thread_started: Callable[[str], None] | None = None,
     ) -> CodexTurnResult:
         self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
         self._begin_agent_run(home_id=home_id, agent_id=agent_id)
@@ -124,6 +125,9 @@ class CodexProvider:
                     config=self.thread_config or None,
                     approval_mode=self._sdk_approval_mode(sdk),
                 )
+                self._update_agent_run_locator(agent_id, thread_id=thread.id)
+                if on_thread_started is not None:
+                    on_thread_started(thread.id)
                 turn_result = thread.run(prompt, cwd=workdir, model=self.model)
                 rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
                 return CodexTurnResult(
@@ -413,6 +417,22 @@ class CodexProvider:
             if turn_id is not None:
                 run.turn_id = turn_id
 
+    def _update_agent_run_locator(
+        self,
+        agent_id: str,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
+        with self._lock:
+            run = self._agent_runs.get(agent_id)
+            if run is None:
+                return
+            if thread_id is not None:
+                run.thread_id = thread_id
+            if turn_id is not None:
+                run.turn_id = turn_id
+
     def _home_init_lock(self, home_id: str, home_root: Path) -> threading.Lock:
         key = (home_id, str(home_root.resolve()))
         with self._lock:
@@ -505,10 +525,18 @@ class CodexProvider:
 
     def _agent_rollout_path(self, agent, *, home_root: Path | None = None) -> Path | None:
         rollout_relpath = getattr(agent, "rollout_relpath", None)
+        resolved_home_root = Path(home_root) if home_root is not None else self._agent_home_root(agent)
+        if not rollout_relpath and getattr(agent, "thread_id", None):
+            rollout_relpath = _find_rollout_relpath(
+                resolved_home_root / ".codex",
+                str(agent.thread_id),
+            )
         if not rollout_relpath:
             return None
-        resolved_home_root = Path(home_root) if home_root is not None else self._agent_home_root(agent)
         return resolved_home_root / ".codex" / str(rollout_relpath)
+
+    def find_rollout_relpath(self, *, home_root: Path, thread_id: str) -> str | None:
+        return _find_rollout_relpath(Path(home_root) / ".codex", thread_id)
 
 
 def _find_rollout_relpath(codex_home: Path, thread_id: str) -> str | None:

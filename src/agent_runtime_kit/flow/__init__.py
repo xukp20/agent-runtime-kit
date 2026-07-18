@@ -38,7 +38,14 @@ from .patterns import (
 )
 from .registry import FlowTypeRegistry, StepTypeRegistry
 from .rendering import RenderContext
-from .scheduler import RuntimeScheduleService, SchedulerRunBudget, SchedulerRunControlView, SchedulerTickResult
+from .scheduler import (
+    RuntimeScheduleService,
+    SchedulerRunBudget,
+    SchedulerRunControlView,
+    SchedulerRunDecision,
+    SchedulerSemanticRunPolicy,
+    SchedulerTickResult,
+)
 from .services import ActiveStepRun, FlowService, StepService
 from .standard_steps import (
     AgentStep,
@@ -101,6 +108,8 @@ __all__ = [
     "RuntimeScheduleService",
     "SchedulerRunBudget",
     "SchedulerRunControlView",
+    "SchedulerRunDecision",
+    "SchedulerSemanticRunPolicy",
     "SchedulerTickResult",
     "StepTypeRegistry",
     "StepStatus",

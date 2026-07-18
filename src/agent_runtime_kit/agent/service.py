@@ -5,7 +5,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
-from typing import Mapping
 
 from agent_runtime_kit.runtime import (
     ARKServices,
@@ -33,6 +32,25 @@ from .report_policy import AgentTraceReportPolicy, TraceReportPersistence
 from .store import AgentStoreService
 from .store_utils import utc_now_iso
 from .templates import render_template
+
+
+@dataclass(frozen=True)
+class RunningAgentAuditRecord:
+    agent_id: str
+    scope_id: str
+    classification: str
+    thread_id: str | None
+    rollout_relpath: str | None
+    evidence: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RunningAgentRepairResult:
+    agent_id: str
+    classification: str
+    action: str
+    dry_run: bool
+    repaired: bool
 
 
 class AgentType:
@@ -304,15 +322,24 @@ class AgentService:
                 provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
                 provider = self.providers[agent.cli_type]
                 if agent.thread_id is None:
+                    start_kwargs = {
+                        "home_id": agent.home_id,
+                        "home_root": home_root,
+                        "env": provider_env,
+                        "workdir": workdir,
+                        "prompt": current_prompt,
+                        "developer_instructions": developer_instructions,
+                        "overwrite_developer_instructions": overwrite_developer_instructions,
+                        "agent_id": agent_id,
+                    }
+                    if isinstance(provider, CodexProvider):
+                        start_kwargs["on_thread_started"] = lambda thread_id: self.store.update_thread_locator(
+                            agent_id,
+                            thread_id=thread_id,
+                            rollout_relpath=None,
+                        )
                     result = provider.start_thread(
-                        home_id=agent.home_id,
-                        home_root=home_root,
-                        env=provider_env,
-                        workdir=workdir,
-                        prompt=current_prompt,
-                        developer_instructions=developer_instructions,
-                        overwrite_developer_instructions=overwrite_developer_instructions,
-                        agent_id=agent_id,
+                        **start_kwargs,
                     )
                 else:
                     result = provider.resume_thread(
@@ -444,14 +471,100 @@ class AgentService:
         return WaitAgentsResult(completed=completed, errors=errors, pending=tuple(pending), timeout=timeout)
 
     def reconcile_stale_running_agents(self, scope_id: str | None = None) -> list[str]:
+        """Compatibility helper for locator-free stale records only."""
+
         repaired: list[str] = []
-        with self._lock:
-            for agent in self.store.list_agents(scope_id=scope_id, status="running"):
-                if agent.agent_id in self._active:
-                    continue
-                self.store.patch_agent(agent.agent_id, status="idle")
-                repaired.append(agent.agent_id)
+        for audit in self.audit_running_agents(scope_id=scope_id):
+            if audit.classification != "safe_to_mark_idle":
+                continue
+            result = self.repair_running_agent(
+                audit.agent_id,
+                expected_scope_id=audit.scope_id,
+                expected_thread_id=audit.thread_id,
+                expected_rollout_relpath=audit.rollout_relpath,
+                action="mark_idle",
+                dry_run=False,
+            )
+            if result.repaired:
+                repaired.append(audit.agent_id)
         return repaired
+
+    def audit_running_agents(self, scope_id: str | None = None) -> list[RunningAgentAuditRecord]:
+        records: list[RunningAgentAuditRecord] = []
+        with self._lock:
+            active_ids = set(self._active)
+            for agent in self.store.list_agents(scope_id=scope_id, status="running"):
+                provider = self.providers.get(agent.cli_type)
+                provider_active = False
+                if provider is not None and hasattr(provider, "list_active_agents"):
+                    provider_active = agent.agent_id in provider.list_active_agents(agent.home_id)
+                if agent.agent_id in active_ids or provider_active:
+                    classification = "healthy_running"
+                    evidence = ("active_worker",) if agent.agent_id in active_ids else ("provider_active",)
+                elif agent.thread_id or agent.rollout_relpath:
+                    classification = "requires_review"
+                    evidence = tuple(
+                        item
+                        for item in (
+                            "thread_locator_present" if agent.thread_id else None,
+                            "rollout_locator_present" if agent.rollout_relpath else None,
+                        )
+                        if item is not None
+                    )
+                else:
+                    classification = "safe_to_mark_idle"
+                    evidence = ("no_active_worker_or_locator",)
+                records.append(
+                    RunningAgentAuditRecord(
+                        agent_id=agent.agent_id,
+                        scope_id=agent.scope_id,
+                        classification=classification,
+                        thread_id=agent.thread_id,
+                        rollout_relpath=agent.rollout_relpath,
+                        evidence=evidence,
+                    )
+                )
+        return records
+
+    def repair_running_agent(
+        self,
+        agent_id: str,
+        *,
+        expected_scope_id: str,
+        expected_thread_id: str | None,
+        expected_rollout_relpath: str | None,
+        action: str,
+        dry_run: bool = True,
+    ) -> RunningAgentRepairResult:
+        if action != "mark_idle":
+            raise ValueError("agent repair action must be 'mark_idle'")
+        audits = {item.agent_id: item for item in self.audit_running_agents()}
+        audit = audits.get(agent_id)
+        if audit is None:
+            raise RuntimeError(f"agent is not a running repair candidate: {agent_id}")
+        if (
+            audit.scope_id != expected_scope_id
+            or audit.thread_id != expected_thread_id
+            or audit.rollout_relpath != expected_rollout_relpath
+        ):
+            raise RuntimeError(f"agent repair identity changed: {agent_id}")
+        if audit.classification == "healthy_running":
+            raise RuntimeError(f"healthy running agent cannot be repaired: {agent_id}")
+        repaired = False
+        if not dry_run:
+            with self._lock:
+                current = self.store.get_agent(agent_id)
+                if current.status != "running":
+                    raise RuntimeError(f"agent status changed before repair: {agent_id}")
+                self.store.patch_agent(agent_id, status="idle")
+                repaired = True
+        return RunningAgentRepairResult(
+            agent_id=agent_id,
+            classification=audit.classification,
+            action=action,
+            dry_run=dry_run,
+            repaired=repaired,
+        )
 
     def interrupt_agent(self, agent_id: str) -> bool:
         provider = self.providers.get(self.store.get_agent(agent_id).cli_type)
@@ -566,16 +679,38 @@ class AgentService:
         provider_env = build_provider_env(home=home, home_root=home_root)
         return provider.read_latest_turn_result(agent, home_root=home_root, env=provider_env)
 
+    def _refresh_codex_rollout_locator(self, agent_id: str) -> Agent:
+        agent = self.store.get_agent(agent_id)
+        if agent.cli_type != "codex" or not agent.thread_id or agent.rollout_relpath:
+            return agent
+        provider = self.providers.get(agent.cli_type)
+        find = getattr(provider, "find_rollout_relpath", None)
+        if not callable(find):
+            return agent
+        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+        rollout_relpath = find(home_root=home_root, thread_id=agent.thread_id)
+        if not rollout_relpath:
+            return agent
+        return self.store.update_thread_locator(
+            agent_id,
+            thread_id=agent.thread_id,
+            rollout_relpath=rollout_relpath,
+        )
+
     def read_rollout_events(self, agent_id: str) -> list[dict]:
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.read_rollout_events(agent_id)
 
     def trace_reader(self, agent_id: str):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.trace_reader(agent_id)
 
     def get_rollout_info(self, agent_id: str):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.get_rollout_info(agent_id)
 
     def list_trace_turns(self, agent_id: str):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.list_trace_turns(agent_id)
 
     def get_trace_turn(
@@ -586,6 +721,7 @@ class AgentService:
         index: int | None = None,
         latest: bool = False,
     ):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.get_trace_turn(agent_id, turn_id=turn_id, index=index, latest=latest)
 
     def get_trace_event(
@@ -595,6 +731,7 @@ class AgentService:
         index: int | None = None,
         last: bool = False,
     ):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.get_trace_event(agent_id, index=index, last=last)
 
     def tail_trace_events(
@@ -605,6 +742,7 @@ class AgentService:
         event_type: str | None = None,
         payload_type: str | None = None,
     ):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.tail_trace_events(
             agent_id,
             limit=limit,
@@ -619,9 +757,11 @@ class AgentService:
         turn_id: str | None = None,
         latest: bool = False,
     ):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.list_response_texts(agent_id, turn_id=turn_id, latest=latest)
 
     def get_latest_response_text(self, agent_id: str) -> str | None:
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.get_latest_response_text(agent_id)
 
     def list_tool_calls(
@@ -631,6 +771,7 @@ class AgentService:
         turn_id: str | None = None,
         latest: bool = False,
     ):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.list_tool_calls(agent_id, turn_id=turn_id, latest=latest)
 
     def get_tool_call(
@@ -641,6 +782,7 @@ class AgentService:
         index: int | None = None,
         last: bool = False,
     ):
+        self._refresh_codex_rollout_locator(agent_id)
         return self.store.get_tool_call(agent_id, call_id=call_id, index=index, last=last)
 
     def build_trace_report(

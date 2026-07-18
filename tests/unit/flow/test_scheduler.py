@@ -19,8 +19,11 @@ from agent_runtime_kit.flow import (
     FlowRequest,
     FlowService,
     FlowStatus,
+    FlowStepValidationError,
     RuntimeScheduleService,
     SchedulerRunBudget,
+    SchedulerRunDecision,
+    SchedulerSemanticRunPolicy,
     StepRunContext,
     StepService,
     StepStatus,
@@ -556,6 +559,96 @@ def test_clear_run_budget_with_reason_retains_cancelled_run_evidence(tmp_path: P
     assert view.requested_flow_advances == 2
     assert view.remaining_step_starts == 3
     assert view.pause_reason == "manual_pause"
+
+
+def test_semantic_policy_runs_logic_to_a_created_step_and_pauses(tmp_path: Path) -> None:
+    pause = FakePauseController(paused=True)
+    flow_service, step_service, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+    flow_id = start_scheduler_flow(flow_service, enqueue=True)
+    step_id = f"{flow_id}-step-1"
+    scheduler.configure_semantic_run(
+        SchedulerSemanticRunPolicy(
+            name="logic_to_step",
+            allow_flow_advance=lambda flow: flow.flow_id == flow_id,
+            allow_step_start=lambda step: False,
+            decide=lambda service: SchedulerRunDecision(
+                action="pause" if step_id in service.queued_step_ids else "continue",
+                reason="target_step_created" if step_id in service.queued_step_ids else None,
+            ),
+            max_flow_advances=10,
+            max_step_starts=0,
+        )
+    )
+    pause.resume(None)
+
+    tick = scheduler.schedule_ready()
+
+    assert tick.advanced_flow_ids == [flow_id]
+    assert tick.started_step_ids == []
+    assert tick.auto_paused is True
+    assert step_service.store.get_step(step_id).status is StepStatus.CREATED
+    assert tick.run_control is not None
+    assert tick.run_control.run_plan == "semantic"
+    assert tick.run_control.semantic_policy == "logic_to_step"
+    assert tick.run_control.completed_flow_advances == 1
+    assert tick.run_control.pause_reason == "target_step_created"
+
+
+def test_semantic_policy_starts_only_target_step_and_stops_after_terminal(tmp_path: Path) -> None:
+    pause = FakePauseController(paused=False)
+    flow_service, step_service, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+    flow_id = start_scheduler_flow(flow_service)
+    target_step_id = flow_service.advance_flow(flow_id)
+    assert target_step_id is not None
+    other_flow_id = start_scheduler_flow(flow_service)
+    other_step_id = flow_service.advance_flow(other_flow_id)
+    assert other_step_id is not None
+    pause.pause(None)
+
+    def decide(_service: RuntimeScheduleService) -> SchedulerRunDecision:
+        target = step_service.store.get_step(target_step_id)
+        if target.status in {StepStatus.COMPLETED, StepStatus.FAILED}:
+            return SchedulerRunDecision(action="pause", reason="target_step_terminal")
+        return SchedulerRunDecision()
+
+    scheduler.configure_semantic_run(
+        SchedulerSemanticRunPolicy(
+            name="one_target_step",
+            allow_flow_advance=lambda flow: False,
+            allow_step_start=lambda step: step.step_id == target_step_id,
+            decide=decide,
+            max_flow_advances=0,
+            max_step_starts=1,
+        )
+    )
+    pause.resume(None)
+
+    first_tick = scheduler.schedule_ready()
+    assert first_tick.started_step_ids == [target_step_id]
+    assert step_service.wait_step(target_step_id, timeout_s=2).status is StepStatus.COMPLETED
+    terminal_tick = first_tick if first_tick.auto_paused else scheduler.schedule_ready()
+
+    assert terminal_tick.auto_paused is True
+    assert terminal_tick.run_control is not None
+    assert terminal_tick.run_control.pause_reason in {"target_step_terminal", "semantic_safety_cap_exhausted"}
+    assert step_service.store.get_step(other_step_id).status is StepStatus.CREATED
+    assert other_step_id in scheduler.queued_step_ids
+
+
+def test_semantic_policy_and_numeric_budget_are_mutually_exclusive(tmp_path: Path) -> None:
+    pause = FakePauseController(paused=True)
+    _, _, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+    scheduler.configure_semantic_run(
+        SchedulerSemanticRunPolicy(
+            name="exclusive",
+            allow_flow_advance=lambda flow: True,
+            allow_step_start=lambda step: True,
+            decide=lambda service: SchedulerRunDecision(),
+        )
+    )
+
+    with pytest.raises(FlowStepValidationError, match="semantic run lease is active"):
+        scheduler.configure_run_budget(SchedulerRunBudget(flow_advances=1, step_starts=0))
 
 
 def test_schedule_ready_starts_multiple_steps_up_to_concurrency_limit(tmp_path: Path) -> None:
