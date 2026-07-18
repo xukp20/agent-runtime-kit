@@ -651,6 +651,39 @@ def test_semantic_policy_and_numeric_budget_are_mutually_exclusive(tmp_path: Pat
         scheduler.configure_run_budget(SchedulerRunBudget(flow_advances=1, step_starts=0))
 
 
+def test_semantic_policy_retries_once_for_an_admitted_temporarily_blocked_flow(tmp_path: Path) -> None:
+    pause = FakePauseController(paused=False)
+    flow_service, _, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+    flow_id = start_scheduler_flow(flow_service, status="waiting", ready=False, enqueue=True)
+    scheduler.configure_semantic_run(
+        SchedulerSemanticRunPolicy(
+            name="retry_admitted_flow",
+            allow_flow_advance=lambda flow: flow.flow_id == flow_id,
+            allow_step_start=lambda step: False,
+            decide=lambda service: SchedulerRunDecision(),
+            max_flow_advances=10,
+            max_step_starts=0,
+        )
+    )
+
+    blocked_tick = scheduler.schedule_ready()
+
+    assert blocked_tick.advanced_flow_ids == []
+    assert blocked_tick.auto_paused is False
+    assert pause.is_paused() is False
+
+    def mark_ready(flow: BaseFlow) -> None:
+        assert isinstance(flow.state, SchedulerFlowState)
+        flow.state.ready = True
+
+    flow_service.store.update_flow_record(flow_id, mark_ready)
+    resumed_tick = scheduler.schedule_ready()
+
+    assert resumed_tick.advanced_flow_ids == [flow_id]
+    assert resumed_tick.auto_paused is False
+    assert pause.is_paused() is False
+
+
 def test_schedule_ready_starts_multiple_steps_up_to_concurrency_limit(tmp_path: Path) -> None:
     SchedulerStep.block = True
     SchedulerStep.release_event = Event()
