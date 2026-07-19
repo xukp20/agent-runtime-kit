@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeCreateSpec, HomeService, McpServerSpec, build_provider_env
+from agent_runtime_kit.agent.homes import (
+    HomeCreateSpec,
+    HomeService,
+    McpServerSpec,
+    ModelConfigOverrides,
+    build_provider_env,
+)
 from agent_runtime_kit.agent.models import MissingProviderEnvError
 from agent_runtime_kit.agent.skills import SkillSpec
 
@@ -99,6 +105,69 @@ def test_create_codex_home_renders_mcp_servers_into_config(tmp_path: Path) -> No
     assert 'X-Static = "static"' in rendered
     assert "[mcp_servers.ark_identity.env_http_headers]" in rendered
     assert 'X-Ark-Step-Id = "ARK_STEP_ID"' in rendered
+
+
+def test_create_codex_home_projects_model_overrides_before_tables(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "model = 'terra'\nmodel_reasoning_effort = 'medium'\n\n[features]\napps = false\n",
+        encoding="utf-8",
+    )
+    service = HomeService(tmp_path / ".agent_runtime")
+    spec = HomeCreateSpec(
+        cli_type="codex",
+        home_id="planner",
+        base_config_path=config,
+        model_config_overrides=ModelConfigOverrides(model="sol", reasoning_effort="high"),
+    )
+
+    service.create_home(spec)
+    service.create_home(spec)
+
+    rendered = (
+        service.resolve_home_root("codex", "planner") / ".codex" / "config.toml"
+    ).read_text(encoding="utf-8")
+    assert rendered.count('model = "sol"') == 1
+    assert rendered.count('model_reasoning_effort = "high"') == 1
+    assert "terra" not in rendered
+    assert "medium" not in rendered
+    assert rendered.index('model = "sol"') < rendered.index("[features]")
+
+
+def test_create_codex_home_supports_partial_model_override(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("model = 'terra'\nmodel_reasoning_effort = 'high'\n", encoding="utf-8")
+    service = HomeService(tmp_path / ".agent_runtime")
+
+    service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            base_config_path=config,
+            model_config_overrides=ModelConfigOverrides(model="sol"),
+        )
+    )
+
+    rendered = (
+        service.resolve_home_root("codex", "planner") / ".codex" / "config.toml"
+    ).read_text(encoding="utf-8")
+    assert 'model = "sol"' in rendered
+    assert "model_reasoning_effort = 'high'" in rendered
+
+
+def test_model_overrides_reject_empty_values_and_unsupported_provider(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="model override must be a non-empty string"):
+        ModelConfigOverrides(model=" ")
+
+    service = HomeService(tmp_path / ".agent_runtime")
+    with pytest.raises(ValueError, match="not supported for provider"):
+        service.create_home(
+            HomeCreateSpec(
+                cli_type="future-provider",
+                home_id="planner",
+                model_config_overrides=ModelConfigOverrides(model="example"),
+            )
+        )
 
 
 def test_create_codex_home_supports_path_and_spec_skills_together(tmp_path: Path) -> None:

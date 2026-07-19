@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from threading import RLock
+from datetime import UTC, datetime
+from threading import Condition, RLock
 from typing import Callable, Literal
 from uuid import uuid4
 
@@ -37,6 +38,27 @@ class SchedulerRunControlView(BaseModel):
     completed_flow_advances: int = 0
     completed_step_starts: int = 0
     pause_reason: str | None = None
+
+
+class SchedulerRunLeaseView(BaseModel):
+    lease_id: str
+    run_plan: Literal["semantic"] = "semantic"
+    policy_name: str
+    status: Literal["active", "draining", "terminal", "lost"]
+    version: int = Field(ge=1)
+    started_at: str
+    terminal_at: str | None = None
+    completed_flow_advances: int = 0
+    completed_step_starts: int = 0
+    advanced_flow_ids: list[str] = Field(default_factory=list)
+    started_step_ids: list[str] = Field(default_factory=list)
+    terminal_reason: str | None = None
+    run_control: SchedulerRunControlView
+
+
+class SchedulerRunLeaseWaitView(BaseModel):
+    lease: SchedulerRunLeaseView
+    timed_out: bool = False
 
 
 class SchedulerRunDecision(BaseModel):
@@ -89,6 +111,9 @@ class RuntimeScheduleService:
         self.max_concurrent_flow_advances = max_concurrent_flow_advances
         self.max_concurrent_steps = max_concurrent_steps
         self.lock = RLock()
+        self._lease_condition = Condition(self.lock)
+        self._run_leases: dict[str, SchedulerRunLeaseView] = {}
+        self._run_lease_order: deque[str] = deque()
         self._requested_run_budget: SchedulerRunBudget | None = None
         self._remaining_flow_advances: int | None = None
         self._remaining_step_starts: int | None = None
@@ -142,6 +167,7 @@ class RuntimeScheduleService:
             self._requested_run_budget = None
             self._remaining_flow_advances = None
             self._remaining_step_starts = None
+            self._create_semantic_lease_locked(policy)
         return self.get_run_control_view()
 
     def clear_run_budget(self, *, reason: str | None = None) -> SchedulerRunControlView:
@@ -156,12 +182,56 @@ class RuntimeScheduleService:
             self._semantic_run_active = False
             self._semantic_run_draining = False
             self._semantic_idle_retry_pending = False
+            if self._semantic_lease_id is not None:
+                self._update_semantic_lease_locked(
+                    status="terminal",
+                    terminal_reason=reason or "run_control_cleared",
+                )
             if reason is None:
                 self._semantic_policy = None
                 self._semantic_lease_id = None
                 self._semantic_flow_advances = 0
                 self._semantic_step_starts = 0
         return self.get_run_control_view()
+
+    def get_run_lease(self, lease_id: str) -> SchedulerRunLeaseView:
+        with self.lock:
+            try:
+                return self._run_leases[lease_id].model_copy(deep=True)
+            except KeyError as exc:
+                raise KeyError(f"unknown process-local scheduler run lease: {lease_id}") from exc
+
+    def wait_run_lease(
+        self,
+        lease_id: str,
+        *,
+        after_version: int | None = None,
+        timeout_s: float = 30.0,
+    ) -> SchedulerRunLeaseWaitView:
+        if after_version is not None and after_version < 0:
+            raise FlowStepValidationError("after_version must be non-negative")
+        if timeout_s < 0 or timeout_s > 300:
+            raise FlowStepValidationError("timeout_s must be between 0 and 300 seconds")
+        with self._lease_condition:
+            if lease_id not in self._run_leases:
+                raise KeyError(f"unknown process-local scheduler run lease: {lease_id}")
+            baseline = after_version
+            if baseline is None:
+                baseline = self._run_leases[lease_id].version
+
+            def changed_or_terminal() -> bool:
+                lease = self._run_leases.get(lease_id)
+                return lease is None or lease.version > baseline or lease.status in {"terminal", "lost"}
+
+            changed = changed_or_terminal()
+            if not changed and timeout_s > 0:
+                changed = self._lease_condition.wait_for(changed_or_terminal, timeout=timeout_s)
+            if lease_id not in self._run_leases:
+                raise KeyError(f"unknown process-local scheduler run lease: {lease_id}")
+            return SchedulerRunLeaseWaitView(
+                lease=self._run_leases[lease_id].model_copy(deep=True),
+                timed_out=not changed,
+            )
 
     def get_run_control_view(self) -> SchedulerRunControlView:
         paused = self._is_globally_paused()
@@ -246,27 +316,45 @@ class RuntimeScheduleService:
 
     def schedule_ready(self) -> SchedulerTickResult:
         result = SchedulerTickResult()
-        while True:
-            flow_id, skipped = self._schedule_flow_once_with_count()
-            result.skipped_flow_count += skipped
-            if flow_id is None:
-                break
-            result.advanced_flow_ids.append(flow_id)
+        try:
+            while True:
+                flow_id, skipped = self._schedule_flow_once_with_count()
+                result.skipped_flow_count += skipped
+                if flow_id is None:
+                    break
+                result.advanced_flow_ids.append(flow_id)
 
-        while True:
-            step_id, skipped = self._schedule_step_once_with_count()
-            result.skipped_step_count += skipped
-            if step_id is None:
-                break
-            result.started_step_ids.append(step_id)
+            while True:
+                step_id, skipped = self._schedule_step_once_with_count()
+                result.skipped_step_count += skipped
+                if step_id is None:
+                    break
+                result.started_step_ids.append(step_id)
 
-        if not result.advanced_flow_ids and not result.started_step_ids:
-            result.reason = "no_runnable_candidate"
-        result.auto_paused = self._settle_run_control(
-            made_progress=bool(result.advanced_flow_ids or result.started_step_ids)
-        )
-        result.run_control = self.get_run_control_view()
-        return result
+            if not result.advanced_flow_ids and not result.started_step_ids:
+                result.reason = "no_runnable_candidate"
+            if result.advanced_flow_ids or result.started_step_ids:
+                with self.lock:
+                    self._update_semantic_lease_locked(
+                        advanced_flow_ids=result.advanced_flow_ids,
+                        started_step_ids=result.started_step_ids,
+                    )
+            result.auto_paused = self._settle_run_control(
+                made_progress=bool(result.advanced_flow_ids or result.started_step_ids)
+            )
+            result.run_control = self.get_run_control_view()
+            return result
+        except Exception:
+            with self.lock:
+                if self._semantic_run_active:
+                    self._semantic_run_active = False
+                    self._semantic_run_draining = False
+                    self._bounded_pause_reason = "runtime_failure"
+                    self._update_semantic_lease_locked(
+                        status="terminal",
+                        terminal_reason="runtime_failure",
+                    )
+            raise
 
     def _schedule_flow_once_with_count(self) -> tuple[str | None, int]:
         flow_service = self._flow_service()
@@ -552,6 +640,7 @@ class RuntimeScheduleService:
                     if self._semantic_run_active:
                         self._semantic_run_draining = True
                         self._bounded_pause_reason = reason
+                        self._update_semantic_lease_locked(status="draining", terminal_reason=reason)
             return False
 
         if not should_stop and made_progress:
@@ -575,7 +664,78 @@ class RuntimeScheduleService:
             self._semantic_run_draining = False
             self._semantic_idle_retry_pending = False
             self._bounded_pause_reason = reason
+            self._update_semantic_lease_locked(status="terminal", terminal_reason=reason)
         return True
+
+    def _create_semantic_lease_locked(self, policy: SchedulerSemanticRunPolicy) -> None:
+        lease_id = self._semantic_lease_id
+        if lease_id is None:
+            raise FlowStepValidationError("semantic scheduler run is active without a lease id")
+        view = SchedulerRunLeaseView(
+            lease_id=lease_id,
+            policy_name=policy.name,
+            status="active",
+            version=1,
+            started_at=datetime.now(UTC).isoformat(),
+            run_control=self.get_run_control_view(),
+        )
+        self._run_leases[lease_id] = view
+        self._run_lease_order.append(lease_id)
+        while len(self._run_lease_order) > 64:
+            expired = self._run_lease_order.popleft()
+            if expired != self._semantic_lease_id:
+                self._run_leases.pop(expired, None)
+        self._lease_condition.notify_all()
+
+    def _update_semantic_lease_locked(
+        self,
+        *,
+        status: Literal["active", "draining", "terminal"] | None = None,
+        terminal_reason: str | None = None,
+        advanced_flow_ids: list[str] | None = None,
+        started_step_ids: list[str] | None = None,
+    ) -> None:
+        lease_id = self._semantic_lease_id
+        if lease_id is None or lease_id not in self._run_leases:
+            return
+        current = self._run_leases[lease_id]
+        next_status = status or current.status
+        new_flows = list(current.advanced_flow_ids)
+        new_steps = list(current.started_step_ids)
+        for flow_id in advanced_flow_ids or []:
+            if flow_id not in new_flows:
+                new_flows.append(flow_id)
+        for step_id in started_step_ids or []:
+            if step_id not in new_steps:
+                new_steps.append(step_id)
+        next_reason = terminal_reason if terminal_reason is not None else current.terminal_reason
+        changed = (
+            next_status != current.status
+            or new_flows != current.advanced_flow_ids
+            or new_steps != current.started_step_ids
+            or next_reason != current.terminal_reason
+            or self._semantic_flow_advances != current.completed_flow_advances
+            or self._semantic_step_starts != current.completed_step_starts
+        )
+        if not changed:
+            return
+        self._run_leases[lease_id] = current.model_copy(
+            update={
+                "status": next_status,
+                "version": current.version + 1,
+                "terminal_at": (
+                    current.terminal_at
+                    or (datetime.now(UTC).isoformat() if next_status == "terminal" else None)
+                ),
+                "completed_flow_advances": self._semantic_flow_advances,
+                "completed_step_starts": self._semantic_step_starts,
+                "advanced_flow_ids": new_flows,
+                "started_step_ids": new_steps,
+                "terminal_reason": next_reason,
+                "run_control": self.get_run_control_view(),
+            }
+        )
+        self._lease_condition.notify_all()
 
     def _has_semantic_admitted_candidate(self, policy: SchedulerSemanticRunPolicy) -> bool:
         with self.lock:

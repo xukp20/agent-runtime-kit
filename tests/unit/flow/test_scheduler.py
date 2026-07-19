@@ -593,6 +593,102 @@ def test_semantic_policy_runs_logic_to_a_created_step_and_pauses(tmp_path: Path)
     assert tick.run_control.completed_flow_advances == 1
     assert tick.run_control.pause_reason == "target_step_created"
 
+    lease = scheduler.get_run_lease(tick.run_control.lease_id or "")
+    assert lease.status == "terminal"
+    assert lease.policy_name == "logic_to_step"
+    assert lease.completed_flow_advances == 1
+    assert lease.advanced_flow_ids == [flow_id]
+    assert lease.terminal_reason == "target_step_created"
+    assert lease.terminal_at is not None
+
+
+def test_semantic_lease_wait_times_out_then_wakes_on_terminal(tmp_path: Path) -> None:
+    pause = FakePauseController(paused=True)
+    flow_service, _, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+    flow_id = start_scheduler_flow(flow_service, enqueue=True)
+    step_id = f"{flow_id}-step-1"
+    control = scheduler.configure_semantic_run(
+        SchedulerSemanticRunPolicy(
+            name="waitable_logic",
+            allow_flow_advance=lambda flow: flow.flow_id == flow_id,
+            allow_step_start=lambda step: False,
+            decide=lambda service: SchedulerRunDecision(
+                action="pause" if step_id in service.queued_step_ids else "continue",
+                reason="target_step_created" if step_id in service.queued_step_ids else None,
+            ),
+            max_flow_advances=10,
+            max_step_starts=0,
+        )
+    )
+    lease_id = control.lease_id or ""
+    started = scheduler.get_run_lease(lease_id)
+    timed_out = scheduler.wait_run_lease(lease_id, after_version=started.version, timeout_s=0)
+    assert timed_out.timed_out is True
+    assert timed_out.lease.status == "active"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        waiter = pool.submit(
+            scheduler.wait_run_lease,
+            lease_id,
+            after_version=started.version,
+            timeout_s=2,
+        )
+        second_waiter = pool.submit(
+            scheduler.wait_run_lease,
+            lease_id,
+            after_version=started.version,
+            timeout_s=2,
+        )
+        pause.resume(None)
+        tick = scheduler.schedule_ready()
+        waited = waiter.result(timeout=2)
+        second_waited = second_waiter.result(timeout=2)
+
+    assert tick.auto_paused is True
+    assert waited.timed_out is False
+    assert waited.lease.version > started.version
+    assert second_waited.timed_out is False
+    assert second_waited.lease.version == waited.lease.version
+    terminal = scheduler.wait_run_lease(
+        lease_id,
+        after_version=waited.lease.version,
+        timeout_s=0,
+    )
+    assert terminal.timed_out is False
+    assert terminal.lease.status == "terminal"
+
+
+def test_semantic_lease_records_manual_clear_as_terminal_with_inactive_control(tmp_path: Path) -> None:
+    pause = FakePauseController(paused=True)
+    _, _, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+    control = scheduler.configure_semantic_run(
+        SchedulerSemanticRunPolicy(
+            name="manual_clear",
+            allow_flow_advance=lambda flow: True,
+            allow_step_start=lambda step: True,
+            decide=lambda service: SchedulerRunDecision(),
+        )
+    )
+    lease_id = control.lease_id or ""
+
+    scheduler.clear_run_budget(reason="manual_pause")
+    lease = scheduler.get_run_lease(lease_id)
+
+    assert lease.status == "terminal"
+    assert lease.terminal_reason == "manual_pause"
+    assert lease.run_control.mode == "paused"
+    assert lease.run_control.pause_reason == "manual_pause"
+
+
+def test_semantic_lease_lookup_is_process_local(tmp_path: Path) -> None:
+    pause = FakePauseController(paused=True)
+    _, _, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+
+    with pytest.raises(KeyError, match="process-local scheduler run lease"):
+        scheduler.get_run_lease("lease_from_previous_process")
+    with pytest.raises(KeyError, match="process-local scheduler run lease"):
+        scheduler.wait_run_lease("lease_from_previous_process", timeout_s=0)
+
 
 def test_semantic_policy_starts_only_target_step_and_stops_after_terminal(tmp_path: Path) -> None:
     pause = FakePauseController(paused=False)

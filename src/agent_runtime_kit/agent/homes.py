@@ -53,6 +53,20 @@ class McpServerSpec:
     env_http_headers: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ModelConfigOverrides:
+    """Provider-neutral model settings projected by a concrete Home renderer."""
+
+    model: str | None = None
+    reasoning_effort: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("model", "reasoning_effort"):
+            value = getattr(self, field_name)
+            if value is not None and not value.strip():
+                raise ValueError(f"{field_name} override must be a non-empty string")
+
+
 @dataclass
 class HomeCreateSpec:
     cli_type: str
@@ -64,6 +78,7 @@ class HomeCreateSpec:
     mcp_servers: list[McpServerSpec] = field(default_factory=list)
     fixed_env: dict[str, str] = field(default_factory=dict)
     required_env: set[str] = field(default_factory=set)
+    model_config_overrides: ModelConfigOverrides | None = None
 
 
 class HomeStore:
@@ -188,6 +203,8 @@ class HomeService:
         home_root.mkdir(parents=True, exist_ok=True)
         if cli_type == "codex":
             self._create_codex_home(home_root, spec)
+        elif spec.model_config_overrides is not None:
+            raise ValueError(f"model configuration overrides are not supported for provider: {cli_type}")
         now = utc_now_iso()
         existing_created_at = now
         try:
@@ -245,12 +262,14 @@ class HomeService:
                 raise ValueError(f"skill spec key must match SkillSpec.name: {skill_name} != {skill_spec.name}")
 
     def _write_codex_config(self, config_path: Path, spec: HomeCreateSpec) -> None:
-        if spec.base_config_path is None and not spec.mcp_servers:
+        if spec.base_config_path is None and not spec.mcp_servers and spec.model_config_overrides is None:
             return
         if spec.base_config_path is not None:
             text = spec.base_config_path.read_text(encoding="utf-8")
         else:
             text = ""
+        if spec.model_config_overrides is not None:
+            text = _apply_codex_model_config_overrides(text, spec.model_config_overrides)
         if spec.mcp_servers:
             text = text.rstrip() + "\n\n" + _render_mcp_servers_toml(spec.mcp_servers)
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,6 +345,45 @@ def _render_mcp_servers_toml(servers: list[McpServerSpec]) -> str:
                 lines.append(f"{_toml_key(key)} = {_toml_value(value)}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _apply_codex_model_config_overrides(text: str, overrides: ModelConfigOverrides) -> str:
+    replacements = {
+        "model": overrides.model,
+        "model_reasoning_effort": overrides.reasoning_effort,
+    }
+    active = {key: value for key, value in replacements.items() if value is not None}
+    if not active:
+        return text
+
+    lines = text.splitlines()
+    first_table = next(
+        (index for index, line in enumerate(lines) if line.strip().startswith("[")),
+        len(lines),
+    )
+    found: set[str] = set()
+    rendered: list[str] = []
+    for index, line in enumerate(lines):
+        if index < first_table and "=" in line and not line.lstrip().startswith("#"):
+            key = line.split("=", 1)[0].strip()
+            if key in active:
+                if key not in found:
+                    rendered.append(f"{key} = {_toml_value(active[key])}")
+                    found.add(key)
+                continue
+        rendered.append(line)
+
+    missing = [key for key in active if key not in found]
+    if missing:
+        insert_at = next(
+            (index for index, line in enumerate(rendered) if line.strip().startswith("[")),
+            len(rendered),
+        )
+        additions = [f"{key} = {_toml_value(active[key])}" for key in missing]
+        if insert_at and rendered[insert_at - 1].strip():
+            additions.append("")
+        rendered[insert_at:insert_at] = additions
+    return "\n".join(rendered).rstrip() + "\n"
 
 
 def _toml_key(value: str) -> str:
