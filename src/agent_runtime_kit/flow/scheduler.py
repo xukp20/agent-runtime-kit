@@ -15,6 +15,9 @@ from .models import FlowStatus, FlowStepValidationError, StepStatus
 from .store import FlowNotFoundError, StepNotFoundError
 
 
+_MAX_SEMANTIC_IDLE_RETRIES = 2
+
+
 class SchedulerRunBudget(BaseModel):
     flow_advances: int = Field(ge=0)
     step_starts: int = Field(ge=0)
@@ -126,7 +129,7 @@ class RuntimeScheduleService:
         self._semantic_run_draining = False
         self._semantic_flow_advances = 0
         self._semantic_step_starts = 0
-        self._semantic_idle_retry_pending = False
+        self._semantic_idle_retry_count = 0
         self.ark.schedule_service = self
 
     def configure_run_budget(self, budget: SchedulerRunBudget) -> SchedulerRunControlView:
@@ -143,7 +146,7 @@ class RuntimeScheduleService:
             self._semantic_lease_id = None
             self._semantic_flow_advances = 0
             self._semantic_step_starts = 0
-            self._semantic_idle_retry_pending = False
+            self._semantic_idle_retry_count = 0
         return self.get_run_control_view()
 
     def configure_semantic_run(self, policy: SchedulerSemanticRunPolicy) -> SchedulerRunControlView:
@@ -162,7 +165,7 @@ class RuntimeScheduleService:
             self._semantic_run_draining = False
             self._semantic_flow_advances = 0
             self._semantic_step_starts = 0
-            self._semantic_idle_retry_pending = False
+            self._semantic_idle_retry_count = 0
             self._bounded_pause_reason = None
             self._requested_run_budget = None
             self._remaining_flow_advances = None
@@ -181,7 +184,7 @@ class RuntimeScheduleService:
             self._bounded_pause_reason = reason
             self._semantic_run_active = False
             self._semantic_run_draining = False
-            self._semantic_idle_retry_pending = False
+            self._semantic_idle_retry_count = 0
             if self._semantic_lease_id is not None:
                 self._update_semantic_lease_locked(
                     status="terminal",
@@ -622,7 +625,7 @@ class RuntimeScheduleService:
             )
             draining = self._semantic_run_draining
             if made_progress:
-                self._semantic_idle_retry_pending = False
+                self._semantic_idle_retry_count = 0
         if policy is None:
             raise FlowStepValidationError("semantic scheduler run is active without a policy")
 
@@ -647,11 +650,14 @@ class RuntimeScheduleService:
             return False
         if not should_stop:
             with self.lock:
-                retry_pending = self._semantic_idle_retry_pending
-            if not retry_pending and self._has_semantic_admitted_candidate(policy):
+                retry_count = self._semantic_idle_retry_count
+            if (
+                retry_count < _MAX_SEMANTIC_IDLE_RETRIES
+                and self._has_semantic_admitted_candidate(policy)
+            ):
                 with self.lock:
                     if self._semantic_run_active:
-                        self._semantic_idle_retry_pending = True
+                        self._semantic_idle_retry_count += 1
                 return False
             reason = decision.reason or "no_runnable_candidate"
 
@@ -662,7 +668,7 @@ class RuntimeScheduleService:
         with self.lock:
             self._semantic_run_active = False
             self._semantic_run_draining = False
-            self._semantic_idle_retry_pending = False
+            self._semantic_idle_retry_count = 0
             self._bounded_pause_reason = reason
             self._update_semantic_lease_locked(status="terminal", terminal_reason=reason)
         return True
