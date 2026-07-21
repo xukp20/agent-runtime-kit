@@ -20,8 +20,9 @@ The current implementation includes:
   requirements, MCP server definitions, and materialized skills;
 - a provider-neutral contract layer with descriptors, capabilities, Home
   renderers, runtime handles, query/context/artifact adapters, and a registry;
-- a Codex reference provider that implements those contracts while starting a
-  fresh SDK client per run and preserving resumable thread artifacts;
+- a Codex reference provider and an opt-in OpenCode 1.18.4 adapter; OpenCode
+  runs an isolated local server per Agent and preserves its SQLite-backed
+  resumable session artifacts;
 - versioned Agent records with provider/session/turn/artifact locators plus
   compatibility aliases for existing Codex runtimes and snapshots;
 - Agent start, wait, interrupt, session-only fork, close, stale-run
@@ -115,6 +116,11 @@ installed normally or supplied from a local Codex source checkout through the
 provider's `sdk_python_root` option. Unit tests do not require a live Codex
 session.
 
+OpenCode support uses an external `opencode` 1.18.4 executable. Applications
+register `build_opencode_provider_bundle(...)` explicitly and provide model
+credentials through environment references; ARK does not bundle OpenCode or
+copy credentials into a Home or snapshot.
+
 ## Runtime Assembly
 
 Applications normally create one shared framework container and one
@@ -178,6 +184,7 @@ By default, runtime state lives below the configured runtime root:
 ```text
 .agent_runtime/
 ├── homes/                 # isolated provider homes and Home index
+├── providers/             # provider-owned per-Agent runtime data (for example OpenCode SQLite/XDG)
 ├── scopes/                # scope-owned Agent, Flow, and Step truth
 ├── index/global.sqlite    # rebuildable global Agent/Flow/Step index
 ├── snapshots/
@@ -215,6 +222,10 @@ python -m pytest -q tests/unit tests/integration
 Real Codex tests are under `tests/real/` and require an explicitly configured
 Codex SDK, CLI, Home, and credentials. They are intentionally separate from the
 default regression suite.
+
+The gated OpenCode integration tests use `ARK_OPENCODE_TEST_BINARY`. Real model
+tests additionally require `ARK_OPENCODE_RUN_REAL_MODELS=1` and backend keys in
+the documented environment variables. They never read a shared OpenCode Home.
 
 ## Documentation
 

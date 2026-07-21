@@ -5,8 +5,9 @@ ARK separates an application's Agent role from the harness that executes it.
 Codex-, CLI-, subprocess-, or library-backed agent is configured, run,
 queried, controlled, and snapshotted.
 
-The bundled reference implementation is `codex`. Additional providers can be
-registered without changing Flow, Step, or snapshot orchestration.
+The bundled implementations are the `codex` reference adapter and an opt-in
+`opencode` 1.18.4 adapter. Additional providers can be registered without
+changing Flow, Step, or snapshot orchestration.
 
 ## Public Contract Namespace
 
@@ -96,3 +97,46 @@ can use `wait_agent_result()`, `query_*()`, and
 `inspect_agent_context_result()` for normalized values. Compatibility paths
 are explicitly marked in source and have migration tests; they are not the
 template for new provider implementations.
+
+## OpenCode Adapter
+
+Create the OpenCode bundle explicitly:
+
+```python
+from pathlib import Path
+
+from agent_runtime_kit.agent.provider_contracts import ProviderRegistry
+from agent_runtime_kit.agent.providers import build_opencode_provider_bundle
+
+runtime_root = Path(".agent_runtime")
+opencode = build_opencode_provider_bundle(
+    runtime_root=runtime_root,
+    binary_path="opencode",  # pinned and managed by the embedding application
+)
+registry = ProviderRegistry((opencode,))
+```
+
+The Home renderer writes `opencode.json`, `AGENTS.md`, skills, and MCP entries.
+Sensitive config values must use OpenCode `{env:NAME}` references; inline API
+keys and authorization values are rejected. Project-local config discovery,
+OpenCode workspace snapshots, sharing, and automatic updates are disabled by
+default.
+
+Each Agent receives its own server process, XDG directories, and
+`OPENCODE_DB`. The adapter subscribes to SSE before submitting a prompt and
+does not report completion until it has both persisted assistant completion
+evidence and a live idle status. Query results normalize OpenCode messages,
+parts, tools, request usage, model identity, and provider-reported cost.
+
+OpenCode `summarize` is exposed as model-backed OpenCode compaction. It is not
+OpenAI Responses native compaction. Fork creates a session-only branch and
+copies the source SQLite database into the target Agent runtime; it does not
+isolate the workspace. Snapshot uses SQLite online backup and includes
+referenced tool-output data, while credentials, logs, caches, and workspace
+files remain excluded. Restore currently requires the same runtime root and
+Agent path so OpenCode's absolute tool-output references remain valid.
+
+The first adapter version queries through a live isolated OpenCode server and
+does not claim offline artifact query or in-flight permission/question
+snapshot support. Capability resolution must be checked for the effective
+model backend and API mode.

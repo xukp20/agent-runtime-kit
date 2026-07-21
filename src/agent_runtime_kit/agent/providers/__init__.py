@@ -10,6 +10,9 @@ from .external_takeover import (
     ExternalTakeoverThreadSnapshot,
     ExternalTakeoverTurnResult,
 )
+from .opencode_bundle import build_opencode_provider_bundle
+from .opencode_home import OpenCodeHomeRenderer
+from .opencode_models import OpenCodeHomeOptions, OpenCodeRunOptions
 
 __all__ = [
     "CodexForkResult",
@@ -22,4 +25,8 @@ __all__ = [
     "ExternalTakeoverProviderResult",
     "ExternalTakeoverThreadSnapshot",
     "ExternalTakeoverTurnResult",
+    "OpenCodeHomeOptions",
+    "OpenCodeHomeRenderer",
+    "OpenCodeRunOptions",
+    "build_opencode_provider_bundle",
 ]
