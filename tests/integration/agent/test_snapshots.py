@@ -290,6 +290,31 @@ def test_scope_restore_without_reports_removes_stale_live_reports(tmp_path: Path
     assert service.read_default_trace_report(agent.agent_id)["rollout"]["agent_id"] == agent.agent_id
 
 
+def test_scope_restore_prepares_post_snapshot_placeholder_before_replacing_scope(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    service.create_agent("scope-a", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    snapshot = snapshot_service.create_scope_snapshot("scope-a")
+    assert snapshot.snapshot_id is not None
+    late_agent = service.store.create_agent_record(
+        scope_id="scope-a",
+        agent_type="worker",
+        cli_type="codex",
+        home_id="worker",
+        thread_id="post-snapshot-placeholder",
+    )
+
+    restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    with pytest.raises(KeyError):
+        service.get_agent(late_agent.agent_id)
+
+
 def test_scope_snapshot_without_reports_reduces_report_heavy_payload_by_at_least_75_percent(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     service = _make_service(runtime_root)
@@ -395,6 +420,31 @@ def test_runtime_synchronized_snapshot_and_restore(tmp_path: Path) -> None:
     assert restored.status == "created"
     assert service.get_agent(agent_b.agent_id).status == "idle"
     assert len(snapshot_service.list_runtime_snapshots()) == 1
+
+
+def test_runtime_restore_prepares_post_snapshot_placeholder_before_replacing_scope(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    service.create_agent("scope-a", "worker")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    snapshot = snapshot_service.create_runtime_snapshot_synchronized()
+    assert snapshot.snapshot_id is not None
+    late_agent = service.store.create_agent_record(
+        scope_id="scope-a",
+        agent_type="worker",
+        cli_type="codex",
+        home_id="worker",
+        thread_id="post-snapshot-placeholder",
+    )
+
+    restored = snapshot_service.restore_runtime_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    with pytest.raises(KeyError):
+        service.get_agent(late_agent.agent_id)
 
 
 def test_runtime_restore_can_prune_scopes_and_artifacts_created_after_snapshot(tmp_path: Path) -> None:

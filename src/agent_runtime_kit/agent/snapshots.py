@@ -391,12 +391,12 @@ class AgentSnapshotService:
                 restored_scope_dir = files_root / "scopes" / scope_key
                 current_scope_dir = self.runtime_root / "scopes" / scope_key
                 old_agents = list(self.store.list_agents(scope_id=scope_id))
+                self._remove_report_files_for_agents(old_agents)
+                self._prepare_provider_artifacts(old_agents)
                 if current_scope_dir.exists():
                     shutil.rmtree(current_scope_dir)
                 if restored_scope_dir.exists():
                     shutil.copytree(restored_scope_dir, current_scope_dir)
-                self._remove_report_files_for_agents(old_agents)
-                self._prepare_provider_artifacts(old_agents)
                 self._restore_report_files(files_root)
                 self._restore_provider_artifacts_or_legacy(manifest, files_root)
                 self.store.rebuild_scope_index(scope_id)
@@ -485,12 +485,12 @@ class AgentSnapshotService:
                         current_scope_dir = self.runtime_root / "scopes" / scope_key
                         restored_scope_dir = files_root / "scopes" / scope_key
                         old_agents = list(self.store.list_agents(scope_id=scope_id))
+                        self._remove_report_files_for_agents(old_agents)
+                        self._prepare_provider_artifacts(old_agents)
                         if current_scope_dir.exists():
                             shutil.rmtree(current_scope_dir)
                         if restored_scope_dir.exists():
                             shutil.copytree(restored_scope_dir, current_scope_dir)
-                        self._remove_report_files_for_agents(old_agents)
-                        self._prepare_provider_artifacts(old_agents)
                         self._restore_report_files(files_root)
                         self._restore_provider_artifacts_or_legacy(scope_manifest, files_root)
                     except BaseException as exc:
