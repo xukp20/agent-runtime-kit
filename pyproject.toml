@@ -19,6 +19,11 @@ classifiers = [
 [project.optional-dependencies]
 dev = ["pytest"]
 claude = ["claude-agent-sdk==0.2.124"]
+openai-agents = [
+  "openai-agents==0.18.3",
+  "openai==2.46.0",
+  "httpx[socks]>=0.27,<1",
+]
 
 [project.urls]
 Homepage = "https://github.com/xukp20/agent-runtime-kit"
@@ -42,5 +47,6 @@ markers = [
   "real_codex_artifact: tests that use local real Codex JSONL artifacts under data/",
   "real_claude: tests that require Claude Agent SDK, Claude Code CLI, and usable provider configuration",
   "real_pi: tests that require Pi CLI 0.80.10 and a usable real model profile",
+  "real_openai_agents: tests that require OpenAI Agents SDK and a live model endpoint",
   "slow: tests that may take longer than regular unit tests",
 ]

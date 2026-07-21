@@ -3,6 +3,14 @@
 from .codex import CodexForkResult, CodexProvider, CodexTurnResult
 from .claude_code import ClaudeCodeProvider, ClaudeCodeSdkUnavailable
 from .claude_code_home import ClaudeCodeHomeOptions
+from .openai_agents import (
+    OpenAIAgentsBuildContext,
+    OpenAIAgentsControlOptions,
+    OpenAIAgentsHomeOptions,
+    OpenAIAgentsProvider,
+    OpenAIAgentsResourceRegistry,
+    OpenAIAgentsRunOptions,
+)
 from .external_takeover import (
     ExternalTakeoverCancelled,
     ExternalTakeoverForkResult,
@@ -23,6 +31,12 @@ __all__ = [
     "CodexForkResult",
     "CodexProvider",
     "CodexTurnResult",
+    "OpenAIAgentsBuildContext",
+    "OpenAIAgentsControlOptions",
+    "OpenAIAgentsHomeOptions",
+    "OpenAIAgentsProvider",
+    "OpenAIAgentsResourceRegistry",
+    "OpenAIAgentsRunOptions",
     "ExternalTakeoverCancelled",
     "ExternalTakeoverForkResult",
     "ExternalTakeoverHomeInitializationRecord",
