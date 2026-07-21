@@ -259,6 +259,12 @@ class RuntimeScheduleService:
                 mode = "unbounded"
             requested = self._requested_run_budget
             semantic = self._semantic_policy
+            if requested is not None:
+                completed_flow_advances = requested.flow_advances - (self._remaining_flow_advances or 0)
+                completed_step_starts = requested.step_starts - (self._remaining_step_starts or 0)
+            else:
+                completed_flow_advances = self._semantic_flow_advances
+                completed_step_starts = self._semantic_step_starts
             return SchedulerRunControlView(
                 mode=mode,
                 run_plan=run_plan,
@@ -268,8 +274,8 @@ class RuntimeScheduleService:
                 requested_step_starts=None if requested is None else requested.step_starts,
                 remaining_flow_advances=self._remaining_flow_advances,
                 remaining_step_starts=self._remaining_step_starts,
-                completed_flow_advances=self._semantic_flow_advances,
-                completed_step_starts=self._semantic_step_starts,
+                completed_flow_advances=completed_flow_advances,
+                completed_step_starts=completed_step_starts,
                 pause_reason=self._bounded_pause_reason,
             )
 

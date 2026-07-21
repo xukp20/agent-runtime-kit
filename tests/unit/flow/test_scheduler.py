@@ -322,6 +322,8 @@ def test_bounded_flow_only_run_advances_once_and_auto_pauses(tmp_path: Path) -> 
     assert tick.run_control.pause_reason == "budget_exhausted"
     assert tick.run_control.remaining_flow_advances == 0
     assert tick.run_control.remaining_step_starts == 0
+    assert tick.run_control.completed_flow_advances == 1
+    assert tick.run_control.completed_step_starts == 0
     assert pause.is_paused()
     assert step_service.store.get_step(step_id).status is StepStatus.CREATED
 
@@ -371,6 +373,8 @@ def test_bounded_step_run_drains_until_stable_hook_before_auto_pause(tmp_path: P
     assert terminal_tick.auto_paused is True
     assert terminal_tick.run_control is not None
     assert terminal_tick.run_control.pause_reason == "budget_exhausted"
+    assert terminal_tick.run_control.completed_flow_advances == 0
+    assert terminal_tick.run_control.completed_step_starts == 1
     assert pause.is_paused()
 
 
@@ -533,6 +537,7 @@ def test_bounded_flow_advance_exception_refunds_reserved_budget(tmp_path: Path, 
         scheduler.schedule_flow_once()
 
     assert scheduler.get_run_control_view().remaining_flow_advances == 1
+    assert scheduler.get_run_control_view().completed_flow_advances == 0
 
 
 def test_clear_run_budget_restores_unbounded_mode(tmp_path: Path) -> None:
