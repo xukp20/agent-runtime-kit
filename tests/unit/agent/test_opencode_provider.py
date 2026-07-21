@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -15,6 +15,7 @@ from agent_runtime_kit.agent.provider_contracts import (
     BaseConfigSource,
     CapabilityKey,
     ModelBackendIdentity,
+    ProviderContextQuery,
     ProviderHomeSpec,
     ProviderControlAction,
     ProviderControlRequest,
@@ -27,9 +28,10 @@ from agent_runtime_kit.agent.providers.opencode_artifacts import OpenCodeArtifac
 from agent_runtime_kit.agent.providers.opencode_bundle import build_opencode_provider_bundle
 from agent_runtime_kit.agent.providers.opencode_home import OpenCodeHomeRenderer
 from agent_runtime_kit.agent.providers.opencode_models import OpenCodeHomeOptions
-from agent_runtime_kit.agent.providers.opencode_query import project_turns
+from agent_runtime_kit.agent.providers.opencode_query import OpenCodeQueryAdapter, project_turns
 from agent_runtime_kit.agent.providers.opencode_runtime import _message_id
 from agent_runtime_kit.agent.providers.opencode_client import OpenCodeSseEvent, _safe_body
+from agent_runtime_kit.agent.providers.opencode_context import OpenCodeContextAdapter, _model_limits
 from agent_runtime_kit.agent.providers.opencode_runtime import OpenCodeProviderRunHandle
 from agent_runtime_kit.agent.skills import SkillSpec
 
@@ -57,6 +59,7 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
                   "model": "deepseek/deepseek-chat",
                   "provider": {"deepseek": {"npm": "@ai-sdk/openai-compatible"}},
                   "snapshot": true,
+                  "plugin": ["unsafe-plugin"],
                 }'''
             ),
             config_overrides={"provider": {"deepseek": {"options": {"baseURL": "https://example.test"}}}},
@@ -71,7 +74,9 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
                 ),
             ),
             fixed_env={"SAFE_SETTING": "yes"},
+            fixed_env_refs={"MAPPED_TOKEN": "SOURCE_TOKEN"},
             required_env=("LEAN_TOKEN",),
+            tools=({"bash": False, "mcp_lean_*": True},),
             provider_options=OpenCodeHomeOptions(
                 binary_path="/opt/opencode",
                 agent_files={"reviewer": "---\ndescription: Review changes\n---\nReview."},
@@ -83,9 +88,11 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     config = json.loads((home_root / "opencode.json").read_text())
     assert config["snapshot"] is False
     assert config["share"] == "disabled"
+    assert config["plugin"] == []
     assert config["provider"]["deepseek"]["options"]["baseURL"] == "https://example.test"
     assert config["mcp"]["lean"]["command"] == ["python", "-m", "lean_mcp"]
     assert config["mcp"]["lean"]["environment"]["LEAN_TOKEN"] == "{env:LEAN_TOKEN}"
+    assert config["tools"] == {"bash": False, "mcp_lean_*": True}
     assert (home_root / "AGENTS.md").read_text() == "Keep changes surgical.\n"
     assert (home_root / "skills" / "proof" / "SKILL.md").is_file()
     assert (home_root / "agents" / "reviewer.md").is_file()
@@ -104,13 +111,26 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
         fixed_env={"SAFE_SETTING": "yes"},
         required_env={"LEAN_TOKEN"},
     )
-    with pytest.raises(Exception, match="LEAN_TOKEN"):
+    with pytest.raises(Exception, match="LEAN_TOKEN|SOURCE_TOKEN"):
         renderer.build_execution_context(record, run_env={}, workdir=str(tmp_path))
     context = renderer.build_execution_context(
-        record, run_env={"LEAN_TOKEN": "secret"}, workdir=str(tmp_path)
+        record,
+        run_env={
+            "LEAN_TOKEN": "secret",
+            "SOURCE_TOKEN": "source-secret",
+            "OPENCODE_CONFIG": "/tmp/bypass.json",
+            "OPENCODE_CONFIG_CONTENT": '{"share": "auto"}',
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "0",
+            "OPENCODE_PURE": "0",
+        },
+        workdir=str(tmp_path),
     )
     assert context.process_environment["ARK_OPENCODE_BINARY"] == "/opt/opencode"
     assert context.process_environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+    assert context.process_environment["OPENCODE_PURE"] == "1"
+    assert "OPENCODE_CONFIG" not in context.process_environment
+    assert "OPENCODE_CONFIG_CONTENT" not in context.process_environment
+    assert context.process_environment["MAPPED_TOKEN"] == "source-secret"
     assert '"LEAN_TOKEN": "secret"' not in (
         home_root / ".ark" / "home_materialization.json"
     ).read_text()
@@ -261,6 +281,92 @@ def test_opencode_error_body_redacts_credentials() -> None:
     value = _safe_body('{"apiKey":"sk-test-secret", "Authorization":"Bearer private"}')
     assert "sk-test-secret" not in value
     assert "Bearer private" not in value
+
+
+def test_opencode_context_resolves_live_model_limits_without_provider_secrets() -> None:
+    identity = ModelBackendIdentity(
+        api_provider="beeapi-responses",
+        api_mode="responses",
+        requested_model="gpt-5.4",
+    )
+    provider_payload = {
+        "all": [
+            {
+                "id": "beeapi-responses",
+                "key": "must-not-be-retained",
+                "options": {"apiKey": "also-must-not-be-retained"},
+                    "models": {
+                        "gpt-5.4": {
+                            "limit": {
+                                "context": 1_050_000,
+                                "input": 922_000,
+                                "output": 128_000,
+                            }
+                        }
+                    },
+            }
+        ]
+    }
+
+    class _Client:
+        def list_messages(self, session_id: str) -> list[object]:
+            assert session_id == "ses_limits"
+            return [
+                {
+                    "info": {"id": "msg_user", "role": "user", "time": {"created": 1000}},
+                    "parts": [{"id": "p_user", "type": "text", "text": "hello"}],
+                },
+                {
+                    "info": {
+                        "id": "msg_assistant",
+                        "role": "assistant",
+                        "parentID": "msg_user",
+                        "providerID": "beeapi-responses",
+                        "modelID": "gpt-5.4",
+                        "finish": "stop",
+                        "tokens": {"input": 100, "cache": {"read": 20}},
+                        "time": {"created": 1100, "completed": 1200},
+                    },
+                    "parts": [{"id": "p_text", "type": "text", "text": "done"}],
+                },
+            ]
+
+        def list_providers(self) -> dict[str, object]:
+            return provider_payload
+
+    client = _Client()
+
+    class _Registry:
+        def client_for_locator(self, locator):  # noqa: ANN001, ANN201
+            del locator
+            return client
+
+    session = ProviderSessionLocator(
+        provider_type="opencode",
+        session_id="ses_limits",
+        home_id="main",
+        created_at="2026-07-21T00:00:00Z",
+        backend_identity=identity,
+    )
+    usage = OpenCodeContextAdapter(
+        registry=_Registry(),
+        query=OpenCodeQueryAdapter(lambda locator: client),
+    ).inspect(
+        ProviderContextQuery(session=session)
+    )
+    assert usage.context_window_tokens == 1_050_000
+    assert usage.effective_context_window_tokens == 922_000
+    assert usage.max_output_tokens == 128_000
+    assert usage.used_tokens == 120
+    assert usage.remaining_tokens == 921_880
+    assert usage.provider_payload is not None
+    assert usage.provider_payload.sanitized_data == {
+        "provider_id": "beeapi-responses",
+        "model_id": "gpt-5.4",
+        "limit": {"context": 1_050_000, "input": 922_000, "output": 128_000},
+    }
+    assert "must-not-be-retained" not in repr(usage.provider_payload)
+    assert _model_limits(provider_payload, replace(identity, requested_model="unknown")) == {}
 
 
 class _InteractionClient:

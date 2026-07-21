@@ -14,6 +14,7 @@ from agent_runtime_kit.agent.provider_contracts import (
     ArtifactRestoreRequest,
     ModelBackendIdentity,
     ProviderContextCompactionRequest,
+    ProviderContextQuery,
     ProviderForkRequest,
     ProviderHomeSpec,
     ProviderRunOptions,
@@ -323,6 +324,13 @@ def test_real_opencode_beeapi_responses_run(tmp_path: Path) -> None:
         assert result.turn_usage.requests
         assert result.turn_usage.requests[-1].model_identity.api_provider == "beeapi-responses"
         assert result.turn_usage.requests[-1].model_identity.api_mode == "responses"
+        query = OpenCodeQueryAdapter(registry.client_for_locator)
+        context_usage = OpenCodeContextAdapter(registry=registry, query=query).inspect(
+            ProviderContextQuery(session=result.session_locator)
+        )
+        assert context_usage.context_window_tokens == 1_050_000
+        assert context_usage.max_output_tokens == 128_000
+        assert context_usage.used_tokens is not None
     finally:
         runtime.close()
 

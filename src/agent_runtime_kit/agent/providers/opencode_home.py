@@ -39,9 +39,12 @@ class OpenCodeHomeRenderer:
             spec.provider_options, OpenCodeHomeOptions
         ):
             errors.append("OpenCode provider_options must be OpenCodeHomeOptions")
+        if spec.extensions:
+            errors.append("OpenCode extensions/plugins are disabled in the first adapter version")
         try:
             config = _read_config(spec)
             _deep_merge(config, dict(spec.config_overrides))
+            _tools_config(spec.tools)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             errors.append(str(exc))
         for item in spec.skills:
@@ -58,8 +61,22 @@ class OpenCodeHomeRenderer:
         root.mkdir(parents=True, exist_ok=True)
         config = _deep_merge(_read_config(spec), dict(spec.config_overrides))
         config = _deep_merge(config, _mcp_config(spec.mcp_servers))
-        config.update({"snapshot": False, "share": "disabled", "autoupdate": False})
+        config = _deep_merge(config, _tools_config(spec.tools))
+        config.update(
+            {
+                "snapshot": False,
+                "share": "disabled",
+                "autoupdate": False,
+                "plugin": [],
+            }
+        )
         _validate_secret_refs(config)
+        required_env = tuple(
+            sorted(
+                set(spec.required_env)
+                | set(spec.fixed_env_refs.values())
+            )
+        )
         config_path = root / options.config_filename
         config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         instructions = _instructions_text(spec.instructions)
@@ -80,7 +97,7 @@ class OpenCodeHomeRenderer:
             manifest_schema_version=1,
             manifest_hash="",
             generated_files=generated,
-            required_env=tuple(spec.required_env),
+            required_env=required_env,
             auth_refs=tuple(spec.auth_refs),
             resolved_defaults=defaults,
             warnings=(
@@ -97,6 +114,7 @@ class OpenCodeHomeRenderer:
                     "server_start_timeout_s": options.server_start_timeout_s,
                     "allow_project_config": options.allow_project_config,
                     "config_filename": options.config_filename,
+                    "fixed_env_refs": dict(spec.fixed_env_refs),
                 },
             ),
         )
@@ -155,9 +173,8 @@ class OpenCodeHomeRenderer:
         env.update(dict(getattr(home, "fixed_env", {})))
         if run_env:
             env.update(run_env)
-        for name in getattr(home, "required_env", set()):
-            if not env.get(name):
-                raise MissingProviderEnvError(name)
+        env.pop("OPENCODE_CONFIG", None)
+        env.pop("OPENCODE_CONFIG_CONTENT", None)
         options_payload = payload.get("provider_payload")
         options_data = (
             options_payload.get("sanitized_data")
@@ -165,9 +182,26 @@ class OpenCodeHomeRenderer:
             and isinstance(options_payload.get("sanitized_data"), Mapping)
             else {}
         )
+        fixed_env_refs = options_data.get("fixed_env_refs")
+        if isinstance(fixed_env_refs, Mapping):
+            for target_name, source_name in fixed_env_refs.items():
+                source = str(source_name)
+                if not env.get(source):
+                    raise MissingProviderEnvError(source)
+                env[str(target_name)] = env[source]
+        required_env = set(getattr(home, "required_env", set())) | set(
+            str(name) for name in payload.get("required_env", [])
+        )
+        for name in required_env:
+            if not env.get(name):
+                raise MissingProviderEnvError(name)
         env["OPENCODE_CONFIG_DIR"] = str(home_root)
-        if not bool(options_data.get("allow_project_config", False)):
-            env.setdefault("OPENCODE_DISABLE_PROJECT_CONFIG", "1")
+        allow_project_config = bool(options_data.get("allow_project_config", False))
+        env["OPENCODE_PURE"] = "1"
+        if allow_project_config:
+            env.pop("OPENCODE_DISABLE_PROJECT_CONFIG", None)
+        else:
+            env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
         if options_data.get("binary_path"):
             env["ARK_OPENCODE_BINARY"] = str(options_data["binary_path"])
         if options_data.get("server_start_timeout_s") is not None:
@@ -181,7 +215,10 @@ class OpenCodeHomeRenderer:
             process_environment=env,
             workdir=workdir,
             resolved_defaults=_identity_from_payload(payload.get("resolved_defaults")),
-            runtime_payload={"runtime_root": str(self.runtime_root)},
+            runtime_payload={
+                "runtime_root": str(self.runtime_root),
+                "allow_project_config": allow_project_config,
+            },
         )
 
 
@@ -325,6 +362,25 @@ def _mcp_config(servers: tuple[object, ...]) -> dict[str, object]:
             raise ValueError(f"OpenCode MCP server {name} requires command or url")
         values[name] = item
     return {"mcp": values} if values else {}
+
+
+def _tools_config(tools: tuple[object, ...]) -> dict[str, object]:
+    values: dict[str, bool] = {}
+    for tool in tools:
+        if isinstance(tool, Mapping):
+            for name, enabled in tool.items():
+                if not str(name).strip() or not isinstance(enabled, bool):
+                    raise ValueError(
+                        "OpenCode tool mappings require non-empty names and boolean values"
+                    )
+                values[str(name)] = enabled
+            continue
+        name = str(getattr(tool, "name", "")).strip()
+        enabled = getattr(tool, "enabled", None)
+        if not name or not isinstance(enabled, bool):
+            raise ValueError("OpenCode tool specs require name and boolean enabled attributes")
+        values[name] = enabled
+    return {"tools": values} if values else {}
 
 
 def _validate_secret_refs(value: object, path: tuple[str, ...] = ()) -> None:

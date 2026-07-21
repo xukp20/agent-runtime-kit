@@ -18,7 +18,7 @@ from ..provider_contracts import (
 from .opencode_artifacts import OpenCodeArtifactAdapter
 from .opencode_context import OpenCodeContextAdapter
 from .opencode_home import OpenCodeHomeRenderer
-from .opencode_models import ADAPTER_VERSION, PROVIDER_TYPE
+from .opencode_models import ADAPTER_VERSION, PROVIDER_TYPE, SUPPORTED_CLI_VERSION
 from .opencode_query import OpenCodeQueryAdapter
 from .opencode_runtime import OpenCodeRuntimeAdapter, OpenCodeRuntimeRegistry
 
@@ -179,7 +179,7 @@ def build_opencode_provider_bundle(
             execution_kind=ProviderExecutionKind.SUBPROCESS_RPC,
             home_kind=ProviderHomeKind.NATIVE,
             sdk_or_cli_name="opencode",
-            sdk_or_cli_version="1.18.4",
+            sdk_or_cli_version=SUPPORTED_CLI_VERSION,
             supported_api_modes=("responses", "chat_completions"),
             static_capabilities=capabilities,
         ),

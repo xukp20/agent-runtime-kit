@@ -8,6 +8,8 @@ from ..provider_contracts import (
     CapabilityKey,
     CapabilityStatus,
     CapabilitySupport,
+    ContextUsageCategory,
+    ModelBackendIdentity,
     ProviderContextCompactionRequest,
     ProviderContextCompactionResult,
     ProviderContextQuery,
@@ -18,6 +20,7 @@ from ..provider_contracts import (
     build_provider_payload,
 )
 from ..store_utils import utc_now_iso
+from .opencode_client import OpenCodeClientError
 from .opencode_models import ADAPTER_VERSION, PROVIDER_TYPE
 from .opencode_query import OpenCodeQueryAdapter
 from .opencode_runtime import OpenCodeRuntimeRegistry
@@ -42,14 +45,54 @@ class OpenCodeContextAdapter:
         tokens = usage.token_usage
         used = _observed_input(tokens)
         identity = request.session.backend_identity
+        client = self.registry.client_for_locator(request.session)
+        try:
+            limits = _model_limits(client.list_providers(), identity)
+        except OpenCodeClientError:
+            limits = {}
+        context_window = limits.get("context")
+        effective_window = limits.get("input") or context_window
+        max_output = limits.get("output")
+        remaining = (
+            max(effective_window - used, 0)
+            if effective_window is not None and used is not None
+            else None
+        )
+        categories = tuple(
+            category
+            for category in (
+                ContextUsageCategory(
+                    kind="input",
+                    name="provider_reported_input",
+                    tokens=tokens.input_tokens,
+                    measurement=(
+                        "provider_reported" if tokens.input_tokens is not None else "unavailable"
+                    ),
+                ),
+                ContextUsageCategory(
+                    kind="cache_read",
+                    name="provider_reported_cache_read",
+                    tokens=tokens.cache_read_input_tokens,
+                    measurement=(
+                        "provider_reported"
+                        if tokens.cache_read_input_tokens is not None
+                        else "unavailable"
+                    ),
+                ),
+            )
+            if category.tokens is not None
+        )
         return ProviderContextUsage(
             session_id=request.session.session_id,
             observed_at=utc_now_iso(),
             source="opencode.latest_assistant_usage",
             available=used is not None,
             used_tokens=used,
-            context_window_tokens=None,
-            remaining_tokens=None,
+            context_window_tokens=context_window,
+            effective_context_window_tokens=effective_window,
+            max_output_tokens=max_output,
+            remaining_tokens=remaining,
+            categories=categories,
             auto_compact_enabled=False,
             compact_capability=CapabilitySupport(
                 capability=CapabilityKey.CONTROL_COMPACT,
@@ -61,6 +104,16 @@ class OpenCodeContextAdapter:
             measurement="provider_reported_latest_request" if used is not None else "unavailable",
             model_identity=identity,
             reason=None if used is not None else "OpenCode did not report latest input usage",
+            provider_payload=build_provider_payload(
+                provider_type=PROVIDER_TYPE,
+                payload_type="context_model_limits",
+                data={
+                    "provider_id": identity.api_provider if identity else None,
+                    "model_id": identity.effective_model if identity else None,
+                    "limit": limits,
+                },
+                adapter_version=ADAPTER_VERSION,
+            ),
         )
 
     def compact(self, request: ProviderContextCompactionRequest) -> ProviderContextCompactionResult:
@@ -147,6 +200,40 @@ def _observed_input(tokens: TokenUsage) -> int | None:
     if tokens.input_tokens is None:
         return None
     return tokens.input_tokens + (tokens.cache_read_input_tokens or 0)
+
+
+def _model_limits(
+    payload: Mapping[str, object],
+    identity: ModelBackendIdentity | None,
+) -> dict[str, int]:
+    if identity is None:
+        return {}
+    providers = payload.get("all")
+    if not isinstance(providers, list):
+        return {}
+    for provider in providers:
+        if (
+            not isinstance(provider, Mapping)
+            or str(provider.get("id") or "") != identity.api_provider
+        ):
+            continue
+        models = provider.get("models")
+        if not isinstance(models, Mapping):
+            return {}
+        model = models.get(identity.effective_model or "")
+        if not isinstance(model, Mapping):
+            return {}
+        limit = model.get("limit")
+        if not isinstance(limit, Mapping):
+            return {}
+        return {
+            key: int(value)
+            for key in ("context", "input", "output")
+            if not isinstance((value := limit.get(key)), bool)
+            and isinstance(value, (int, float))
+            and value > 0
+        }
+    return {}
 
 
 def _message_ids(messages: list[object]) -> set[str]:

@@ -96,6 +96,12 @@ class OpenCodeClient:
             raise OpenCodeClientError("OpenCode status response is not an object")
         return value
 
+    def list_providers(self) -> Mapping[str, object]:
+        value = self.request("GET", "/provider")
+        if not isinstance(value, Mapping):
+            raise OpenCodeClientError("OpenCode provider response is not an object")
+        return value
+
     def prompt_async(self, session_id: str, payload: Mapping[str, object]) -> None:
         self.request("POST", f"/session/{_segment(session_id)}/prompt_async", payload=payload)
 

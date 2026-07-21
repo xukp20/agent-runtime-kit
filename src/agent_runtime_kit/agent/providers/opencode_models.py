@@ -7,6 +7,7 @@ from typing import Mapping
 
 PROVIDER_TYPE = "opencode"
 ADAPTER_VERSION = "1"
+SUPPORTED_CLI_VERSION = "1.18.4"
 
 
 @dataclass(frozen=True)

@@ -37,6 +37,7 @@ from .opencode_models import (
     OpenCodeNativeLocator,
     OpenCodeRunOptions,
     PROVIDER_TYPE,
+    SUPPORTED_CLI_VERSION,
     parse_native_locator,
 )
 from .opencode_query import completed_turn_result
@@ -129,6 +130,13 @@ class OpenCodeRuntimeRegistry:
         port = _free_port()
         env = dict(context.process_environment)
         env.update(request.environment)
+        env.pop("OPENCODE_CONFIG", None)
+        env.pop("OPENCODE_CONFIG_CONTENT", None)
+        env["OPENCODE_PURE"] = "1"
+        if bool(context.runtime_payload.get("allow_project_config", False)):
+            env.pop("OPENCODE_DISABLE_PROJECT_CONFIG", None)
+        else:
+            env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
         env.update(
             {
                 "HOME": str(paths["home"]),
@@ -164,7 +172,17 @@ class OpenCodeRuntimeRegistry:
                     f"OpenCode serve exited during startup with code {process.returncode}"
                 )
             try:
-                client.health()
+                health = client.health()
+                if health.get("healthy") is not True:
+                    raise OpenCodeClientError("OpenCode health response did not report healthy=true")
+                version = str(health.get("version") or "")
+                if version != SUPPORTED_CLI_VERSION:
+                    process.terminate()
+                    process.wait(timeout=5)
+                    raise RuntimeError(
+                        f"unsupported OpenCode version: {version or 'unknown'}; "
+                        f"expected {SUPPORTED_CLI_VERSION}"
+                    )
                 break
             except OpenCodeClientError as exc:
                 last_error = exc
