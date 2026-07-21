@@ -53,3 +53,5 @@ current-code reference are the authoritative API guides.
 - [Claude Code provider](claude-code-provider.md): isolated Claude Homes,
   Claude Agent SDK runtime assembly, normalized queries, context/compact,
   session-only fork, and transcript snapshot/restore.
+- [Pi provider](pi-provider.md): Pi 0.80.10 Home and model configuration,
+  JSONL RPC lifecycle, agent-owned compaction, MCP bridge, and snapshots.

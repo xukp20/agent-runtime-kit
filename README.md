@@ -20,10 +20,10 @@ The current implementation includes:
   requirements, MCP server definitions, and materialized skills;
 - a provider-neutral contract layer with descriptors, capabilities, Home
   renderers, runtime handles, query/context/artifact adapters, and a registry;
-- bundled Codex and Claude Code providers: Codex preserves its existing SDK
-  compatibility surface, while Claude Code uses the Claude Agent SDK with
-  isolated native Homes, resumable sessions, normalized JSONL queries,
-  context control, and transcript snapshots;
+- bundled Codex, Claude Code, and Pi providers: Codex preserves its existing
+  SDK compatibility surface, Claude Code uses the Claude Agent SDK with
+  isolated native Homes and transcript snapshots, and Pi uses JSONL subprocess
+  RPC with an ARK-owned MCP extension bridge;
 - versioned Agent records with provider/session/turn/artifact locators plus
   compatibility aliases for existing Codex runtimes and snapshots;
 - Agent start, wait, interrupt, session-only fork, close, stale-run
@@ -130,6 +130,13 @@ The Claude Code CLI and its backend credentials remain external runtime
 requirements. See [`docs/claude-code-provider.md`](docs/claude-code-provider.md)
 for isolated Home assembly, capabilities, and snapshot boundaries.
 
+Pi support targets `@earendil-works/pi-coding-agent` 0.80.10. Applications
+supply either an executable `pi` CLI or a Node executable plus the CLI entry
+file through `PiHomeOptions`. MCP projection additionally requires a prepared
+Node runtime containing `@modelcontextprotocol/sdk`; ARK packages the bridge
+code but does not install or mutate application Node dependencies. See the
+[Pi provider guide](docs/pi-provider.md) for assembly and capability details.
+
 ## Runtime Assembly
 
 Applications normally create one shared framework container and one
@@ -227,9 +234,9 @@ Run the deterministic unit and integration suites with:
 python -m pytest -q tests/unit tests/integration
 ```
 
-Real Codex and Claude Code tests are under `tests/real/` and require explicitly
-configured SDKs, CLIs, Homes, and credentials. They are intentionally separate
-from the default regression suite.
+Real provider tests are under `tests/real/` and require explicitly configured
+CLIs, Homes, credentials, and opt-in environment gates. They are intentionally
+separate from the default regression suite.
 
 ## Documentation
 
@@ -248,6 +255,8 @@ Agent status wait contracts intended for application monitoring adapters.
 - [`docs/claude-code-provider.md`](docs/claude-code-provider.md) documents the
   bundled Claude Code adapter, configuration, controls, query projection, and
   snapshot semantics.
+- [`docs/pi-provider.md`](docs/pi-provider.md) documents Pi Home projection,
+  RPC lifecycle, usage/context semantics, MCP, snapshots, and configuration.
 
 Maintainer checkouts may also contain a local `dev_docs/` tree with Chinese
 design, implementation, and current-code reference material. It is intentionally

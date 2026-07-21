@@ -28,7 +28,7 @@ Repository = "https://github.com/xukp20/agent-runtime-kit"
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-agent_runtime_kit = ["py.typed"]
+agent_runtime_kit = ["py.typed", "agent/providers/pi_mcp_bridge.mjs"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -41,5 +41,6 @@ markers = [
   "real_codex: tests that require Codex CLI, Codex SDK, or a usable Codex home",
   "real_codex_artifact: tests that use local real Codex JSONL artifacts under data/",
   "real_claude: tests that require Claude Agent SDK, Claude Code CLI, and usable provider configuration",
+  "real_pi: tests that require Pi CLI 0.80.10 and a usable real model profile",
   "slow: tests that may take longer than regular unit tests",
 ]
