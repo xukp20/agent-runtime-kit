@@ -72,6 +72,35 @@ def test_codex_snapshot_uses_provider_artifact_manifest_for_restore(tmp_path: Pa
     assert not state_db.exists()
 
 
+def test_codex_snapshot_keeps_legacy_placeholder_session_compatibility(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    registry = AgentTypeRegistry()
+    registry.register(SnapshotAgentType())
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        providers={"codex": CodexProvider(runtime_root=runtime_root)},
+    )
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.store.create_agent_record(
+        scope_id="scope-a",
+        agent_type="worker",
+        cli_type="codex",
+        home_id="worker",
+        thread_id="placeholder-thread",
+    )
+    assert agent.artifact_locator is None
+
+    snapshot = AgentSnapshotService(
+        runtime_root,
+        store=service.store,
+        agent_service=service,
+    ).create_scope_snapshot("scope-a")
+
+    assert snapshot.status == "created"
+    assert snapshot.snapshot_id is not None
+
+
 def test_scope_snapshot_copies_scope_metadata_and_only_scope_rollouts(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     service = _make_service(runtime_root)

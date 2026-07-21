@@ -18,10 +18,14 @@ The current implementation includes:
   continuation prompts, completion checks, and auto-continue policy;
 - isolated provider homes with configuration, credentials, environment
   requirements, MCP server definitions, and materialized skills;
-- a Codex provider that starts a fresh SDK client per run while preserving the
-  agent thread and Home-backed rollout artifacts across turns;
-- persistent Agent records with start, wait, interrupt, fork, close, stale-run
-  reconciliation, thread reads, and rollout trace inspection;
+- a provider-neutral contract layer with descriptors, capabilities, Home
+  renderers, runtime handles, query/context/artifact adapters, and a registry;
+- a Codex reference provider that implements those contracts while starting a
+  fresh SDK client per run and preserving resumable thread artifacts;
+- versioned Agent records with provider/session/turn/artifact locators plus
+  compatibility aliases for existing Codex runtimes and snapshots;
+- Agent start, wait, interrupt, session-only fork, close, stale-run
+  reconciliation, normalized results, usage, and offline query APIs;
 - provider-neutral context inspection and between-turn compaction, with Codex
   completion evidence, fail-closed recovery, and snapshot-safe maintenance;
 - typed `BaseFlow` and `BaseStep` models with registries, JSON truth, SQLite
@@ -50,11 +54,11 @@ Embedding application
           │
           ▼
 ARKServices
-  ├─ AgentService ── provider Home, thread, completion, trace
+  ├─ AgentService ── Provider Registry, Home, run handles, completion, query
   ├─ FlowService  ── Flow lifecycle and child relationships
   ├─ StepService  ── asynchronous Step execution
   ├─ RuntimeScheduleService ── queues, limits, run control
-  ├─ AgentSnapshotService ── stable snapshot and restore
+  ├─ AgentSnapshotService ── scope/runtime orchestration over Artifact adapters
   └─ RuntimePauseController ── global and scope pause gates
 ```
 
@@ -182,8 +186,10 @@ By default, runtime state lives below the configured runtime root:
 └── reports/               # optional persisted trace reports
 ```
 
-JSON files and provider rollout artifacts are authoritative restorable truth.
-SQLite databases and scheduler queues are rebuildable indexes or caches.
+JSON files and provider-native artifacts identified by each provider's Artifact
+Manifest are authoritative restorable truth. SQLite databases and scheduler
+queues are rebuildable indexes or caches unless a provider explicitly declares
+a database authoritative in its manifest.
 
 ## Boundaries
 
@@ -216,6 +222,9 @@ default regression suite.
 - [`docs/agent-context-compaction.md`](docs/agent-context-compaction.md)
   documents context usage, compaction admission, failure recovery, and the
   optional provider contract.
+- [`docs/provider-adapters.md`](docs/provider-adapters.md) documents the
+  provider-neutral contracts, capability rules, extension points, and Codex
+  compatibility surface.
 
 Maintainer checkouts may also contain a local `dev_docs/` tree with Chinese
 design, implementation, and current-code reference material. It is intentionally

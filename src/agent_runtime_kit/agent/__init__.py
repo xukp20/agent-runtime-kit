@@ -14,6 +14,7 @@ from .instructions import InstructionService, TextFragment
 from .models import (
     Agent,
     AgentCompletionRecord,
+    AgentForkInfo,
     AgentContextCompactionEvidenceError,
     AgentContextCompactionRequestUnknown,
     AgentContextCompactionTimeout,
@@ -45,6 +46,7 @@ __all__ = [
     "Agent",
     "AgentCompletionContext",
     "AgentCompletionRecord",
+    "AgentForkInfo",
     "AgentContextCompactionEvidenceError",
     "AgentContextCompactionResult",
     "AgentContextCompactionRequestUnknown",

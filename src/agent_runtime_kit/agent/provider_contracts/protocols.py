@@ -74,6 +74,12 @@ class ProviderHomeRenderer(Protocol):
 
     def materialize(self, spec: ProviderHomeSpec, home_root: Path) -> HomeMaterializationResult: ...
 
+    def refresh_materialization(
+        self,
+        home: HomeRecordView,
+        home_root: Path,
+    ) -> HomeMaterializationResult: ...
+
     def initialize(
         self,
         home: HomeRecordView,

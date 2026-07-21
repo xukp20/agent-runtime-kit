@@ -430,3 +430,27 @@ def test_codex_execution_context_checks_manifest_and_managed_file_hashes(tmp_pat
     config_path.write_text('model = "tampered"\n', encoding="utf-8")
     with pytest.raises(RuntimeError, match="materialized file hash mismatch"):
         service.build_execution_context("codex", "planner", run_env={"REQUIRED": "yes"})
+
+
+def test_codex_home_can_explicitly_seal_application_post_processing(tmp_path: Path) -> None:
+    service = HomeService(tmp_path / ".agent_runtime")
+    service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            config_overrides={"model": "gpt-before"},
+        )
+    )
+    config_path = service.resolve_home_root("codex", "planner") / ".codex" / "config.toml"
+    config_path.write_text('model = "gpt-after"\n', encoding="utf-8")
+
+    sealed = service.seal_home_materialization("codex", "planner")
+    context = service.build_execution_context("codex", "planner")
+
+    assert sealed.materialization_manifest_hash == context.materialization_manifest.manifest_hash
+    assert sealed.resolved_defaults["requested_model"] == "gpt-after"
+    assert "explicitly refreshed" in sealed.warnings[-1]
+
+    config_path.write_text('model = "tampered-again"\n', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="materialized file hash mismatch"):
+        service.build_execution_context("codex", "planner")

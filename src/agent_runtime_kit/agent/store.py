@@ -154,16 +154,20 @@ class AgentStoreService:
         artifact_locator: AgentArtifactLocator | None = None,
     ) -> Agent:
         agent = self.get_agent(agent_id)
-        resolved_session = session_locator or ProviderSessionLocator(
-            provider_type=agent.provider_type or agent.cli_type,
-            session_id=thread_id,
-            home_id=agent.home_id,
-            created_at=agent.session_locator.created_at if agent.session_locator is not None else utc_now_iso(),
-            backend_identity=(
-                agent.session_locator.backend_identity if agent.session_locator is not None else None
-            ),
-            native_locator={"rollout_relpath": rollout_relpath},
-        )
+        if session_locator is not None:
+            resolved_session = session_locator
+        elif agent.session_locator is not None and agent.session_locator.session_id == thread_id:
+            # A live-start callback may repeat the current session before a new
+            # turn exists. Keep the exact locator referenced by latest_turn.
+            resolved_session = agent.session_locator
+        else:
+            resolved_session = ProviderSessionLocator(
+                provider_type=agent.provider_type or agent.cli_type,
+                session_id=thread_id,
+                home_id=agent.home_id,
+                created_at=utc_now_iso(),
+                native_locator={"rollout_relpath": rollout_relpath},
+            )
         resolved_artifact = artifact_locator
         if resolved_artifact is None and (agent.provider_type or agent.cli_type) == "codex" and rollout_relpath:
             resolved_artifact = AgentArtifactLocator(

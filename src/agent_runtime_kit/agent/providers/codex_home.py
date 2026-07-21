@@ -136,6 +136,42 @@ class CodexHomeRenderer:
             marker_ref=str(marker) if marker.exists() else None,
         )
 
+    def refresh_materialization(
+        self,
+        home: "HomeRecord",
+        home_root: Path,
+    ) -> HomeMaterializationResult:
+        """Explicitly seal application post-processing into the Home manifest."""
+
+        manifest_path = Path(home_root) / ".ark" / "home_materialization.json"
+        payload = read_json(manifest_path)
+        declared_hash = str(payload.get("manifest_hash", ""))
+        if (
+            declared_hash != (home.materialization_manifest_hash or "")
+            or _manifest_hash(payload) != declared_hash
+        ):
+            raise RuntimeError(f"home materialization manifest hash mismatch: {home.home_id}")
+        config_path = Path(home_root) / ".codex" / "config.toml"
+        config_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+        result = HomeMaterializationResult(
+            provider_type=self.provider_type,
+            home_id=home.home_id,
+            renderer_version=str(payload["renderer_version"]),
+            manifest_schema_version=int(payload["manifest_schema_version"]),
+            manifest_hash="",
+            generated_files=_describe_generated_files(Path(home_root)),
+            source_resource_hashes=dict(payload.get("source_resource_hashes") or {}),
+            required_env=tuple(payload.get("required_env") or ()),
+            auth_refs=tuple(payload.get("auth_refs") or ()),
+            resolved_defaults=_resolve_model_defaults(config_text),
+            warnings=tuple(payload.get("warnings") or ())
+            + ("materialization manifest explicitly refreshed after application post-processing",),
+            effective_capabilities=_codex_home_capabilities(home.home_id),
+        )
+        result = replace(result, manifest_hash=_manifest_hash(to_jsonable(result)))
+        write_json_atomic(manifest_path, to_jsonable(result))
+        return result
+
     def build_execution_context(
         self,
         home: "HomeRecord",

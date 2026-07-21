@@ -438,6 +438,40 @@ class HomeService:
         home = self.get_home(provider_type, home_id)
         return renderer.build_execution_context(home, run_env=run_env, workdir=workdir)
 
+    def seal_home_materialization(self, provider_type: str, home_id: str) -> HomeRecord:
+        """Explicitly accept application post-processing and refresh the manifest.
+
+        Applications should call this once after they intentionally modify
+        provider-managed Home files. Later unsealed mutations still fail hash
+        verification when an execution context is built.
+        """
+
+        renderer = self.renderers.get(provider_type)
+        refresh = getattr(renderer, "refresh_materialization", None)
+        if not callable(refresh):
+            raise ValueError(f"provider does not support Home materialization sealing: {provider_type}")
+        home = self.get_home(provider_type, home_id)
+        home_root = self.resolve_home_root(provider_type, home_id)
+        materialization = refresh(home, home_root)
+        if not isinstance(materialization, HomeMaterializationResult):
+            raise TypeError(f"invalid HomeMaterializationResult from provider renderer: {provider_type}")
+        if materialization.provider_type != provider_type or materialization.home_id != home_id:
+            raise ValueError("provider renderer refreshed materialization for a different home")
+        home.materialization_manifest_hash = materialization.manifest_hash
+        home.resolved_defaults = (
+            to_jsonable(materialization.resolved_defaults)
+            if materialization.resolved_defaults is not None
+            else None
+        )
+        home.capability_snapshot = (
+            to_jsonable(materialization.effective_capabilities)
+            if materialization.effective_capabilities is not None
+            else home.capability_snapshot
+        )
+        home.warnings = list(materialization.warnings)
+        home.updated_at = utc_now_iso()
+        return self.store.upsert_home(home)
+
 
 def build_provider_env(
     *,

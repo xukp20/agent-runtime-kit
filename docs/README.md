@@ -44,3 +44,6 @@ current-code reference are the authoritative API guides.
 - [Agent context inspection and compaction](agent-context-compaction.md):
   provider-neutral usage and compaction APIs, first-turn admission,
   fail-closed recovery, snapshot behavior, and the optional provider contract.
+- [Provider adapters and normalized Agent runtime](provider-adapters.md):
+  Provider Registry, capabilities, Home/runtime/query/context/artifact SPI,
+  normalized records and results, and migration compatibility.

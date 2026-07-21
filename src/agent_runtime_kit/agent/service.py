@@ -746,6 +746,9 @@ class AgentService:
         if bundle is not None and bundle.context is not None:
             usage = self.inspect_agent_context_result(agent_id, env=env, workdir=workdir)
             return _legacy_agent_context_usage(usage)
+        # COMPAT(legacy-provider-context-methods): injected providers may expose
+        # inspect_thread_context without a bundle. Remove when they register a
+        # ProviderContextAdapter; covered by fake-provider context tests.
         provider = self.providers.get(agent.cli_type)
         inspect = getattr(provider, "inspect_thread_context", None)
         if not callable(inspect):
@@ -887,6 +890,8 @@ class AgentService:
             agent = self.store.get_agent(agent_id)
             bundle = self._provider_bundle(agent.cli_type)
             context_adapter = bundle.context if bundle is not None else None
+            # COMPAT(legacy-provider-context-reconcile): retain the old method
+            # only for injected providers without a ProviderContextAdapter.
             provider = self.providers.get(agent.cli_type)
             reconcile = getattr(provider, "reconcile_thread_compaction", None)
             if context_adapter is None and not callable(reconcile):
@@ -1009,6 +1014,8 @@ class AgentService:
             return self._skipped_context_compaction(agent, usage_before, now, "no_session")
         bundle = self._provider_bundle(agent.cli_type)
         context_adapter = bundle.context if bundle is not None else None
+        # COMPAT(legacy-provider-context-compact): retain compact_thread only
+        # for injected providers without a ProviderContextAdapter.
         provider = self.providers.get(agent.cli_type)
         compact = getattr(provider, "compact_thread", None)
         if context_adapter is None and not callable(compact):

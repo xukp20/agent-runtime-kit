@@ -709,6 +709,18 @@ class AgentSnapshotService:
         bundle = self._provider_bundle(str(getattr(agent, "cli_type", "")))
         adapter = bundle.artifacts if bundle is not None else None
         if session is not None and adapter is not None:
+            native = session.native_locator if isinstance(session.native_locator, dict) else {}
+            if (
+                getattr(agent, "artifact_locator", None) is None
+                and not native.get("rollout_relpath")
+                and not getattr(agent, "rollout_relpath", None)
+            ):
+                # COMPAT(legacy-placeholder-session): LC and older callers may
+                # create an Agent with a placeholder thread_id before any
+                # provider run. Old snapshots skipped its absent rollout. Keep
+                # that behavior only while no artifact was ever declared; a
+                # declared-but-missing artifact still fails closed below.
+                return None
             stability = adapter.wait_quiescent(
                 ArtifactStabilityRequest(session=session, agent_id=str(agent.agent_id))
             )

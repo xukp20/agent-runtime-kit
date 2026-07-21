@@ -8,6 +8,7 @@ from agent_runtime_kit.agent.context import (
     AgentContextMaintenanceJournalStatus,
 )
 from agent_runtime_kit.agent.models import CompletionDecision, AgentCompletionRecord
+from agent_runtime_kit.agent.provider_contracts import ProviderTurnLocator
 from agent_runtime_kit.agent.store import AgentStoreService
 from agent_runtime_kit.agent.store_utils import encode_scope_id
 
@@ -161,3 +162,24 @@ def test_store_rejects_conflicting_v2_and_legacy_provider_aliases(tmp_path: Path
 
     with pytest.raises(ValueError, match="provider_type and legacy cli_type conflict"):
         store.get_agent(agent.agent_id)
+
+
+def test_store_reuses_exact_session_locator_for_resume_start_callback(tmp_path: Path) -> None:
+    store = AgentStoreService(tmp_path / ".agent_runtime")
+    agent = store.create_agent_record(scope_id="scope", agent_type="worker")
+    first = store.update_thread_locator(
+        agent.agent_id,
+        thread_id="thread-1",
+        rollout_relpath="sessions/thread-1.jsonl",
+    )
+    turn = ProviderTurnLocator(session=first.session_locator, turn_id="turn-1")
+    store.patch_agent(agent.agent_id, latest_turn_locator=turn)
+
+    resumed = store.update_thread_locator(
+        agent.agent_id,
+        thread_id="thread-1",
+        rollout_relpath="sessions/thread-1.jsonl",
+    )
+
+    assert resumed.session_locator == first.session_locator
+    assert resumed.latest_turn_locator == turn
