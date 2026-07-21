@@ -23,6 +23,7 @@ from .models import (
     AgentContextMaintenanceUnsupported,
     AgentContextUsageUnavailable,
     AgentRuntimeKitError,
+    AgentStatusWaitResult,
     CompletionDecision,
     WaitAgentsResult,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "AgentArtifactView",
     "AgentResponseTextView",
     "AgentRuntimeKitError",
+    "AgentStatusWaitResult",
     "AgentTraceReportPolicy",
     "AgentSnapshotService",
     "AgentRolloutInfo",

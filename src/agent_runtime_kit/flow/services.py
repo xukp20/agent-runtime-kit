@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
-from threading import Event, RLock, Thread
+from threading import Condition, Event, RLock, Thread
 from time import monotonic, sleep
 from typing import Any
 
@@ -20,6 +20,7 @@ from .models import (
     FlowStepValidationError,
     StepStatus,
     StepTerminalReceipt,
+    StepTerminalWaitResult,
     utc_now_iso,
 )
 from .registry import FlowTypeRegistry, StepTypeRegistry
@@ -387,13 +388,15 @@ class StepService:
         self.store = store
         self.active_steps: dict[str, ActiveStepRun] = {}
         self.lock = RLock()
+        self._step_condition = Condition(self.lock)
         self.ark.step_service = self
 
     def create_step(self, step: BaseStep, *, enqueue: bool = True) -> str:
-        with self.lock:
+        with self._step_condition:
             self.store.create_step(step)
             if enqueue and self.ark.schedule_service is not None:
                 self.ark.schedule_service.enqueue_step(step.step_id)
+            self._step_condition.notify_all()
             return step.step_id
 
     def can_run_step(self, step_id: str) -> bool:
@@ -436,10 +439,11 @@ class StepService:
             done_event=done_event,
             bypass_pause=bypass_pause,
         )
-        with self.lock:
+        with self._step_condition:
             if step_id in self.active_steps:
                 raise FlowStepValidationError(f"step already active: {step_id}")
             self.active_steps[step_id] = active
+            self._step_condition.notify_all()
 
         worker = Thread(target=self._run_step_body, args=(step_id, active), daemon=True)
         active.worker_ref = worker
@@ -472,10 +476,11 @@ class StepService:
         except Exception as exc:
             active.exception = exc
         finally:
-            with self.lock:
+            with self._step_condition:
                 self.active_steps.pop(step_id, None)
                 if active.done_event is not None:
                     active.done_event.set()
+                self._step_condition.notify_all()
 
     def _run_step_body_with_context(self, step_id: str, step: BaseStep, ctx: StepRunContext) -> None:
         self._mark_step_running(step_id)
@@ -526,6 +531,51 @@ class StepService:
                 sleep(0.01)
         return self.store.get_step(step_id)
 
+    def wait_step_terminal(
+        self,
+        step_id: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> StepTerminalWaitResult:
+        if timeout_s is not None and timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative")
+        deadline = None if timeout_s is None else monotonic() + timeout_s
+        with self._step_condition:
+            while True:
+                step = self.store.get_step(step_id)
+                active = step_id in self.active_steps
+                status_terminal = step.status in {StepStatus.COMPLETED, StepStatus.FAILED}
+                if status_terminal and not active:
+                    return StepTerminalWaitResult(
+                        step=step,
+                        terminal=True,
+                        timed_out=False,
+                        runner_state="settled",
+                    )
+                if step.status is StepStatus.RUNNING and not active:
+                    return StepTerminalWaitResult(
+                        step=step,
+                        terminal=False,
+                        timed_out=False,
+                        runner_state="lost",
+                        warning="persisted running step has no active runner in this process",
+                    )
+
+                remaining = None if deadline is None else deadline - monotonic()
+                if remaining is not None and remaining <= 0:
+                    return StepTerminalWaitResult(
+                        step=step,
+                        terminal=False,
+                        timed_out=True,
+                        runner_state="active" if active else "not_started",
+                        warning=(
+                            "step reached terminal status but terminal handling is still active"
+                            if status_terminal
+                            else None
+                        ),
+                    )
+                self._step_condition.wait(remaining)
+
     def list_running_steps(self, scope_id: str | None = None) -> list[str]:
         active_ids = [
             run.step_id
@@ -551,6 +601,8 @@ class StepService:
             step.started_at = started_at
 
         self.store.update_step_record(step_id, mark)
+        with self._step_condition:
+            self._step_condition.notify_all()
 
     def _receipt_matches(self, receipt: StepTerminalReceipt, step: BaseStep) -> bool:
         return (

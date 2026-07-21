@@ -41,6 +41,9 @@ current-code reference are the authoritative API guides.
 
 ## Feature Guides
 
+- [Runtime observation](runtime-observation.md): observation-only Step terminal
+  and Agent status waits, settled/lost semantics, timeout behavior, and web
+  adapter guidance.
 - [Agent context inspection and compaction](agent-context-compaction.md):
   provider-neutral usage and compaction APIs, first-turn admission,
   fail-closed recovery, snapshot behavior, and the optional provider contract.

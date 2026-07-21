@@ -25,13 +25,16 @@ The current implementation includes:
 - versioned Agent records with provider/session/turn/artifact locators plus
   compatibility aliases for existing Codex runtimes and snapshots;
 - Agent start, wait, interrupt, session-only fork, close, stale-run
-  reconciliation, normalized results, usage, and offline query APIs;
+  reconciliation, lifecycle-status observation, normalized results, usage,
+  and offline query APIs;
 - provider-neutral context inspection and between-turn compaction, with Codex
   completion evidence, fail-closed recovery, and snapshot-safe maintenance;
 - typed `BaseFlow` and `BaseStep` models with registries, JSON truth, SQLite
   indexes, lifecycle contexts, and transactional mutation;
 - asynchronous Step execution and a scheduler that advances Flows separately
   from starting Steps, with concurrency limits and pause gates;
+- observation-only Step terminal waits that distinguish settled terminal,
+  timeout, not-started, active, and persisted-running-without-runner states;
 - numeric bounded runs and semantic run leases for controlled production
   advancement;
 - standard `AgentStep` and `DispatchStep` implementations, including accepted
@@ -218,7 +221,12 @@ default regression suite.
 
 ## Documentation
 
+See [Runtime observation](docs/runtime-observation.md) for Step terminal and
+Agent status wait contracts intended for application monitoring adapters.
+
 - [`docs/README.md`](docs/README.md) is the public documentation entry point.
+- [`docs/runtime-observation.md`](docs/runtime-observation.md) documents
+  observation-only Step terminal and Agent lifecycle waits.
 - [`docs/agent-context-compaction.md`](docs/agent-context-compaction.md)
   documents context usage, compaction admission, failure recovery, and the
   optional provider contract.

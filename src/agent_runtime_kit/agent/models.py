@@ -215,6 +215,14 @@ class Agent:
         self.schema_version = 2
 
 
+@dataclass(frozen=True)
+class AgentStatusWaitResult:
+    agent: Agent
+    changed: bool
+    timed_out: bool
+    observed_at: str
+
+
 @dataclass
 class WaitAgentsResult:
     completed: dict[str, object]

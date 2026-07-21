@@ -38,6 +38,7 @@ from .models import (
     AgentHasNoCompletedTurn,
     AgentIncompleteError,
     AgentPausedError,
+    AgentStatusWaitResult,
     CompletionDecision,
     WaitAgentsResult,
 )
@@ -227,6 +228,7 @@ class AgentService:
             if start_paused:
                 self.pause_controller.pause(None)
         self._lock = threading.RLock()
+        self._status_condition = threading.Condition(self._lock)
         self._active: dict[str, _ActiveAgentRun] = {}
         self._latest_standard_results: dict[str, AgentTurnResult] = {}
         self.trace_report_errors: list[dict[str, str]] = []
@@ -309,11 +311,13 @@ class AgentService:
         return self.store.list_agents(scope_id=scope_id, status=status)
 
     def close_agent(self, agent_id: str) -> Agent:
-        with self._lock:
+        with self._status_condition:
             agent = self.store.get_agent(agent_id)
             if agent.status == "running" or agent_id in self._active:
                 raise AgentAlreadyRunningError(agent_id)
-            return self.store.close_agent(agent_id)
+            closed = self.store.close_agent(agent_id)
+            self._status_condition.notify_all()
+            return closed
 
     def start_agent(
         self,
@@ -329,7 +333,7 @@ class AgentService:
         context_maintenance_policy: AgentContextMaintenancePolicy | None = None,
     ) -> Agent:
         variables = dict(variables or {})
-        with self._lock:
+        with self._status_condition:
             agent = self.store.get_agent(agent_id)
             if agent.status == "closed":
                 raise AgentClosedError(agent_id)
@@ -373,6 +377,7 @@ class AgentService:
             )
             active.worker = worker
             self._active[agent_id] = active
+            self._status_condition.notify_all()
             worker.start()
             return self.store.get_agent(agent_id)
 
@@ -496,7 +501,7 @@ class AgentService:
         except BaseException as exc:
             active.error = exc
         finally:
-            with self._lock:
+            with self._status_condition:
                 try:
                     agent = self.store.get_agent(agent_id)
                     if agent.status != "closed":
@@ -505,6 +510,7 @@ class AgentService:
                     active.handle_ready.set()
                     self._active.pop(agent_id, None)
                     active.done_event.set()
+                    self._status_condition.notify_all()
 
     def _execute_provider_turn(
         self,
@@ -685,6 +691,36 @@ class AgentService:
             if agent.last_completion.status == "checker_failed":
                 raise AgentCompletionCheckError(agent.last_completion.error_message or agent_id)
         return self.read_latest_turn_result(agent_id)
+
+    def wait_agent_status_change(
+        self,
+        agent_id: str,
+        *,
+        after_status: str,
+        timeout_s: float | None = None,
+    ) -> AgentStatusWaitResult:
+        if timeout_s is not None and timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative")
+        deadline = None if timeout_s is None else monotonic() + timeout_s
+        with self._status_condition:
+            while True:
+                agent = self.store.get_agent(agent_id)
+                if agent.status != after_status:
+                    return AgentStatusWaitResult(
+                        agent=agent,
+                        changed=True,
+                        timed_out=False,
+                        observed_at=utc_now_iso(),
+                    )
+                remaining = None if deadline is None else deadline - monotonic()
+                if remaining is not None and remaining <= 0:
+                    return AgentStatusWaitResult(
+                        agent=agent,
+                        changed=False,
+                        timed_out=True,
+                        observed_at=utc_now_iso(),
+                    )
+                self._status_condition.wait(remaining)
 
     def wait_agent_result(
         self,
@@ -970,7 +1006,7 @@ class AgentService:
         require_resolved: bool = True,
         respect_pause: bool = True,
     ) -> _ActiveAgentRun:
-        with self._lock:
+        with self._status_condition:
             agent = self.store.get_agent(agent_id)
             if agent.status == "closed":
                 raise AgentClosedError(agent_id)
@@ -987,10 +1023,11 @@ class AgentService:
                 done_event=threading.Event(),
             )
             self._active[agent_id] = active
+            self._status_condition.notify_all()
             return active
 
     def _finish_synchronous_maintenance(self, active: _ActiveAgentRun) -> None:
-        with self._lock:
+        with self._status_condition:
             try:
                 agent = self.store.get_agent(active.agent_id)
                 if agent.status != "closed":
@@ -998,6 +1035,7 @@ class AgentService:
             finally:
                 self._active.pop(active.agent_id, None)
                 active.done_event.set()
+                self._status_condition.notify_all()
 
     def _compact_agent_context(
         self,
@@ -1345,12 +1383,13 @@ class AgentService:
             raise RuntimeError(f"healthy running agent cannot be repaired: {agent_id}")
         repaired = False
         if not dry_run:
-            with self._lock:
+            with self._status_condition:
                 current = self.store.get_agent(agent_id)
                 if current.status != "running":
                     raise RuntimeError(f"agent status changed before repair: {agent_id}")
                 self.store.patch_agent(agent_id, status="idle")
                 repaired = True
+                self._status_condition.notify_all()
         return RunningAgentRepairResult(
             agent_id=agent_id,
             classification=audit.classification,

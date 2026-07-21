@@ -200,6 +200,18 @@ class BaseStep(StrictModel):
             )
 
 
+StepRunnerState = Literal["active", "not_started", "lost", "settled"]
+
+
+class StepTerminalWaitResult(StrictModel):
+    step: SerializeAsAny[BaseStep]
+    terminal: bool
+    timed_out: bool
+    runner_state: StepRunnerState
+    observed_at: str = Field(default_factory=utc_now_iso)
+    warning: str | None = None
+
+
 class BaseFlow(StrictModel):
     Input: ClassVar[type[BaseFlowInput]] = BaseFlowInput
     Result: ClassVar[type[BaseFlowResult]] = BaseFlowResult

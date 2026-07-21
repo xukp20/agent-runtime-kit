@@ -16,6 +16,7 @@ from agent_runtime_kit.agent.models import (
     AgentContextCompactionRequestUnknown,
     AgentIncompleteError,
     AgentPausedError,
+    AgentStatusWaitResult,
     CompletionDecision,
 )
 from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy, TraceReportPersistence
@@ -344,6 +345,37 @@ def test_wait_agents_uses_one_shared_timeout_budget(tmp_path: Path) -> None:
     assert set(waited.pending) == {agent_a.agent_id, agent_b.agent_id}
     assert elapsed < 0.2
     assert service.wait_agents([agent_a.agent_id, agent_b.agent_id], timeout_s=2).clean
+
+
+def test_wait_agent_status_change_observes_terminal_status_without_result_errors(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, _provider = _make_service(runtime_root, NeverCompleteAgentType(), run_delay_s=0.1)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+
+    idle = service.wait_agent_status_change(agent.agent_id, after_status="idle", timeout_s=0)
+    service.start_agent(agent.agent_id, variables={"item": "incomplete"})
+    terminal = service.wait_agent_status_change(agent.agent_id, after_status="running", timeout_s=2)
+
+    assert isinstance(idle, AgentStatusWaitResult)
+    assert idle.changed is False
+    assert idle.timed_out is True
+    assert idle.agent.status == "idle"
+    assert terminal.changed is True
+    assert terminal.timed_out is False
+    assert terminal.agent.status == "idle"
+
+
+def test_wait_agent_status_change_returns_immediately_for_changed_status(tmp_path: Path) -> None:
+    service, _provider = _make_service(tmp_path / ".agent_runtime", BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+
+    result = service.wait_agent_status_change(agent.agent_id, after_status="running", timeout_s=2)
+
+    assert result.changed is True
+    assert result.timed_out is False
+    assert result.agent.status == "idle"
 
 
 def test_reconcile_stale_running_agents_repairs_only_inactive_scope(tmp_path: Path) -> None:

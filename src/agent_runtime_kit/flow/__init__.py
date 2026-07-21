@@ -26,6 +26,7 @@ from .models import (
     ManualPauseState,
     StepStatus,
     StepTerminalReceipt,
+    StepTerminalWaitResult,
 )
 from .patterns import (
     can_exit_standard_dispatch_wait,
@@ -118,6 +119,7 @@ __all__ = [
     "StepTypeRegistry",
     "StepStatus",
     "StepTerminalReceipt",
+    "StepTerminalWaitResult",
     "StepRunContext",
     "StepService",
     "FlowNotFoundError",
