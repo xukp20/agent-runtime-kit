@@ -41,10 +41,16 @@ from .models import (
     WaitAgentsResult,
 )
 from .provider_contracts import (
+    AgentContextUsage as StandardAgentContextUsage,
     AgentEvent,
     AgentProviderBundle,
     AgentTurnResult,
     Page,
+    ProviderContextCompactionRequest,
+    ProviderContextCompactionResult as StandardProviderContextCompactionResult,
+    ProviderContextQuery,
+    ProviderContextReconcileRequest,
+    ProviderContextUsage as StandardProviderContextUsage,
     ProviderEventQuery,
     ProviderRegistry,
     ProviderRunHandle,
@@ -718,6 +724,10 @@ class AgentService:
         agent = self.store.get_agent(agent_id)
         if not agent.thread_id:
             return self._unavailable_context_usage(agent, "no_session")
+        bundle = self._provider_bundle(agent.cli_type)
+        if bundle is not None and bundle.context is not None:
+            usage = self.inspect_agent_context_result(agent_id, env=env, workdir=workdir)
+            return _legacy_agent_context_usage(usage)
         provider = self.providers.get(agent.cli_type)
         inspect = getattr(provider, "inspect_thread_context", None)
         if not callable(inspect):
@@ -735,6 +745,37 @@ class AgentService:
         )
         if not isinstance(usage, ProviderContextUsage):
             raise TypeError(f"provider returned invalid context usage: {agent.cli_type}")
+        return usage.for_agent(agent_id=agent.agent_id, provider_type=agent.cli_type)
+
+    def inspect_agent_context_result(
+        self,
+        agent_id: str,
+        *,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> StandardAgentContextUsage:
+        """Inspect context through the provider-neutral Context adapter."""
+
+        agent = self.store.get_agent(agent_id)
+        if not agent.thread_id:
+            return _standard_unavailable_context_usage(agent, "no_session")
+        bundle = self._provider_bundle(agent.cli_type)
+        if bundle is None or bundle.context is None:
+            return _standard_unavailable_context_usage(agent, "provider_unsupported")
+        usage = bundle.context.inspect(
+            ProviderContextQuery(
+                session=self._provider_session_locator(agent),
+                agent_id=agent.agent_id,
+                execution_context=self.home_service.build_execution_context(
+                    agent.cli_type,
+                    agent.home_id,
+                    run_env=env,
+                    workdir=workdir,
+                ),
+            )
+        )
+        if not isinstance(usage, StandardProviderContextUsage):
+            raise TypeError(f"provider returned invalid standard context usage: {agent.cli_type}")
         return usage.for_agent(agent_id=agent.agent_id, provider_type=agent.cli_type)
 
     def compact_agent(
@@ -826,25 +867,48 @@ class AgentService:
         )
         try:
             agent = self.store.get_agent(agent_id)
+            bundle = self._provider_bundle(agent.cli_type)
+            context_adapter = bundle.context if bundle is not None else None
             provider = self.providers.get(agent.cli_type)
             reconcile = getattr(provider, "reconcile_thread_compaction", None)
-            if not callable(reconcile):
+            if context_adapter is None and not callable(reconcile):
                 raise AgentContextMaintenanceBlocked(
                     f"provider cannot reconcile context maintenance: {agent.cli_type}"
                 )
-            home = self.home_service.get_home(agent.cli_type, agent.home_id)
-            home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-            provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
-            provider_result = reconcile(
-                home_id=agent.home_id,
-                home_root=home_root,
-                env=provider_env,
-                thread_id=journal.session_id,
-                workdir=workdir,
-                agent_id=agent.agent_id,
-                baseline=journal.baseline,
-                provider_operation_id=journal.provider_operation_id,
-            )
+            if context_adapter is not None:
+                standard_result = context_adapter.reconcile(
+                    ProviderContextReconcileRequest(
+                        session=self._provider_session_locator(agent),
+                        operation_id=journal.provider_operation_id,
+                        baseline=journal.baseline,
+                        agent_id=agent.agent_id,
+                        execution_context=self.home_service.build_execution_context(
+                            agent.cli_type,
+                            agent.home_id,
+                            run_env=env,
+                            workdir=workdir,
+                        ),
+                    )
+                )
+                provider_result = (
+                    _legacy_provider_compaction_result(standard_result)
+                    if standard_result is not None
+                    else None
+                )
+            else:
+                home = self.home_service.get_home(agent.cli_type, agent.home_id)
+                home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+                provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+                provider_result = reconcile(
+                    home_id=agent.home_id,
+                    home_root=home_root,
+                    env=provider_env,
+                    thread_id=journal.session_id,
+                    workdir=workdir,
+                    agent_id=agent.agent_id,
+                    baseline=journal.baseline,
+                    provider_operation_id=journal.provider_operation_id,
+                )
             if provider_result is None:
                 raise AgentContextMaintenanceBlocked(
                     f"provider has not confirmed context maintenance terminal state: {agent_id}"
@@ -925,9 +989,11 @@ class AgentService:
         now = utc_now_iso()
         if not agent.thread_id:
             return self._skipped_context_compaction(agent, usage_before, now, "no_session")
+        bundle = self._provider_bundle(agent.cli_type)
+        context_adapter = bundle.context if bundle is not None else None
         provider = self.providers.get(agent.cli_type)
         compact = getattr(provider, "compact_thread", None)
-        if not callable(compact):
+        if context_adapter is None and not callable(compact):
             if force:
                 raise AgentContextMaintenanceUnsupported(agent.cli_type)
             return self._unsupported_context_compaction(agent, usage_before, now)
@@ -945,9 +1011,19 @@ class AgentService:
             if usage_before.usage_ratio < threshold:
                 return self._skipped_context_compaction(agent, usage_before, now, "below_threshold")
 
-        home = self.home_service.get_home(agent.cli_type, agent.home_id)
-        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-        provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+        if context_adapter is not None:
+            execution_context = self.home_service.build_execution_context(
+                agent.cli_type,
+                agent.home_id,
+                run_env=env,
+                workdir=workdir,
+            )
+            home = home_root = provider_env = None
+        else:
+            home = self.home_service.get_home(agent.cli_type, agent.home_id)
+            home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+            provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+            execution_context = None
         prepared_at = utc_now_iso()
         journal = AgentContextMaintenanceJournal(
             agent_id=agent.agent_id,
@@ -979,16 +1055,29 @@ class AgentService:
             )
 
         try:
-            provider_result = compact(
-                home_id=agent.home_id,
-                home_root=home_root,
-                env=provider_env,
-                thread_id=agent.thread_id,
-                workdir=workdir,
-                agent_id=agent.agent_id,
-                timeout_s=timeout_s,
-                on_compaction_started=on_compaction_started,
-            )
+            if context_adapter is not None:
+                standard_result = context_adapter.compact(
+                    ProviderContextCompactionRequest(
+                        session=self._provider_session_locator(agent),
+                        trigger=trigger,
+                        timeout_s=timeout_s,
+                        agent_id=agent.agent_id,
+                        execution_context=execution_context,
+                        on_started=on_compaction_started,
+                    )
+                )
+                provider_result = _legacy_provider_compaction_result(standard_result)
+            else:
+                provider_result = compact(
+                    home_id=agent.home_id,
+                    home_root=home_root,
+                    env=provider_env,
+                    thread_id=agent.thread_id,
+                    workdir=workdir,
+                    agent_id=agent.agent_id,
+                    timeout_s=timeout_s,
+                    on_compaction_started=on_compaction_started,
+                )
         except BaseException as exc:
             if request_started or isinstance(exc, AgentContextCompactionRequestUnknown):
                 started_journal = self.store.read_context_maintenance(agent_id)
@@ -1479,7 +1568,12 @@ class AgentService:
         bundle = self._provider_bundle(agent.cli_type)
         if bundle is None or bundle.query is None:
             raise RuntimeError(f"provider does not support standard query: {agent.cli_type}")
-        return bundle, ProviderSessionLocator(
+        return bundle, self._provider_session_locator(agent)
+
+    def _provider_session_locator(self, agent: Agent) -> ProviderSessionLocator:
+        if not agent.thread_id:
+            raise AgentHasNoCompletedTurn(agent.agent_id)
+        return ProviderSessionLocator(
             provider_type=agent.cli_type,
             session_id=agent.thread_id,
             home_id=agent.home_id,
@@ -1754,3 +1848,66 @@ def _render_continue_prompt(
     if rendered is None:
         raise ValueError(f"AgentType {agent_type.agent_type} has no continue prompt template")
     return rendered
+
+
+def _standard_unavailable_context_usage(agent: Agent, reason: str) -> StandardAgentContextUsage:
+    return StandardAgentContextUsage(
+        agent_id=agent.agent_id,
+        provider_type=agent.cli_type,
+        session_id=agent.thread_id,
+        observed_at=utc_now_iso(),
+        source="unavailable",
+        available=False,
+        measurement="unavailable",
+        reason=reason,
+    )
+
+
+def _legacy_agent_context_usage(usage: StandardAgentContextUsage) -> AgentContextUsage:
+    window = usage.context_window
+    available = usage.available and usage.used_tokens is not None and window is not None
+    return AgentContextUsage(
+        agent_id=usage.agent_id,
+        provider_type=usage.provider_type,
+        session_id=usage.session_id,
+        total_tokens=usage.used_tokens,
+        context_window=window,
+        observed_at=usage.observed_at,
+        source=usage.source,
+        available=available,
+        reason=usage.reason if available else usage.reason or "context_window_unavailable",
+    )
+
+
+def _legacy_provider_context_usage(
+    usage: StandardProviderContextUsage,
+) -> ProviderContextUsage:
+    window = usage.context_window
+    available = usage.available and usage.used_tokens is not None and window is not None
+    return ProviderContextUsage(
+        session_id=usage.session_id,
+        total_tokens=usage.used_tokens,
+        context_window=window,
+        observed_at=usage.observed_at,
+        source=usage.source,
+        available=available,
+        reason=usage.reason if available else usage.reason or "context_window_unavailable",
+    )
+
+
+def _legacy_provider_compaction_result(
+    result: StandardProviderContextCompactionResult,
+) -> ProviderContextCompactionResult:
+    if not isinstance(result, StandardProviderContextCompactionResult):
+        raise TypeError("provider returned invalid standard compaction result")
+    return ProviderContextCompactionResult(
+        session_id=result.session_id,
+        usage_after=(
+            _legacy_provider_context_usage(result.usage_after)
+            if result.usage_after is not None
+            else None
+        ),
+        started_at=result.started_at,
+        completed_at=result.completed_at,
+        provider_operation_id=result.provider_operation_id,
+    )

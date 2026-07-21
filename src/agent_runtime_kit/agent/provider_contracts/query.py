@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable
 
+from .homes import ProviderExecutionContext
 from .locators import ProviderSessionLocator, ProviderTurnLocator
 from .models import AgentEvent, AgentToolCall, ProviderTurnResult
 from .usage import AgentSessionUsage, AgentTurnUsage
@@ -64,6 +66,12 @@ class ProviderUsageQuery(ProviderTurnQuery):
 @dataclass(frozen=True)
 class ProviderContextQuery:
     session: ProviderSessionLocator
+    agent_id: str | None = None
+    execution_context: ProviderExecutionContext | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,17 @@ class ProviderContextCompactionRequest:
     trigger: str
     timeout_s: float | None = None
     provider_options: object | None = None
+    agent_id: str | None = None
+    execution_context: ProviderExecutionContext | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    on_started: Callable[[dict[str, object], str | None], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -79,3 +98,9 @@ class ProviderContextReconcileRequest:
     session: ProviderSessionLocator
     operation_id: str | None = None
     baseline: object | None = None
+    agent_id: str | None = None
+    execution_context: ProviderExecutionContext | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )

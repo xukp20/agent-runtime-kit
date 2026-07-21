@@ -245,6 +245,32 @@ class ProviderContextUsage:
             return None
         return self.used_tokens / window
 
+    def for_agent(self, *, agent_id: str, provider_type: str) -> "AgentContextUsage":
+        return AgentContextUsage(
+            session_id=self.session_id,
+            observed_at=self.observed_at,
+            source=self.source,
+            available=self.available,
+            used_tokens=self.used_tokens,
+            context_window_tokens=self.context_window_tokens,
+            effective_context_window_tokens=self.effective_context_window_tokens,
+            max_output_tokens=self.max_output_tokens,
+            reserved_output_tokens=self.reserved_output_tokens,
+            remaining_tokens=self.remaining_tokens,
+            categories=self.categories,
+            auto_compact_enabled=self.auto_compact_enabled,
+            auto_compact_threshold_tokens=self.auto_compact_threshold_tokens,
+            compact_capability=self.compact_capability,
+            measurement=self.measurement,
+            as_of_turn_id=self.as_of_turn_id,
+            stale=self.stale,
+            reason=self.reason,
+            model_identity=self.model_identity,
+            provider_payload=self.provider_payload,
+            agent_id=agent_id,
+            provider_type=provider_type,
+        )
+
 
 @dataclass(frozen=True)
 class AgentContextUsage(ProviderContextUsage):
