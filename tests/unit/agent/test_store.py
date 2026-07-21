@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from agent_runtime_kit.agent.context import (
     AgentContextMaintenanceJournal,
@@ -92,3 +95,69 @@ def test_store_reads_rollout_jsonl_events(tmp_path: Path) -> None:
 
     assert store.locate_rollout(agent.agent_id) == rollout
     assert store.read_rollout_events(agent.agent_id) == [{"type": "turn", "id": "turn-1"}]
+
+
+def test_store_dual_writes_agent_record_v2_and_legacy_codex_locators(tmp_path: Path) -> None:
+    store = AgentStoreService(tmp_path / ".agent_runtime")
+    agent = store.create_agent_record(
+        scope_id="scope",
+        agent_type="worker",
+        cli_type="codex",
+        home_id="worker",
+        thread_id="thread-1",
+        rollout_relpath="sessions/thread-1.jsonl",
+    )
+
+    payload = json.loads(store.resolve_agent_path(agent.agent_id).read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 2
+    assert payload["provider_type"] == "codex"
+    assert payload["session_locator"]["session_id"] == "thread-1"
+    assert payload["artifact_locator"]["native_primary_ref"] == "sessions/thread-1.jsonl"
+    assert payload["cli_type"] == "codex"
+    assert payload["thread_id"] == "thread-1"
+    assert payload["rollout_relpath"] == "sessions/thread-1.jsonl"
+
+
+def test_store_reads_legacy_agent_record_without_rewriting_it(tmp_path: Path) -> None:
+    store = AgentStoreService(tmp_path / ".agent_runtime")
+    agent = store.create_agent_record(scope_id="scope", agent_type="worker")
+    path = store.resolve_agent_path(agent.agent_id)
+    legacy = {
+        "schema_version": 1,
+        "object_type": "agent",
+        "agent_id": agent.agent_id,
+        "scope_id": "scope",
+        "agent_type": "worker",
+        "cli_type": "codex",
+        "home_id": "worker",
+        "thread_id": "legacy-thread",
+        "rollout_relpath": "sessions/legacy.jsonl",
+        "status": "idle",
+        "created_at": "2026-07-20T00:00:00Z",
+        "updated_at": "2026-07-20T00:00:00Z",
+    }
+    original = json.dumps(legacy, sort_keys=True) + "\n"
+    path.write_text(original, encoding="utf-8")
+
+    restored = store.get_agent(agent.agent_id)
+
+    assert restored.schema_version == 2
+    assert restored.provider_type == "codex"
+    assert restored.session_locator is not None
+    assert restored.session_locator.session_id == "legacy-thread"
+    assert restored.artifact_locator is not None
+    assert restored.artifact_locator.native_primary_ref == "sessions/legacy.jsonl"
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_store_rejects_conflicting_v2_and_legacy_provider_aliases(tmp_path: Path) -> None:
+    store = AgentStoreService(tmp_path / ".agent_runtime")
+    agent = store.create_agent_record(scope_id="scope", agent_type="worker")
+    path = store.resolve_agent_path(agent.agent_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["provider_type"] = "claude-code"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="provider_type and legacy cli_type conflict"):
+        store.get_agent(agent.agent_id)

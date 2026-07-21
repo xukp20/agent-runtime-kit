@@ -237,7 +237,43 @@ class CodexRuntimeAdapter:
         return handle
 
     def fork(self, request: ProviderForkRequest) -> ProviderForkResult:
-        raise NotImplementedError("Codex provider-neutral fork is wired in PF-09")
+        ctx = request.execution_context
+        if ctx is None or ctx.provider_type != "codex":
+            raise ValueError("Codex fork requires a Codex ProviderExecutionContext")
+        native = self.provider.fork_thread(
+            home_id=ctx.home_id,
+            home_root=ctx.home_root,
+            env=ctx.process_environment,
+            thread_id=request.source_session.session_id,
+            agent_id=request.target_agent_id,
+        )
+        target_session = ProviderSessionLocator(
+            provider_type="codex",
+            session_id=native.thread_id,
+            home_id=request.target_home_id,
+            created_at=utc_now_iso(),
+            backend_identity=request.source_session.backend_identity,
+            native_locator={"rollout_relpath": native.rollout_relpath},
+        )
+        artifact_locator = None
+        if native.rollout_relpath:
+            artifact_locator = AgentArtifactLocator(
+                provider_type="codex",
+                home_id=request.target_home_id,
+                session_id=native.thread_id,
+                adapter_version="1",
+                native_primary_ref=native.rollout_relpath,
+            )
+        return ProviderForkResult(
+            source_session=request.source_session,
+            target_session=target_session,
+            status="created",
+            source_turn=request.source_turn,
+            fork_mode="session_only",
+            workspace_isolated=False,
+            artifact_locator=artifact_locator,
+            limitations=("workspace files are not isolated or rolled back",),
+        )
 
     def control(self, request: ProviderControlRequest) -> ProviderControlResult:
         if request.run_id is None:

@@ -414,6 +414,7 @@ class ProviderForkRequest:
     fork_mode: str = "session_only"
     source_workspace_revision: str | None = None
     provider_options: object | None = None
+    execution_context: ProviderExecutionContext | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.fork_mode != "session_only":

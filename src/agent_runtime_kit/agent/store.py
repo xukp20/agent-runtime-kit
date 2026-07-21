@@ -10,10 +10,12 @@ from typing import Any
 from .models import (
     Agent,
     AgentCompletionRecord,
+    AgentForkInfo,
     AgentHasNoCompletedTurn,
     agent_from_dict,
     to_jsonable,
 )
+from .provider_contracts import AgentArtifactLocator, ProviderSessionLocator, ProviderTurnLocator
 from .context import AgentContextMaintenanceJournal
 from .store_utils import encode_scope_id, read_json, utc_now_iso, write_json_atomic
 from .trace import (
@@ -50,14 +52,25 @@ class AgentStoreService:
         rollout_relpath: str | None = None,
         fork_source_agent_id: str | None = None,
         fork_source_thread_id: str | None = None,
+        agent_id: str | None = None,
+        provider_type: str | None = None,
+        session_locator: ProviderSessionLocator | None = None,
+        latest_turn_locator: ProviderTurnLocator | None = None,
+        artifact_locator: AgentArtifactLocator | None = None,
+        fork_info: AgentForkInfo | None = None,
     ) -> Agent:
         now = utc_now_iso()
         agent = Agent(
-            agent_id=f"a_{uuid.uuid4().hex}",
+            agent_id=agent_id or f"a_{uuid.uuid4().hex}",
             scope_id=scope_id,
             agent_type=agent_type,
             cli_type=cli_type,
             home_id=home_id or agent_type,
+            provider_type=provider_type or cli_type,
+            session_locator=session_locator,
+            latest_turn_locator=latest_turn_locator,
+            artifact_locator=artifact_locator,
+            fork_info=fork_info,
             thread_id=thread_id,
             rollout_relpath=rollout_relpath,
             status="idle",
@@ -136,8 +149,38 @@ class AgentStoreService:
         *,
         thread_id: str,
         rollout_relpath: str | None,
+        session_locator: ProviderSessionLocator | None = None,
+        latest_turn_locator: ProviderTurnLocator | None = None,
+        artifact_locator: AgentArtifactLocator | None = None,
     ) -> Agent:
-        return self.patch_agent(agent_id, thread_id=thread_id, rollout_relpath=rollout_relpath)
+        agent = self.get_agent(agent_id)
+        resolved_session = session_locator or ProviderSessionLocator(
+            provider_type=agent.provider_type or agent.cli_type,
+            session_id=thread_id,
+            home_id=agent.home_id,
+            created_at=agent.session_locator.created_at if agent.session_locator is not None else utc_now_iso(),
+            backend_identity=(
+                agent.session_locator.backend_identity if agent.session_locator is not None else None
+            ),
+            native_locator={"rollout_relpath": rollout_relpath},
+        )
+        resolved_artifact = artifact_locator
+        if resolved_artifact is None and (agent.provider_type or agent.cli_type) == "codex" and rollout_relpath:
+            resolved_artifact = AgentArtifactLocator(
+                provider_type="codex",
+                home_id=agent.home_id,
+                session_id=thread_id,
+                adapter_version="codex-artifact-v1",
+                native_primary_ref=rollout_relpath,
+            )
+        return self.patch_agent(
+            agent_id,
+            thread_id=thread_id,
+            rollout_relpath=rollout_relpath,
+            session_locator=resolved_session,
+            latest_turn_locator=latest_turn_locator or agent.latest_turn_locator,
+            artifact_locator=resolved_artifact or agent.artifact_locator,
+        )
 
     def update_completion(self, agent_id: str, record: AgentCompletionRecord | None) -> Agent:
         return self.patch_agent(agent_id, last_completion=record)
@@ -449,11 +492,12 @@ class AgentStoreService:
         self._ensure_scope_schema(scope_key)
 
     def _write_agent(self, agent: Agent) -> None:
+        agent.normalize_compat_fields()
         path = self._agent_json_path(agent)
         write_json_atomic(
             path,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "object_type": "agent",
                 **to_jsonable(agent),
             },

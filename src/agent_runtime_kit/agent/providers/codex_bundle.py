@@ -58,6 +58,7 @@ def build_codex_provider_bundle(
         CapabilityKey.RUN_STREAM,
         CapabilityKey.RUN_WAIT_TERMINAL,
         CapabilityKey.RUN_INTERRUPT,
+        CapabilityKey.CONTROL_FORK,
         CapabilityKey.QUERY_TURNS,
         CapabilityKey.QUERY_EVENTS,
         CapabilityKey.QUERY_CONTENT,

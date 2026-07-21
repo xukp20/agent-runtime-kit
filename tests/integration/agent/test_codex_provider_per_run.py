@@ -333,6 +333,13 @@ def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
     assert standard_result.turn_locator.turn_id == "turn-Start state."
     assert standard_result.completion is not None
     assert standard_result.completion.status == "complete"
+    persisted = service.get_agent(agent.agent_id)
+    assert persisted.schema_version == 2
+    assert persisted.provider_type == "codex"
+    assert persisted.session_locator == standard_result.session_locator
+    assert persisted.latest_turn_locator == standard_result.turn_locator
+    assert persisted.artifact_locator == standard_result.provider_result.artifact_locator
+    assert persisted.thread_id == standard_result.session_locator.session_id
     assert service.provider_registry.get("codex").provider_type == "codex"
     assert provider.list_active_agents("live-locator") == []
 

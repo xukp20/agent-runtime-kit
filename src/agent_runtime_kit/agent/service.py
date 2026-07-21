@@ -31,6 +31,7 @@ from .models import (
     AgentClosedError,
     AgentCompletionCheckError,
     AgentCompletionRecord,
+    AgentForkInfo,
     AgentContextCompactionRequestUnknown,
     AgentContextMaintenanceBlocked,
     AgentContextMaintenanceUnsupported,
@@ -52,6 +53,7 @@ from .provider_contracts import (
     ProviderContextReconcileRequest,
     ProviderContextUsage as StandardProviderContextUsage,
     ProviderEventQuery,
+    ProviderForkRequest,
     ProviderRegistry,
     ProviderRunHandle,
     ProviderRunRequest,
@@ -417,6 +419,17 @@ class AgentService:
                     agent_id,
                     thread_id=thread_id,
                     rollout_relpath=rollout_relpath,
+                    session_locator=(
+                        standard_result.session_locator if standard_result is not None else None
+                    ),
+                    latest_turn_locator=(
+                        standard_result.turn_locator if standard_result is not None else None
+                    ),
+                    artifact_locator=(
+                        standard_result.provider_result.artifact_locator
+                        if standard_result is not None
+                        else None
+                    ),
                 )
                 agent = self.store.get_agent(agent_id)
                 ctx = AgentCompletionContext(
@@ -1423,6 +1436,59 @@ class AgentService:
             target_scope = target_scope_id or source.scope_id
             self._assert_agent_can_start(source.scope_id)
             self._assert_agent_can_start(target_scope)
+        bundle = self._provider_bundle(source.cli_type)
+        if bundle is not None:
+            target_agent_id = f"a_{uuid.uuid4().hex}"
+            source_session = source.session_locator or self._provider_session_locator(source)
+            forked_standard = bundle.runtime.fork(
+                ProviderForkRequest(
+                    source_agent_id=source.agent_id,
+                    source_session=source_session,
+                    source_turn=source.latest_turn_locator,
+                    target_agent_id=target_agent_id,
+                    target_scope_id=target_scope,
+                    target_home_id=source.home_id,
+                    execution_context=self.home_service.build_execution_context(
+                        source.cli_type,
+                        source.home_id,
+                    ),
+                )
+            )
+            rollout_relpath = (
+                forked_standard.artifact_locator.native_primary_ref
+                if forked_standard.artifact_locator is not None
+                else _native_rollout_relpath(forked_standard.target_session.native_locator)
+            )
+            return self.store.create_agent_record(
+                agent_id=target_agent_id,
+                scope_id=target_scope,
+                agent_type=source.agent_type,
+                cli_type=source.cli_type,
+                provider_type=source.provider_type,
+                home_id=source.home_id,
+                session_locator=forked_standard.target_session,
+                artifact_locator=forked_standard.artifact_locator,
+                thread_id=forked_standard.target_session.session_id,
+                rollout_relpath=rollout_relpath,
+                fork_info=AgentForkInfo(
+                    source_agent_id=source.agent_id,
+                    source_session_id=source_session.session_id,
+                    source_turn_id=(
+                        forked_standard.source_turn.turn_id
+                        if forked_standard.source_turn is not None
+                        else None
+                    ),
+                    fork_mode=forked_standard.fork_mode,
+                    workspace_isolated=forked_standard.workspace_isolated,
+                    created_at=utc_now_iso(),
+                ),
+                fork_source_agent_id=source.agent_id,
+                fork_source_thread_id=source.thread_id,
+            )
+
+        # COMPAT(legacy-provider-fork): injected providers without a bundle use
+        # fork_thread and the legacy locator fields. Remove when LC fakes and
+        # external takeover providers implement ProviderRuntimeAdapter.fork().
         home = self.home_service.get_home(source.cli_type, source.home_id)
         home_root = self.home_service.resolve_home_root(source.cli_type, source.home_id)
         provider_env = build_provider_env(home=home, home_root=home_root)
@@ -1793,6 +1859,13 @@ def _standard_or_legacy_turn_id(
     if standard_result is not None and standard_result.turn_locator is not None:
         return standard_result.turn_locator.turn_id
     return _turn_id(legacy_result)
+
+
+def _native_rollout_relpath(native_locator: object | None) -> str | None:
+    if not isinstance(native_locator, dict):
+        return None
+    value = native_locator.get("rollout_relpath")
+    return str(value) if value is not None else None
 
 
 def _build_provider_bundle(

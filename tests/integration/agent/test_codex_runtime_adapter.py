@@ -7,11 +7,13 @@ from types import SimpleNamespace
 
 from agent_runtime_kit.agent.provider_contracts import (
     ProviderExecutionContext,
+    ProviderForkRequest,
     ProviderRunRequest,
     ProviderRunState,
+    ProviderSessionLocator,
     TokenUsage,
 )
-from agent_runtime_kit.agent.providers.codex import CodexTurnResult
+from agent_runtime_kit.agent.providers.codex import CodexForkResult, CodexTurnResult
 from agent_runtime_kit.agent.providers.codex_runtime import CodexRuntimeAdapter
 
 
@@ -96,6 +98,14 @@ class _CodexProviderStub:
         self.release.set()
         return self.block
 
+    def fork_thread(self, **kwargs):  # noqa: ANN003, ANN201
+        assert kwargs["thread_id"] == "thread-1"
+        assert kwargs["agent_id"] == "a2"
+        return CodexForkResult(
+            thread_id="thread-2",
+            rollout_relpath="sessions/forked.jsonl",
+        )
+
     def close(self) -> None:
         return None
 
@@ -162,3 +172,31 @@ def test_codex_runtime_handle_interrupt_confirms_terminal(tmp_path: Path) -> Non
     assert control.terminal_confirmed is True
     assert handle.wait_terminal(timeout_s=1).status is ProviderRunState.COMPLETED
     assert provider.interrupt_calls == ["a1"]
+
+
+def test_codex_runtime_fork_is_session_only_and_returns_artifact_locator(tmp_path: Path) -> None:
+    provider = _CodexProviderStub()
+    context = _request(tmp_path).execution_context
+    source = ProviderSessionLocator(
+        provider_type="codex",
+        session_id="thread-1",
+        home_id="worker",
+        created_at="2026-07-21T00:00:00Z",
+    )
+
+    result = CodexRuntimeAdapter(provider).fork(  # type: ignore[arg-type]
+        ProviderForkRequest(
+            source_agent_id="a1",
+            source_session=source,
+            target_agent_id="a2",
+            target_scope_id="scope",
+            target_home_id="worker",
+            execution_context=context,
+        )
+    )
+
+    assert result.target_session.session_id == "thread-2"
+    assert result.fork_mode == "session_only"
+    assert result.workspace_isolated is False
+    assert result.artifact_locator is not None
+    assert result.artifact_locator.native_primary_ref == "sessions/forked.jsonl"
