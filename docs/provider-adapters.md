@@ -54,6 +54,13 @@ An `AgentProviderBundle` groups one descriptor with these extension points:
 - `capability_resolver`: optionally resolves support from the effective Home,
   backend/API mode, and model instead of relying on static provider support.
 
+Home initialization is fail-closed around the materialization manifest. ARK
+validates the existing manifest before invoking a provider initializer. If the
+initializer reports `materialization_changed`, ARK explicitly reseals the Home
+before constructing the run execution context. This permits declared,
+one-time provider initialization changes while later unsealed changes to
+provider-managed files still fail hash validation.
+
 Adapters convert native SDK or subprocess values at their boundary. Raw native
 data may be retained in a bounded, secret-sanitized `ProviderPayload`, but it
 is not the primary application contract.

@@ -121,6 +121,8 @@ class CodexHomeRenderer:
             initialize = getattr(self.provider, "ensure_home_initialized", None)
             if not callable(initialize):
                 raise TypeError("Codex Home renderer provider lacks ensure_home_initialized")
+            marker = ctx.home_root / ".ark" / "codex_home_initialized.json"
+            was_initialized = marker.exists()
             record = initialize(
                 home_id=home.home_id,
                 home_root=ctx.home_root,
@@ -130,6 +132,7 @@ class CodexHomeRenderer:
             return HomeInitializationResult(
                 initialized=True,
                 marker_ref=str(getattr(record, "marker_path", "")) or None,
+                materialization_changed=not was_initialized,
             )
         marker = ctx.home_root / ".ark" / "codex_home_initialized.json"
         return HomeInitializationResult(

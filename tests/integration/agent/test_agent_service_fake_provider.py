@@ -1,5 +1,6 @@
 from pathlib import Path
 from time import monotonic
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ from agent_runtime_kit.agent.models import (
     CompletionDecision,
 )
 from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy, TraceReportPersistence
+from agent_runtime_kit.agent.providers.codex import CodexProvider
 from agent_runtime_kit.agent.provider_contracts import ProviderRegistry
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 
@@ -244,6 +246,73 @@ def test_agent_service_create_home_can_initialize_provider_home(tmp_path: Path) 
     assert env["ARK_BOOT_TOKEN"] == "boot"
     assert env["HOME"] == str(runtime_root / "homes" / "codex" / "worker")
     assert env["CODEX_HOME"] == str(runtime_root / "homes" / "codex" / "worker" / ".codex")
+
+
+def test_provider_home_initialization_reseals_trusted_managed_file_changes(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    provider = CodexProvider(runtime_root=runtime_root)
+    registry = AgentTypeRegistry()
+    registry.register(BasicAgentType())
+    service = AgentService(runtime_root, agent_types=registry, providers={"codex": provider})
+    home = service.home_service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="worker",
+            config_overrides={"model": "gpt-before-initialization"},
+        )
+    )
+    config_path = service.home_service.resolve_home_root("codex", "worker") / ".codex" / "config.toml"
+    initial_manifest_hash = home.materialization_manifest_hash
+    fake_provider = FakeProvider(runtime_root)
+
+    def initialize_home(**kwargs):  # noqa: ANN003, ANN202
+        marker_path = Path(kwargs["home_root"]) / ".ark" / "codex_home_initialized.json"
+        if marker_path.exists():
+            return SimpleNamespace(marker_path=marker_path)
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8") + "\n# provider initialization mutation\n",
+            encoding="utf-8",
+        )
+        marker_path.write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(marker_path=marker_path)
+
+    def start_thread(**kwargs):  # noqa: ANN003, ANN202
+        initialize_home(**{key: kwargs[key] for key in ("home_id", "home_root", "env", "workdir")})
+        on_thread_started = kwargs.pop("on_thread_started")
+        on_turn_started = kwargs.pop("on_turn_started")
+        result = fake_provider.start_thread(**kwargs)
+        on_thread_started(result.thread_id)
+        on_turn_started(result.thread_id, result.turn_result.id)
+        return result
+
+    def resume_thread(**kwargs):  # noqa: ANN003, ANN202
+        initialize_home(**{key: kwargs[key] for key in ("home_id", "home_root", "env", "workdir")})
+        on_turn_started = kwargs.pop("on_turn_started")
+        result = fake_provider.resume_thread(**kwargs)
+        on_turn_started(result.thread_id, result.turn_result.id)
+        return result
+
+    provider.ensure_home_initialized = initialize_home  # type: ignore[method-assign]
+    provider.start_thread = start_thread  # type: ignore[method-assign]
+    provider.resume_thread = resume_thread  # type: ignore[method-assign]
+
+    agent = service.create_agent("repo:demo", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "second"}).agent_id)
+
+    context = service.home_service.build_execution_context("codex", "worker")
+    refreshed = service.home_service.get_home("codex", "worker")
+
+    assert refreshed.materialization_manifest_hash != initial_manifest_hash
+    assert context.materialization_manifest is not None
+    assert context.materialization_manifest.manifest_hash == refreshed.materialization_manifest_hash
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "# unsealed tampering\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="materialized file hash mismatch"):
+        service.home_service.build_execution_context("codex", "worker")
 
 
 def test_agent_service_prompt_direct_text_still_beats_start_template_override(tmp_path: Path) -> None:

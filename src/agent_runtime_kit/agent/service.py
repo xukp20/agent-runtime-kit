@@ -293,7 +293,10 @@ class AgentService:
                 run_env=env,
                 workdir=workdir,
             )
-            return bundle.home_renderer.initialize(home, context)
+            result = bundle.home_renderer.initialize(home, context)
+            if result.materialization_changed:
+                self.home_service.seal_home_materialization(cli_type, home_id)
+            return result
         provider = self.providers.get(cli_type)
         if provider is None:
             raise RuntimeError(f"no provider registered for {cli_type}")
@@ -536,6 +539,13 @@ class AgentService:
                 prompt=prompt,
                 developer_instructions=developer_instructions,
                 overwrite_developer_instructions=overwrite_developer_instructions,
+                env=env,
+                workdir=workdir,
+            )
+        if agent.cli_type == "codex":
+            self.ensure_provider_home_initialized(
+                agent.cli_type,
+                agent.home_id,
                 env=env,
                 workdir=workdir,
             )
