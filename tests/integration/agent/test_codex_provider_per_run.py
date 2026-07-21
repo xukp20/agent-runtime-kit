@@ -345,6 +345,63 @@ def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
     assert provider.list_active_agents("live-locator") == []
 
 
+def test_agent_service_reseals_provider_declared_home_initialization_changes(
+    tmp_path: Path,
+) -> None:
+    _reset_fake_codex()
+    runtime_root = tmp_path / "runtime"
+    provider = _provider()
+    registry = AgentTypeRegistry()
+    registry.register(LiveLocatorAgentType())
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        provider_registry=ProviderRegistry(
+            (build_codex_provider_bundle(provider, runtime_root=runtime_root),)
+        ),
+    )
+    home = service.home_service.create_home(
+        ProviderHomeSpec(
+            provider_type="codex",
+            home_id="live-locator",
+            config_overrides={"model": "gpt-before-initialization"},
+        )
+    )
+    home_root = service.home_service.resolve_home_root("codex", "live-locator")
+    config_path = home_root / ".codex" / "config.toml"
+    initial_manifest_hash = home.materialization_manifest_hash
+    initialize_home = provider.ensure_home_initialized
+
+    def initialize_with_managed_change(**kwargs):  # noqa: ANN003, ANN202
+        marker_path = Path(kwargs["home_root"]) / ".ark" / "codex_home_initialized.json"
+        if not marker_path.exists():
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8")
+                + "\n# provider initialization mutation\n",
+                encoding="utf-8",
+            )
+        return initialize_home(**kwargs)
+
+    provider.ensure_home_initialized = initialize_with_managed_change  # type: ignore[method-assign]
+    agent = service.create_agent("scope", "live-locator")
+
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "second"}).agent_id)
+
+    context = service.home_service.build_execution_context("codex", "live-locator")
+    refreshed = service.home_service.get_home("codex", "live-locator")
+    assert refreshed.materialization_manifest_hash != initial_manifest_hash
+    assert context.materialization_manifest is not None
+    assert context.materialization_manifest.manifest_hash == refreshed.materialization_manifest_hash
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "# unsealed tampering\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="materialized file hash mismatch"):
+        service.home_service.build_execution_context("codex", "live-locator")
+
+
 def test_agent_service_interrupt_waits_until_codex_turn_is_terminal(tmp_path: Path) -> None:
     _reset_fake_codex()
     started = threading.Event()

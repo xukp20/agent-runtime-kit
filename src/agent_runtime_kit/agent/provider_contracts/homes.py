@@ -82,6 +82,7 @@ class HomeInitializationResult:
     marker_ref: str | None = None
     warnings: tuple[str, ...] = ()
     provider_payload: ProviderPayload | None = None
+    materialization_changed: bool = False
 
 
 @dataclass(frozen=True)

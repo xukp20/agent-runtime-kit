@@ -283,7 +283,10 @@ class AgentService:
             run_env=env,
             workdir=workdir,
         )
-        return bundle.home_renderer.initialize(home, context)
+        result = bundle.home_renderer.initialize(home, context)
+        if result.materialization_changed:
+            self.home_service.seal_home_materialization(provider_type, home_id)
+        return result
 
     def get_agent(self, agent_id: str) -> Agent:
         return self.store.get_agent(agent_id)
@@ -490,6 +493,12 @@ class AgentService:
         workdir: str | None,
     ) -> AgentTurnResult:
         bundle = self._provider_bundle(agent.provider_type)
+        self.ensure_provider_home_initialized(
+            agent.provider_type,
+            agent.home_id,
+            env=env,
+            workdir=workdir,
+        )
         execution_context = self.home_service.build_execution_context(
             agent.provider_type,
             agent.home_id,
