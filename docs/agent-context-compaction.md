@@ -1,9 +1,9 @@
 # Agent Context Inspection and Compaction
 
 ARK exposes provider-neutral context inspection and between-turn compaction
-through `AgentService`. The first provider implementation is Codex; other
-providers can implement the same optional capability without exposing their
-native event or storage formats to applications.
+through `AgentService`. Codex and Claude Code implement this optional
+capability without exposing their native event or storage formats to
+applications.
 
 ## Public API
 
@@ -47,7 +47,11 @@ AgentStep retry turns do not compact again.
 
 Compaction request acceptance is not treated as completion. The Codex adapter
 requires new rollout evidence after a captured baseline and verifies that the
-thread is idle before returning success.
+thread is idle before returning success. The Claude Code adapter requires a
+terminal SDK `ResultMessage` plus a new persisted `compact_boundary`. A
+successful Claude slash command that does not create a boundary—for example,
+when the context is too small to compact—is not reported as completed
+compaction.
 
 ARK persists a `context_maintenance.json` journal beside the Agent truth. If a
 request may have started but its terminal state is unknown, later Agent starts
