@@ -5,8 +5,9 @@ ARK separates an application's Agent role from the harness that executes it.
 Codex-, CLI-, subprocess-, or library-backed agent is configured, run,
 queried, controlled, and snapshotted.
 
-The bundled reference implementation is `codex`. Additional providers can be
-registered without changing Flow, Step, or snapshot orchestration.
+The bundled implementations are `codex` and `claude_code`. Additional
+providers can be registered without changing Flow, Step, or snapshot
+orchestration.
 
 ## Public Contract Namespace
 
@@ -86,7 +87,26 @@ and scope snapshots remain readable.
 archive integrity, and index rebuilding. It delegates every provider-specific
 file decision to the bundle's Artifact adapter. The Codex adapter captures the
 single-session rollout JSONL as authoritative resume evidence and discards its
-rebuildable `state_5.sqlite*` cache during restore.
+rebuildable `state_5.sqlite*` cache during restore. The Claude Code adapter
+captures one native session JSONL and records the matching Home
+materialization manifest as a required external dependency.
+
+## Claude Code Adapter
+
+`ClaudeCodeProvider` uses `claude-agent-sdk==0.2.124` to control the Claude Code
+CLI. Each run handle owns one thread, asyncio loop, and SDK client so interrupt
+and terminal delivery remain on the client's native loop. The adapter exposes
+the same normalized run, query, context, usage, fork, and artifact contracts as
+Codex without treating the configured backend or model as the provider type.
+
+Claude Code fork is session-only. File checkpointing is rejected by the first
+adapter version because Claude's file-history artifacts are not yet included
+in the Artifact Manifest. Context inspection and compact require a verified
+CLI version with the context-control protocol; compact success additionally
+requires a new persisted `compact_boundary` after the captured baseline.
+
+See [Claude Code provider](claude-code-provider.md) for setup and operational
+limits.
 
 ## Codex Compatibility
 

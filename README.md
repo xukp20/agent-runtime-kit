@@ -20,8 +20,10 @@ The current implementation includes:
   requirements, MCP server definitions, and materialized skills;
 - a provider-neutral contract layer with descriptors, capabilities, Home
   renderers, runtime handles, query/context/artifact adapters, and a registry;
-- a Codex reference provider that implements those contracts while starting a
-  fresh SDK client per run and preserving resumable thread artifacts;
+- bundled Codex and Claude Code providers: Codex preserves its existing SDK
+  compatibility surface, while Claude Code uses the Claude Agent SDK with
+  isolated native Homes, resumable sessions, normalized JSONL queries,
+  context control, and transcript snapshots;
 - versioned Agent records with provider/session/turn/artifact locators plus
   compatibility aliases for existing Codex runtimes and snapshots;
 - Agent start, wait, interrupt, session-only fork, close, stale-run
@@ -114,6 +116,16 @@ Codex support uses the OpenAI Codex Python SDK at runtime. The SDK may be
 installed normally or supplied from a local Codex source checkout through the
 provider's `sdk_python_root` option. Unit tests do not require a live Codex
 session.
+
+Claude Code support uses the optional, pinned Claude Agent SDK:
+
+```bash
+python -m pip install -e '.[claude]'
+```
+
+The Claude Code CLI and its backend credentials remain external runtime
+requirements. See [`docs/claude-code-provider.md`](docs/claude-code-provider.md)
+for isolated Home assembly, capabilities, and snapshot boundaries.
 
 ## Runtime Assembly
 
@@ -212,9 +224,9 @@ Run the deterministic unit and integration suites with:
 python -m pytest -q tests/unit tests/integration
 ```
 
-Real Codex tests are under `tests/real/` and require an explicitly configured
-Codex SDK, CLI, Home, and credentials. They are intentionally separate from the
-default regression suite.
+Real Codex and Claude Code tests are under `tests/real/` and require explicitly
+configured SDKs, CLIs, Homes, and credentials. They are intentionally separate
+from the default regression suite.
 
 ## Documentation
 
@@ -225,6 +237,9 @@ default regression suite.
 - [`docs/provider-adapters.md`](docs/provider-adapters.md) documents the
   provider-neutral contracts, capability rules, extension points, and Codex
   compatibility surface.
+- [`docs/claude-code-provider.md`](docs/claude-code-provider.md) documents the
+  bundled Claude Code adapter, configuration, controls, query projection, and
+  snapshot semantics.
 
 Maintainer checkouts may also contain a local `dev_docs/` tree with Chinese
 design, implementation, and current-code reference material. It is intentionally
