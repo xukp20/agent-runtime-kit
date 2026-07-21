@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from typing import Mapping
 
 from ..provider_contracts import (
     AgentProviderBundle,
     CapabilityKey,
     CapabilityStatus,
     CapabilitySupport,
+    ModelBackendIdentity,
     ProviderCapabilities,
     ProviderDescriptor,
     ProviderExecutionKind,
@@ -37,6 +40,92 @@ class CodexCompatibilityBridge:
         if legacy is None:
             raise RuntimeError("Codex run completed without a legacy turn result")
         return legacy
+
+
+class CodexCapabilityResolver:
+    provider_type = "codex"
+
+    def __init__(self, base: ProviderCapabilities) -> None:
+        self.base = base
+
+    def resolve_capabilities(
+        self,
+        home: object,
+        model_backend: ModelBackendIdentity | None = None,
+    ) -> ProviderCapabilities:
+        backend = model_backend or _home_model_backend(home)
+        home_id = str(getattr(home, "home_id", "")) or None
+        backend_key = backend.backend_key
+        supports = {
+            key: replace(
+                support,
+                resolved_for_home_id=home_id,
+                resolved_for_backend=backend_key,
+            )
+            for key, support in self.base.supports.items()
+            if key
+            not in {
+                CapabilityKey.MODEL_RESPONSES,
+                CapabilityKey.MODEL_CHAT_COMPLETIONS,
+                CapabilityKey.MODEL_OTHER_API,
+            }
+        }
+        model_modes = {
+            CapabilityKey.MODEL_RESPONSES: "responses",
+            CapabilityKey.MODEL_CHAT_COMPLETIONS: "chat_completions",
+        }
+        for capability, api_mode in model_modes.items():
+            available = backend.api_mode == api_mode
+            supports[capability] = CapabilitySupport(
+                capability=capability,
+                status=CapabilityStatus.NATIVE if available else CapabilityStatus.UNSUPPORTED,
+                available=available,
+                reason=None if available else f"effective backend uses {backend.api_mode}",
+                resolved_for_home_id=home_id,
+                resolved_for_backend=backend_key,
+                evidence_version="codex-home-backend-v1",
+            )
+        known_mode = backend.api_mode in set(model_modes.values())
+        supports[CapabilityKey.MODEL_OTHER_API] = CapabilitySupport(
+            capability=CapabilityKey.MODEL_OTHER_API,
+            status=CapabilityStatus.UNSUPPORTED if known_mode else CapabilityStatus.UNVERIFIED,
+            available=False,
+            reason=(
+                f"effective backend uses verified Codex API mode {backend.api_mode}"
+                if known_mode
+                else f"Codex adapter has not verified API mode {backend.api_mode}"
+            ),
+            resolved_for_home_id=home_id,
+            resolved_for_backend=backend_key,
+            evidence_version="codex-home-backend-v1",
+        )
+        return ProviderCapabilities(
+            provider_type="codex",
+            supports=supports,
+            resolved_for_home_id=home_id,
+            resolved_for_backend=backend_key,
+        )
+
+
+def _home_model_backend(home: object) -> ModelBackendIdentity:
+    payload = getattr(home, "resolved_defaults", None)
+    if isinstance(payload, Mapping):
+        api_provider = payload.get("api_provider")
+        api_mode = payload.get("api_mode")
+        if isinstance(api_provider, str) and isinstance(api_mode, str):
+            return ModelBackendIdentity(
+                api_provider=api_provider,
+                api_mode=api_mode,
+                endpoint_id=payload.get("endpoint_id"),
+                requested_model=payload.get("requested_model"),
+                resolved_model=payload.get("resolved_model"),
+                model_version=payload.get("model_version"),
+                service_tier=payload.get("service_tier"),
+                reasoning_effort=payload.get("reasoning_effort"),
+                tokenizer_id=payload.get("tokenizer_id"),
+                model_config_hash=payload.get("model_config_hash"),
+            )
+    return ModelBackendIdentity(api_provider="openai", api_mode="responses")
 
 
 def build_codex_provider_bundle(
@@ -136,11 +225,12 @@ def build_codex_provider_bundle(
             execution_kind=ProviderExecutionKind.SDK,
             home_kind=ProviderHomeKind.NATIVE,
             sdk_or_cli_name="openai_codex",
-            supported_api_modes=("responses",),
+            supported_api_modes=("responses", "chat_completions"),
             static_capabilities=capabilities,
         ),
         runtime=CodexRuntimeAdapter(provider),
         home_renderer=CodexHomeRenderer(runtime_root=runtime_root, provider=provider),
+        capability_resolver=CodexCapabilityResolver(capabilities),
         query=CodexQueryAdapter(runtime_root=runtime_root, provider=provider),
         context=CodexContextAdapter(provider),
         artifacts=CodexArtifactAdapter(runtime_root=runtime_root, provider=provider),

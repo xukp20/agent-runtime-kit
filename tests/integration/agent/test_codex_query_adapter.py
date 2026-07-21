@@ -121,3 +121,35 @@ def test_codex_capabilities_distinguish_native_adapted_and_unavailable(tmp_path:
     request_usage = capabilities.get(CapabilityKey.QUERY_REQUEST_USAGE)
     assert request_usage.status is CapabilityStatus.UNSUPPORTED
     assert request_usage.available is False
+
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="responses"))
+    responses = service.resolve_provider_capabilities(
+        provider_type="codex",
+        home_id="responses",
+    )
+    assert responses.available(CapabilityKey.MODEL_RESPONSES)
+    assert not responses.available(CapabilityKey.MODEL_CHAT_COMPLETIONS)
+
+    config_path = tmp_path / "deepseek-chat.toml"
+    config_path.write_text(
+        """
+model = "deepseek-chat"
+model_provider = "deepseek"
+
+[model_providers.deepseek]
+base_url = "https://api.deepseek.com"
+wire_api = "chat"
+""".lstrip(),
+        encoding="utf-8",
+    )
+    service.home_service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="chat",
+            base_config_path=config_path,
+        )
+    )
+    chat = service.resolve_provider_capabilities(provider_type="codex", home_id="chat")
+    assert chat.resolved_for_backend == "deepseek:chat_completions"
+    assert chat.available(CapabilityKey.MODEL_CHAT_COMPLETIONS)
+    assert not chat.available(CapabilityKey.MODEL_RESPONSES)

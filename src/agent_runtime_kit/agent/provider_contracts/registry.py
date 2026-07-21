@@ -80,6 +80,7 @@ class ProviderRegistry:
         for name, adapter in (
             ("runtime", bundle.runtime),
             ("home_renderer", bundle.home_renderer),
+            ("capability_resolver", bundle.capability_resolver),
             ("query", bundle.query),
             ("context", bundle.context),
             ("artifacts", bundle.artifacts),

@@ -46,6 +46,7 @@ from .provider_contracts import (
     AgentEvent,
     AgentProviderBundle,
     AgentTurnResult,
+    ModelBackendIdentity,
     Page,
     ProviderContextCompactionRequest,
     ProviderContextCompactionResult as StandardProviderContextCompactionResult,
@@ -54,6 +55,7 @@ from .provider_contracts import (
     ProviderContextUsage as StandardProviderContextUsage,
     ProviderEventQuery,
     ProviderForkRequest,
+    ProviderCapabilities,
     ProviderRegistry,
     ProviderRunHandle,
     ProviderRunRequest,
@@ -1551,6 +1553,19 @@ class AgentService:
         home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
         provider_env = build_provider_env(home=home, home_root=home_root)
         return provider.read_latest_turn_result(agent, home_root=home_root, env=provider_env)
+
+    def resolve_provider_capabilities(
+        self,
+        *,
+        provider_type: str,
+        home_id: str,
+        model_backend: ModelBackendIdentity | None = None,
+    ) -> ProviderCapabilities:
+        home = self.home_service.get_home(provider_type, home_id)
+        bundle = self._provider_bundle(provider_type)
+        if bundle is None:
+            raise RuntimeError(f"provider does not expose standard capabilities: {provider_type}")
+        return bundle.resolve_capabilities(home, model_backend)
 
     def query_sessions(
         self,
