@@ -55,5 +55,8 @@ current-code reference are the authoritative API guides.
   session-only fork, and transcript snapshot/restore.
 - [Pi provider](pi-provider.md): Pi 0.80.10 Home and model configuration,
   JSONL RPC lifecycle, agent-owned compaction, MCP bridge, and snapshots.
+- [OpenAI Agents provider](openai-agents-provider.md): application-owned Agent
+  factories, Responses and Chat Completions backends, SQLite sessions, and
+  compaction boundaries.
 - [OpenCode adapter](provider-adapters.md#opencode-adapter): isolated local
   server lifecycle, SQLite sessions, model-backed compaction, and snapshots.

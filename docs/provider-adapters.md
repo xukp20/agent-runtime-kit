@@ -58,6 +58,12 @@ Adapters convert native SDK or subprocess values at their boundary. Raw native
 data may be retained in a bounded, secret-sanitized `ProviderPayload`, but it
 is not the primary application contract.
 
+`AgentType.provider_type` and `AgentType.default_home_id` declare the normal
+execution binding. `AgentStepState.cli_type` is an optional per-Step override;
+when omitted, `AgentService` resolves the Provider and Home from `AgentType`.
+Legacy Step records that explicitly contain `cli_type = "codex"` continue to
+run with Codex.
+
 ## Capability Rules
 
 Callers must treat capability resolution as authoritative. Unsupported or
@@ -132,6 +138,25 @@ model backend uses Responses, Chat Completions, or Messages. MCP is projected
 through an ARK-owned Pi extension rather than claimed as a Pi-native feature.
 
 See [Pi provider](pi-provider.md) for configuration and exact limitations.
+
+## OpenAI Agents Adapter
+
+The OpenAI Agents adapter uses an application-owned resource registry for
+non-serializable Agent factories and tools. Homes persist the factory
+reference, backend/API-mode identity, MCP and skill resources, and SQLite
+session policy without serializing Python callables or credentials. Responses
+and Chat Completions are backend modes rather than distinct Provider types.
+
+Responses Homes may opt into SDK input-history compaction. Chat Completions
+Homes report compact as unsupported unless a separately designed compaction
+strategy is configured; ARK does not silently substitute a summarizer. See
+[OpenAI Agents provider](openai-agents-provider.md) for assembly and limits.
+
+The low-level OpenAI Agents and OpenCode run handles can represent provider
+approval/input boundaries, but ARK 0.2 does not expose a complete
+`AgentService`/Flow `NEEDS_INPUT` lifecycle. Applications using those layers
+must configure non-interactive operation; direct handle controls remain an
+extension point for a later common lifecycle.
 
 ## OpenCode Adapter
 

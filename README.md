@@ -129,6 +129,16 @@ The Claude Code CLI and its backend credentials remain external runtime
 requirements. See [`docs/claude-code-provider.md`](docs/claude-code-provider.md)
 for isolated Home assembly, capabilities, and snapshot boundaries.
 
+OpenAI Agents support uses the pinned optional SDK set:
+
+```bash
+python -m pip install -e '.[openai-agents]'
+```
+
+See [`docs/openai-agents-provider.md`](docs/openai-agents-provider.md) for
+resource factories, Responses versus Chat Completions, SQLite sessions, and
+compaction limits.
+
 Pi support targets `@earendil-works/pi-coding-agent` 0.80.10. Applications
 supply either an executable `pi` CLI or a Node executable plus the CLI entry
 file through `PiHomeOptions`. MCP projection additionally requires a prepared
@@ -266,6 +276,9 @@ Agent status wait contracts intended for application monitoring adapters.
   snapshot semantics.
 - [`docs/pi-provider.md`](docs/pi-provider.md) documents Pi Home projection,
   RPC lifecycle, usage/context semantics, MCP, snapshots, and configuration.
+- [`docs/openai-agents-provider.md`](docs/openai-agents-provider.md) documents
+  OpenAI Agents SDK assembly, backend-neutral model configuration, durable
+  sessions, and compaction behavior.
 - [`docs/provider-adapters.md`](docs/provider-adapters.md#opencode-adapter)
   documents OpenCode configuration, lifecycle, query, compact, fork, and
   snapshot boundaries.

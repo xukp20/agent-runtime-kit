@@ -98,6 +98,8 @@ class RunningAgentRepairResult:
 
 class AgentType:
     agent_type: str = ""
+    provider_type: str = "codex"
+    default_home_id: str | None = None
     developer_instructions_template: str | None = None
     start_prompt_template: str | None = None
     continue_prompt_template: str | None = None
@@ -239,18 +241,19 @@ class AgentService:
         self,
         scope_id: str,
         agent_type: str,
-        cli_type: str = "codex",
+        cli_type: str | None = None,
         home_id: str | None = None,
     ) -> Agent:
-        self.agent_types.get(agent_type)
-        resolved_home_id = home_id or agent_type
-        home = self.home_service.get_home(cli_type, resolved_home_id)
+        agent_type_spec = self.agent_types.get(agent_type)
+        resolved_cli_type = cli_type or agent_type_spec.provider_type
+        resolved_home_id = home_id or agent_type_spec.default_home_id or agent_type
+        home = self.home_service.get_home(resolved_cli_type, resolved_home_id)
         if home.status != "active":
-            raise RuntimeError(f"home is not active: {cli_type}/{resolved_home_id}")
+            raise RuntimeError(f"home is not active: {resolved_cli_type}/{resolved_home_id}")
         return self.store.create_agent_record(
             scope_id=scope_id,
             agent_type=agent_type,
-            cli_type=cli_type,
+            cli_type=resolved_cli_type,
             home_id=resolved_home_id,
         )
 

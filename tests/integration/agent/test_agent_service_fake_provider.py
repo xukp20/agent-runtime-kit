@@ -32,6 +32,11 @@ class BasicAgentType(AgentType):
     continue_prompt_template = "Continue {{item}} because {{reason}}."
 
 
+class AlternateProviderAgentType(BasicAgentType):
+    provider_type = "alternate"
+    default_home_id = "alternate-worker"
+
+
 class OneContinueAgentType(BasicAgentType):
     def check_completion(self, ctx: AgentCompletionContext) -> CompletionDecision:
         if ctx.auto_continue_count == 0:
@@ -71,6 +76,26 @@ def test_agent_service_runs_agent_and_reads_latest_result(tmp_path: Path) -> Non
     assert provider.calls[0]["home_id"] == "worker"
     assert provider.calls[0]["agent_id"] == agent.agent_id
     assert service.read_latest_turn_result(agent.agent_id).id == result.id
+
+
+def test_agent_service_resolves_provider_and_home_from_agent_type(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    registry = AgentTypeRegistry()
+    registry.register(AlternateProviderAgentType())
+    provider = FakeProvider(runtime_root)
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        providers={"alternate": provider},
+    )
+    service.home_service.create_home(
+        HomeCreateSpec(cli_type="alternate", home_id="alternate-worker")
+    )
+
+    agent = service.create_agent("repo:node", "worker")
+
+    assert agent.cli_type == "alternate"
+    assert agent.home_id == "alternate-worker"
 
 
 @pytest.mark.parametrize(

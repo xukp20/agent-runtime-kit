@@ -23,7 +23,7 @@ class AgentStepState(BaseStepState):
     state_type: str = "agent_step"
     agent_role: str
     agent_type: str | None = None
-    cli_type: str = "codex"
+    cli_type: str | None = None
     home_id: str | None = None
     create_agent_if_missing: bool = False
     bind_created_agent_to: Literal["step", "flow"] = "step"

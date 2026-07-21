@@ -66,14 +66,15 @@ class FakeAgentService:
         self,
         scope_id: str,
         agent_type: str,
-        cli_type: str = "codex",
+        cli_type: str | None = None,
         home_id: str | None = None,
     ) -> Agent:
+        resolved_cli_type = cli_type or "codex"
         agent = Agent(
             agent_id=f"agent-{self.next_agent}",
             scope_id=scope_id,
             agent_type=agent_type,
-            cli_type=cli_type,
+            cli_type=resolved_cli_type,
             home_id=home_id or agent_type,
         )
         self.next_agent += 1
