@@ -16,6 +16,7 @@ from ..provider_contracts import (
 )
 from .codex import CodexProvider
 from .codex_home import CodexHomeRenderer
+from .codex_query import CodexQueryAdapter
 from .codex_runtime import CodexProviderRunHandle, CodexRuntimeAdapter
 
 
@@ -55,6 +56,13 @@ def build_codex_provider_bundle(
         CapabilityKey.RUN_STREAM,
         CapabilityKey.RUN_WAIT_TERMINAL,
         CapabilityKey.RUN_INTERRUPT,
+        CapabilityKey.QUERY_TURNS,
+        CapabilityKey.QUERY_EVENTS,
+        CapabilityKey.QUERY_CONTENT,
+        CapabilityKey.QUERY_TOOL_CALLS,
+        CapabilityKey.QUERY_REQUEST_USAGE,
+        CapabilityKey.QUERY_SESSION_USAGE,
+        CapabilityKey.ARTIFACT_OFFLINE_QUERY,
         CapabilityKey.MODEL_RESPONSES,
     }
     capabilities = ProviderCapabilities(
@@ -82,5 +90,6 @@ def build_codex_provider_bundle(
         ),
         runtime=CodexRuntimeAdapter(provider),
         home_renderer=CodexHomeRenderer(runtime_root=runtime_root, provider=provider),
+        query=CodexQueryAdapter(runtime_root=runtime_root, provider=provider),
         compatibility=CodexCompatibilityBridge(),
     )

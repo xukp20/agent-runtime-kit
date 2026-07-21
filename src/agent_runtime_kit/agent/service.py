@@ -44,11 +44,17 @@ from .provider_contracts import (
     AgentEvent,
     AgentProviderBundle,
     AgentTurnResult,
+    Page,
+    ProviderEventQuery,
     ProviderRegistry,
     ProviderRunHandle,
     ProviderRunRequest,
     ProviderSessionLocator,
+    ProviderToolQuery,
+    ProviderTurnLocator,
+    ProviderTurnQuery,
     ProviderTurnResult,
+    ProviderUsageQuery,
 )
 from .providers.codex import CodexProvider
 from .report_policy import AgentTraceReportPolicy, TraceReportPersistence
@@ -1376,6 +1382,110 @@ class AgentService:
         home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
         provider_env = build_provider_env(home=home, home_root=home_root)
         return provider.read_latest_turn_result(agent, home_root=home_root, env=provider_env)
+
+    def query_turns(
+        self,
+        agent_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Page:
+        bundle, session = self._query_bundle_and_session(agent_id)
+        return bundle.query.list_turns(
+            ProviderTurnQuery(session=session, cursor=cursor, limit=limit)
+        )
+
+    def query_turn(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        latest: bool = False,
+    ) -> object | None:
+        bundle, session = self._query_bundle_and_session(agent_id)
+        turn = ProviderTurnLocator(session=session, turn_id=turn_id) if turn_id is not None else None
+        return bundle.query.read_turn(
+            ProviderTurnQuery(session=session, turn=turn, latest=latest)
+        )
+
+    def query_events(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        kind: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Page:
+        bundle, session = self._query_bundle_and_session(agent_id)
+        turn = ProviderTurnLocator(session=session, turn_id=turn_id) if turn_id is not None else None
+        return bundle.query.list_events(
+            ProviderEventQuery(
+                session=session,
+                turn=turn,
+                kind=kind,
+                cursor=cursor,
+                limit=limit,
+            )
+        )
+
+    def query_tool_calls(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        call_id: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Page:
+        bundle, session = self._query_bundle_and_session(agent_id)
+        turn = ProviderTurnLocator(session=session, turn_id=turn_id) if turn_id is not None else None
+        return bundle.query.list_tool_calls(
+            ProviderToolQuery(
+                session=session,
+                turn=turn,
+                call_id=call_id,
+                cursor=cursor,
+                limit=limit,
+            )
+        )
+
+    def query_usage(
+        self,
+        agent_id: str,
+        *,
+        turn_id: str | None = None,
+        latest: bool = False,
+        include_session_aggregate: bool = False,
+    ) -> object:
+        bundle, session = self._query_bundle_and_session(agent_id)
+        turn = ProviderTurnLocator(session=session, turn_id=turn_id) if turn_id is not None else None
+        return bundle.query.read_usage(
+            ProviderUsageQuery(
+                session=session,
+                turn=turn,
+                latest=latest,
+                include_session_aggregate=include_session_aggregate,
+            )
+        )
+
+    def _query_bundle_and_session(
+        self,
+        agent_id: str,
+    ) -> tuple[AgentProviderBundle, ProviderSessionLocator]:
+        agent = self.store.get_agent(agent_id)
+        if not agent.thread_id:
+            raise AgentHasNoCompletedTurn(agent_id)
+        bundle = self._provider_bundle(agent.cli_type)
+        if bundle is None or bundle.query is None:
+            raise RuntimeError(f"provider does not support standard query: {agent.cli_type}")
+        return bundle, ProviderSessionLocator(
+            provider_type=agent.cli_type,
+            session_id=agent.thread_id,
+            home_id=agent.home_id,
+            created_at=agent.created_at or utc_now_iso(),
+            native_locator={"rollout_relpath": agent.rollout_relpath},
+        )
 
     def _refresh_codex_rollout_locator(self, agent_id: str) -> Agent:
         agent = self.store.get_agent(agent_id)
