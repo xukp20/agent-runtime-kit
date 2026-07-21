@@ -47,3 +47,5 @@ current-code reference are the authoritative API guides.
 - [Provider adapters and normalized Agent runtime](provider-adapters.md):
   Provider Registry, capabilities, Home/runtime/query/context/artifact SPI,
   normalized records and results, and migration compatibility.
+- [Pi provider](pi-provider.md): Pi 0.80.10 Home and model configuration,
+  JSONL RPC lifecycle, agent-owned compaction, MCP bridge, and snapshots.

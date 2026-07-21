@@ -5,7 +5,7 @@ ARK separates an application's Agent role from the harness that executes it.
 Codex-, CLI-, subprocess-, or library-backed agent is configured, run,
 queried, controlled, and snapshotted.
 
-The bundled reference implementation is `codex`. Additional providers can be
+The bundled adapters are `codex` and `pi`. Additional providers can be
 registered without changing Flow, Step, or snapshot orchestration.
 
 ## Public Contract Namespace
@@ -88,6 +88,11 @@ file decision to the bundle's Artifact adapter. The Codex adapter captures the
 single-session rollout JSONL as authoritative resume evidence and discards its
 rebuildable `state_5.sqlite*` cache during restore.
 
+The Pi adapter captures one idle Pi v3 session JSONL. Its manifest also records
+the hash of the ARK Home materialization manifest as a restore-time reference;
+the Home is validated but not duplicated into every session snapshot. Pi
+snapshot and fork operations do not capture or roll back workspace files.
+
 ## Codex Compatibility
 
 Existing application calls such as `wait_agent()`, legacy trace readers, and
@@ -96,3 +101,14 @@ can use `wait_agent_result()`, `query_*()`, and
 `inspect_agent_context_result()` for normalized values. Compatibility paths
 are explicitly marked in source and have migration tests; they are not the
 template for new provider implementations.
+
+## Pi Adapter
+
+Pi is integrated through its LF-delimited subprocess RPC protocol and native
+v3 session JSONL. The adapter supplies Home, runtime, query, context, artifact,
+snapshot, and dynamic capability implementations. Its compact operation is Pi
+agent-owned history summarization and is independent of whether the selected
+model backend uses Responses, Chat Completions, or Messages. MCP is projected
+through an ARK-owned Pi extension rather than claimed as a Pi-native feature.
+
+See [Pi provider](pi-provider.md) for configuration and exact limitations.

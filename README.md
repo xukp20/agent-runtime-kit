@@ -20,8 +20,9 @@ The current implementation includes:
   requirements, MCP server definitions, and materialized skills;
 - a provider-neutral contract layer with descriptors, capabilities, Home
   renderers, runtime handles, query/context/artifact adapters, and a registry;
-- a Codex reference provider that implements those contracts while starting a
-  fresh SDK client per run and preserving resumable thread artifacts;
+- bundled Codex and Pi provider adapters: Codex uses the Python SDK, while Pi
+  uses its JSONL subprocess RPC, native Home/session format, and an ARK-owned
+  MCP extension bridge;
 - versioned Agent records with provider/session/turn/artifact locators plus
   compatibility aliases for existing Codex runtimes and snapshots;
 - Agent start, wait, interrupt, session-only fork, close, stale-run
@@ -114,6 +115,13 @@ Codex support uses the OpenAI Codex Python SDK at runtime. The SDK may be
 installed normally or supplied from a local Codex source checkout through the
 provider's `sdk_python_root` option. Unit tests do not require a live Codex
 session.
+
+Pi support targets `@earendil-works/pi-coding-agent` 0.80.10. Applications
+supply either an executable `pi` CLI or a Node executable plus the CLI entry
+file through `PiHomeOptions`. MCP projection additionally requires a prepared
+Node runtime containing `@modelcontextprotocol/sdk`; ARK packages the bridge
+code but does not install or mutate application Node dependencies. See the
+[Pi provider guide](docs/pi-provider.md) for assembly and capability details.
 
 ## Runtime Assembly
 
@@ -212,9 +220,9 @@ Run the deterministic unit and integration suites with:
 python -m pytest -q tests/unit tests/integration
 ```
 
-Real Codex tests are under `tests/real/` and require an explicitly configured
-Codex SDK, CLI, Home, and credentials. They are intentionally separate from the
-default regression suite.
+Real provider tests are under `tests/real/` and require explicitly configured
+CLIs, Homes, credentials, and opt-in environment gates. They are intentionally
+separate from the default regression suite.
 
 ## Documentation
 
@@ -225,6 +233,8 @@ default regression suite.
 - [`docs/provider-adapters.md`](docs/provider-adapters.md) documents the
   provider-neutral contracts, capability rules, extension points, and Codex
   compatibility surface.
+- [`docs/pi-provider.md`](docs/pi-provider.md) documents Pi Home projection,
+  RPC lifecycle, usage/context semantics, MCP, snapshots, and configuration.
 
 Maintainer checkouts may also contain a local `dev_docs/` tree with Chinese
 design, implementation, and current-code reference material. It is intentionally

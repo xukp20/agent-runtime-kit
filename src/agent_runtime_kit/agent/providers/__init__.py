@@ -10,6 +10,9 @@ from .external_takeover import (
     ExternalTakeoverThreadSnapshot,
     ExternalTakeoverTurnResult,
 )
+from .pi_bundle import build_pi_provider_bundle
+from .pi_home import PiHomeOptions, PiHomeRenderer
+from .pi_runtime import PiProviderRunHandle, PiRuntimeAdapter
 
 __all__ = [
     "CodexForkResult",
@@ -22,4 +25,9 @@ __all__ = [
     "ExternalTakeoverProviderResult",
     "ExternalTakeoverThreadSnapshot",
     "ExternalTakeoverTurnResult",
+    "PiHomeOptions",
+    "PiHomeRenderer",
+    "PiProviderRunHandle",
+    "PiRuntimeAdapter",
+    "build_pi_provider_bundle",
 ]
