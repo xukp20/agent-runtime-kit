@@ -13,6 +13,7 @@ from agent_runtime_kit.agent.models import (
     AgentAlreadyRunningError,
     AgentContextMaintenanceBlocked,
 )
+from agent_runtime_kit.agent.provider_contracts import ModelBackendIdentity, ProviderSessionLocator
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy
 from agent_runtime_kit.agent.providers.codex import CodexProvider
@@ -27,6 +28,39 @@ class SnapshotAgentType(AgentType):
     developer_instructions_template = "Developer."
     start_prompt_template = "Start {{item}}."
     continue_prompt_template = "Continue {{item}}."
+
+
+def test_snapshot_provider_session_preserves_exact_native_locator(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = AgentService(runtime_root, providers={"contract_fake": object()})
+    agent = service.store.create_agent_record(
+        scope_id="scope-a",
+        agent_type="worker",
+        cli_type="contract_fake",
+        home_id="worker",
+    )
+    exact = ProviderSessionLocator(
+        provider_type="contract_fake",
+        session_id="session-exact",
+        home_id="worker",
+        created_at="2026-07-21T10:00:00Z",
+        native_locator={"database": "provider/session.db", "rollout_relpath": "exact.jsonl"},
+        backend_identity=ModelBackendIdentity(
+            api_provider="backend-a",
+            api_mode="responses",
+            requested_model="model-a",
+        ),
+    )
+    persisted = service.store.update_thread_locator(
+        agent.agent_id,
+        thread_id=exact.session_id,
+        rollout_relpath="legacy-placeholder.jsonl",
+        session_locator=exact,
+    )
+
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+
+    assert snapshot_service._provider_session(persisted) == exact
 
 
 def test_codex_snapshot_uses_provider_artifact_manifest_for_restore(tmp_path: Path) -> None:

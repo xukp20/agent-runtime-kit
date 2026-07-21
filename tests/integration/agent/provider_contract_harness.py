@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from agent_runtime_kit.agent.provider_contracts import (
     AgentError,
@@ -19,6 +20,7 @@ from agent_runtime_kit.agent.provider_contracts import (
     ProviderDescriptor,
     ProviderEventBatch,
     ProviderExecutionKind,
+    ProviderExecutionContext,
     ProviderHomeKind,
     ProviderRunRequest,
     ProviderRunState,
@@ -52,7 +54,13 @@ class FakeHomeRenderer:
         return HomeInitializationResult(initialized=True)
 
     def build_execution_context(self, home, *, run_env=None, workdir=None):  # noqa: ANN001, ANN201
-        raise NotImplementedError
+        return ProviderExecutionContext(
+            provider_type=self.provider_type,
+            home_id=home.home_id,
+            home_root=Path(home.home_relpath),
+            process_environment=dict(run_env or {}),
+            workdir=workdir,
+        )
 
 
 class ContractFakeRunHandle:

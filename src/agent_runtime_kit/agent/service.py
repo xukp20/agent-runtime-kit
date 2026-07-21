@@ -47,8 +47,10 @@ from .provider_contracts import (
     AgentEvent,
     AgentProviderBundle,
     AgentTurnResult,
+    CapabilityKey,
     ModelBackendIdentity,
     Page,
+    ProviderCapabilityUnavailable,
     ProviderContextCompactionRequest,
     ProviderContextCompactionResult as StandardProviderContextCompactionResult,
     ProviderContextQuery,
@@ -539,15 +541,9 @@ class AgentService:
             run_env=env,
             workdir=workdir,
         )
-        session_locator = None
-        if agent.thread_id is not None:
-            session_locator = ProviderSessionLocator(
-                provider_type=agent.cli_type,
-                session_id=agent.thread_id,
-                home_id=agent.home_id,
-                created_at=agent.created_at or utc_now_iso(),
-                native_locator={"rollout_relpath": agent.rollout_relpath},
-            )
+        session_locator = (
+            self._provider_session_locator(agent) if agent.thread_id is not None else None
+        )
         request = ProviderRunRequest(
             agent_id=agent.agent_id,
             scope_id=agent.scope_id,
@@ -575,6 +571,7 @@ class AgentService:
                 agent.agent_id,
                 thread_id=locator.session_id,
                 rollout_relpath=agent.rollout_relpath,
+                session_locator=locator,
             )
         provider_result = handle.wait_terminal()
         standard_result = AgentTurnResult(
@@ -1064,6 +1061,23 @@ class AgentService:
             if force:
                 raise AgentContextMaintenanceUnsupported(agent.cli_type)
             return self._unsupported_context_compaction(agent, usage_before, now)
+        if context_adapter is not None:
+            home = self.home_service.get_home(agent.cli_type, agent.home_id)
+            model_backend = self._provider_session_locator(agent).backend_identity
+            try:
+                compact_support = bundle.resolve_capabilities(home, model_backend).get(
+                    CapabilityKey.CONTROL_COMPACT
+                )
+            except ProviderCapabilityUnavailable:
+                compact_support = None
+            if compact_support is None or not compact_support.available:
+                if force:
+                    reason = compact_support.reason if compact_support is not None else None
+                    detail = f": {reason}" if reason else ""
+                    raise AgentContextMaintenanceUnsupported(
+                        f"{agent.cli_type} does not support {CapabilityKey.CONTROL_COMPACT.value}{detail}"
+                    )
+                return self._unsupported_context_compaction(agent, usage_before, now)
         if not force:
             if not usage_before.available:
                 return self._skipped_context_compaction(
@@ -1085,7 +1099,7 @@ class AgentService:
                 run_env=env,
                 workdir=workdir,
             )
-            home = home_root = provider_env = None
+            home_root = provider_env = None
         else:
             home = self.home_service.get_home(agent.cli_type, agent.home_id)
             home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)

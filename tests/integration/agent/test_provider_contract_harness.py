@@ -3,12 +3,20 @@ from __future__ import annotations
 import pytest
 
 from agent_runtime_kit.agent.provider_contracts import (
+    AgentProviderBundle,
+    ModelBackendIdentity,
+    ProviderContextUsage,
     ProviderControlAction,
     ProviderControlRequest,
     ProviderExecutionKind,
     ProviderRegistry,
     ProviderRunState,
+    ProviderSessionLocator,
 )
+from agent_runtime_kit.agent.context import AgentContextCompactionStatus
+from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.models import AgentContextMaintenanceUnsupported
+from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 
 from .provider_contract_harness import (
     assert_immediate_terminal_contract,
@@ -70,3 +78,126 @@ def test_event_cursor_is_monotonic_and_does_not_repeat_events() -> None:
     second = handle.drain_events(after_cursor=first.next_cursor)
     assert [event.sequence for event in first.events] == [0]
     assert second.events == ()
+
+
+class _ContractAgentType(AgentType):
+    agent_type = "contract-agent"
+    start_prompt_template = "work"
+
+
+class _InspectOnlyContextAdapter:
+    provider_type = "contract_fake"
+
+    def __init__(self) -> None:
+        self.compact_calls = 0
+
+    def inspect(self, request):  # noqa: ANN001, ANN201
+        return ProviderContextUsage(
+            session_id=request.session.session_id,
+            observed_at="2026-07-21T10:00:00Z",
+            source="contract_fake",
+            available=True,
+            used_tokens=90,
+            effective_context_window_tokens=100,
+            measurement="provider_reported",
+            model_identity=request.session.backend_identity,
+        )
+
+    def compact(self, request):  # noqa: ANN001, ANN201
+        self.compact_calls += 1
+        raise AssertionError("compact must be capability-gated before adapter invocation")
+
+    def reconcile(self, request):  # noqa: ANN001, ANN201
+        return None
+
+
+def _contract_agent_service(tmp_path, bundle: AgentProviderBundle) -> AgentService:  # noqa: ANN001
+    agent_types = AgentTypeRegistry()
+    agent_types.register(_ContractAgentType())
+    return AgentService(
+        tmp_path / ".agent_runtime",
+        agent_types=agent_types,
+        providers={"contract_fake": object()},
+        provider_registry=ProviderRegistry((bundle,)),
+    )
+
+
+def test_agent_service_resume_preserves_exact_provider_session_locator(tmp_path) -> None:  # noqa: ANN001
+    bundle = make_contract_fake_bundle()
+    service = _contract_agent_service(tmp_path, bundle)
+    service.home_service.create_home(
+        HomeCreateSpec(cli_type="contract_fake", home_id="contract-home")
+    )
+    agent = service.create_agent(
+        "scope-contract",
+        "contract-agent",
+        cli_type="contract_fake",
+        home_id="contract-home",
+    )
+    exact = ProviderSessionLocator(
+        provider_type="contract_fake",
+        session_id="session-exact",
+        home_id="contract-home",
+        created_at="2026-07-21T10:00:00Z",
+        native_locator={"database": "agents/a-1/opencode.db", "opaque": {"partition": 7}},
+        backend_identity=ModelBackendIdentity(
+            api_provider="backend-a",
+            api_mode="responses",
+            requested_model="model-a",
+        ),
+    )
+    service.store.update_thread_locator(
+        agent.agent_id,
+        thread_id=exact.session_id,
+        rollout_relpath=None,
+        session_locator=exact,
+    )
+
+    service.start_agent(agent.agent_id)
+    result = service.wait_agent_result(agent.agent_id, timeout_s=2)
+
+    runtime = bundle.runtime
+    assert runtime.handles[-1].request.session_locator == exact
+    assert result.session_locator == exact
+    assert service.get_agent(agent.agent_id).session_locator == exact
+
+
+def test_agent_service_compact_fails_closed_when_context_exists_without_capability(
+    tmp_path,  # noqa: ANN001
+) -> None:
+    base = make_contract_fake_bundle()
+    context = _InspectOnlyContextAdapter()
+    bundle = AgentProviderBundle(
+        descriptor=base.descriptor,
+        runtime=base.runtime,
+        home_renderer=base.home_renderer,
+        context=context,
+    )
+    service = _contract_agent_service(tmp_path, bundle)
+    service.home_service.create_home(
+        HomeCreateSpec(cli_type="contract_fake", home_id="contract-home")
+    )
+    agent = service.create_agent(
+        "scope-contract",
+        "contract-agent",
+        cli_type="contract_fake",
+        home_id="contract-home",
+    )
+    service.store.update_thread_locator(
+        agent.agent_id,
+        thread_id="session-1",
+        rollout_relpath=None,
+        session_locator=ProviderSessionLocator(
+            provider_type="contract_fake",
+            session_id="session-1",
+            home_id="contract-home",
+            created_at="2026-07-21T10:00:00Z",
+        ),
+    )
+
+    with pytest.raises(AgentContextMaintenanceUnsupported, match="control.compact"):
+        service.compact_agent(agent.agent_id)
+    conditional = service.compact_agent_if_needed(agent.agent_id, threshold=0.5)
+
+    assert conditional.status is AgentContextCompactionStatus.UNSUPPORTED
+    assert context.compact_calls == 0

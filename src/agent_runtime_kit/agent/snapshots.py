@@ -816,6 +816,9 @@ class AgentSnapshotService:
         session_id = getattr(agent, "thread_id", None)
         if not session_id:
             return None
+        exact = getattr(agent, "session_locator", None)
+        if isinstance(exact, ProviderSessionLocator):
+            return exact
         return ProviderSessionLocator(
             provider_type=str(getattr(agent, "cli_type", "")),
             session_id=str(session_id),
