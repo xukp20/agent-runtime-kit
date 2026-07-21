@@ -20,6 +20,7 @@ from agent_runtime_kit.agent.models import (
     CompletionDecision,
 )
 from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy, TraceReportPersistence
+from agent_runtime_kit.agent.provider_contracts import ProviderRegistry
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 
 from .fakes import FakeProvider, FakeTurnResult
@@ -96,6 +97,24 @@ def test_agent_service_resolves_provider_and_home_from_agent_type(tmp_path: Path
 
     assert agent.cli_type == "alternate"
     assert agent.home_id == "alternate-worker"
+
+
+def test_agent_service_keeps_legacy_providers_with_explicit_registry(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    registry = AgentTypeRegistry()
+    registry.register(BasicAgentType())
+    provider = FakeProvider(runtime_root)
+
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        providers={"codex": provider},
+        provider_registry=ProviderRegistry(),
+    )
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+
+    agent = service.create_agent("repo:node", "worker")
+    assert agent.cli_type == "codex"
 
 
 @pytest.mark.parametrize(

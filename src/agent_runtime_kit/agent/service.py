@@ -202,16 +202,17 @@ class AgentService:
         self.providers = providers or {"codex": CodexProvider(runtime_root=self.runtime_root)}
         self.provider_registry = provider_registry or ProviderRegistry()
         self._provider_bundle_sources: dict[str, object] = {}
-        if provider_registry is None:
-            for provider_type, provider in self.providers.items():
-                bundle = _build_provider_bundle(provider, runtime_root=self.runtime_root)
-                if bundle is not None:
-                    if bundle.provider_type != provider_type:
-                        raise ValueError(
-                            f"provider bundle key mismatch: {provider_type} != {bundle.provider_type}"
-                        )
-                    self.provider_registry.register(bundle)
-                    self._provider_bundle_sources[provider_type] = provider
+        for provider_type, provider in self.providers.items():
+            if provider_type in self.provider_registry:
+                continue
+            bundle = _build_provider_bundle(provider, runtime_root=self.runtime_root)
+            if bundle is not None:
+                if bundle.provider_type != provider_type:
+                    raise ValueError(
+                        f"provider bundle key mismatch: {provider_type} != {bundle.provider_type}"
+                    )
+                self.provider_registry.register(bundle)
+                self._provider_bundle_sources[provider_type] = provider
         self.store = store or AgentStoreService(self.runtime_root, providers=self.providers)
         if home_service is None:
             renderers = {
