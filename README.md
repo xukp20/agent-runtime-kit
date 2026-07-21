@@ -20,10 +20,9 @@ The current implementation includes:
   requirements, MCP server definitions, and materialized skills;
 - a provider-neutral contract layer with descriptors, capabilities, Home
   renderers, runtime handles, query/context/artifact adapters, and a registry;
-- bundled Codex, Claude Code, and Pi providers: Codex preserves its existing
-  SDK compatibility surface, Claude Code uses the Claude Agent SDK with
-  isolated native Homes and transcript snapshots, and Pi uses JSONL subprocess
-  RPC with an ARK-owned MCP extension bridge;
+- bundled Codex, Claude Code, Pi, OpenAI Agents, and OpenCode providers: Codex
+  preserves its existing SDK compatibility surface, while the other adapters
+  use isolated native Homes and provider-owned session artifacts;
 - versioned Agent records with provider/session/turn/artifact locators plus
   compatibility aliases for existing Codex runtimes and snapshots;
 - Agent start, wait, interrupt, session-only fork, close, stale-run
@@ -137,6 +136,11 @@ Node runtime containing `@modelcontextprotocol/sdk`; ARK packages the bridge
 code but does not install or mutate application Node dependencies. See the
 [Pi provider guide](docs/pi-provider.md) for assembly and capability details.
 
+OpenCode support uses an external `opencode` 1.18.4 executable. Applications
+register `build_opencode_provider_bundle(...)` explicitly and provide model
+credentials through environment references; ARK does not bundle OpenCode or
+copy credentials into a Home or snapshot.
+
 ## Runtime Assembly
 
 Applications normally create one shared framework container and one
@@ -200,6 +204,7 @@ By default, runtime state lives below the configured runtime root:
 ```text
 .agent_runtime/
 ├── homes/                 # isolated provider homes and Home index
+├── providers/             # provider-owned per-Agent runtime data (for example OpenCode SQLite/XDG)
 ├── scopes/                # scope-owned Agent, Flow, and Step truth
 ├── index/global.sqlite    # rebuildable global Agent/Flow/Step index
 ├── snapshots/
@@ -238,6 +243,10 @@ Real provider tests are under `tests/real/` and require explicitly configured
 CLIs, Homes, credentials, and opt-in environment gates. They are intentionally
 separate from the default regression suite.
 
+The gated OpenCode integration tests use `ARK_OPENCODE_TEST_BINARY`. Real model
+tests additionally require `ARK_OPENCODE_RUN_REAL_MODELS=1` and backend keys in
+the documented environment variables. They never read a shared OpenCode Home.
+
 ## Documentation
 
 See [Runtime observation](docs/runtime-observation.md) for Step terminal and
@@ -257,6 +266,9 @@ Agent status wait contracts intended for application monitoring adapters.
   snapshot semantics.
 - [`docs/pi-provider.md`](docs/pi-provider.md) documents Pi Home projection,
   RPC lifecycle, usage/context semantics, MCP, snapshots, and configuration.
+- [`docs/provider-adapters.md`](docs/provider-adapters.md#opencode-adapter)
+  documents OpenCode configuration, lifecycle, query, compact, fork, and
+  snapshot boundaries.
 
 Maintainer checkouts may also contain a local `dev_docs/` tree with Chinese
 design, implementation, and current-code reference material. It is intentionally

@@ -23,6 +23,9 @@ from .external_takeover import (
 from .pi_bundle import build_pi_provider_bundle
 from .pi_home import PiHomeOptions, PiHomeRenderer
 from .pi_runtime import PiProviderRunHandle, PiRuntimeAdapter
+from .opencode_bundle import build_opencode_provider_bundle
+from .opencode_home import OpenCodeHomeRenderer
+from .opencode_models import OpenCodeHomeOptions, OpenCodeRunOptions
 
 __all__ = [
     "ClaudeCodeHomeOptions",
@@ -49,4 +52,8 @@ __all__ = [
     "PiProviderRunHandle",
     "PiRuntimeAdapter",
     "build_pi_provider_bundle",
+    "OpenCodeHomeOptions",
+    "OpenCodeHomeRenderer",
+    "OpenCodeRunOptions",
+    "build_opencode_provider_bundle",
 ]
