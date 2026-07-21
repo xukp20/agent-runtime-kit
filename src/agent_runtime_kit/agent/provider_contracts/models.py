@@ -76,6 +76,11 @@ class ProviderRunRequest:
     provider_options: object | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     event_sink: Callable[["AgentEvent"], None] | None = field(default=None, repr=False, compare=False)
+    session_start_home_commit: Callable[[], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     execution_context: ProviderExecutionContext | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:

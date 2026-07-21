@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from agent_runtime_kit.agent.provider_contracts import (
     ModelBackendIdentity,
@@ -42,9 +44,12 @@ class _CodexProviderStub:
         self.started = threading.Event()
         self.release = threading.Event()
         self.interrupt_calls: list[str] = []
+        self.operation_order: list[str] = []
 
     def start_thread(self, *, on_thread_started, on_turn_started, **kwargs):  # noqa: ANN001, ANN201
+        self.operation_order.append("session.created")
         on_thread_started("thread-1")
+        self.operation_order.append("turn.started")
         on_turn_started("thread-1", "turn-1")
         self.started.set()
         if self.block:
@@ -168,6 +173,57 @@ def test_codex_runtime_adapter_normalizes_result_usage_and_context(tmp_path: Pat
     assert result.context_after.used_tokens == 100
     assert result.context_after.context_window == 200
     assert handle.legacy_turn_result.final_response == "done"
+
+
+def test_codex_runtime_commits_new_session_home_before_first_turn(tmp_path: Path) -> None:
+    provider = _CodexProviderStub()
+    request = _request(tmp_path)
+    request = replace(
+        request,
+        session_start_home_commit=lambda: provider.operation_order.append("home.committed"),
+    )
+
+    CodexRuntimeAdapter(provider).start(request).wait_terminal(timeout_s=5)  # type: ignore[arg-type]
+
+    assert provider.operation_order == ["session.created", "home.committed", "turn.started"]
+
+
+def test_codex_runtime_does_not_commit_home_when_resuming_session(tmp_path: Path) -> None:
+    provider = _CodexProviderStub()
+    request = _request(tmp_path)
+    commit_calls: list[str] = []
+    request = replace(
+        request,
+        session_locator=ProviderSessionLocator(
+            provider_type="codex",
+            session_id="thread-1",
+            home_id="worker",
+            created_at="2026-07-22T00:00:00Z",
+        ),
+        session_start_home_commit=lambda: commit_calls.append("committed"),
+    )
+
+    CodexRuntimeAdapter(provider).resume(request).wait_terminal(timeout_s=5)  # type: ignore[arg-type]
+
+    assert commit_calls == []
+
+
+def test_codex_runtime_home_commit_failure_blocks_first_turn(tmp_path: Path) -> None:
+    provider = _CodexProviderStub()
+
+    def reject_home_change() -> None:
+        raise RuntimeError("unexpected managed Home change")
+
+    request = replace(
+        _request(tmp_path),
+        session_start_home_commit=reject_home_change,
+    )
+
+    handle = CodexRuntimeAdapter(provider).start(request)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="unexpected managed Home change"):
+        handle.wait_terminal(timeout_s=5)
+    assert provider.operation_order == ["session.created"]
 
 
 def test_codex_runtime_handle_interrupt_confirms_terminal(tmp_path: Path) -> None:

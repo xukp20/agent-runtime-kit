@@ -95,6 +95,20 @@ class ProviderHomeRenderer(Protocol):
     ) -> ProviderExecutionContext: ...
 
 
+class ProviderLifecycleHomeRenderer(Protocol):
+    """Optional trusted lifecycle commit extension for a Home renderer."""
+
+    provider_type: str
+
+    def commit_lifecycle_materialization(
+        self,
+        home: HomeRecordView,
+        home_root: Path,
+        *,
+        lifecycle: str,
+    ) -> HomeMaterializationResult | None: ...
+
+
 class ProviderRunHandle(Protocol):
     @property
     def run_id(self) -> str: ...

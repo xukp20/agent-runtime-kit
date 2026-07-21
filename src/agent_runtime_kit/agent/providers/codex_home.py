@@ -144,6 +144,10 @@ class CodexHomeRenderer:
         self,
         home: "HomeRecord",
         home_root: Path,
+        *,
+        warning: str = (
+            "materialization manifest explicitly refreshed after application post-processing"
+        ),
     ) -> HomeMaterializationResult:
         """Explicitly seal application post-processing into the Home manifest."""
 
@@ -168,13 +172,52 @@ class CodexHomeRenderer:
             required_env=tuple(payload.get("required_env") or ()),
             auth_refs=tuple(payload.get("auth_refs") or ()),
             resolved_defaults=_resolve_model_defaults(config_text),
-            warnings=tuple(payload.get("warnings") or ())
-            + ("materialization manifest explicitly refreshed after application post-processing",),
+            warnings=tuple(payload.get("warnings") or ()) + (warning,),
             effective_capabilities=_codex_home_capabilities(home.home_id),
         )
         result = replace(result, manifest_hash=_manifest_hash(to_jsonable(result)))
         write_json_atomic(manifest_path, to_jsonable(result))
         return result
+
+    def commit_lifecycle_materialization(
+        self,
+        home: "HomeRecord",
+        home_root: Path,
+        *,
+        lifecycle: str,
+    ) -> HomeMaterializationResult | None:
+        if lifecycle != "session_start":
+            raise ValueError(f"unsupported Codex Home materialization lifecycle: {lifecycle}")
+        manifest_path = Path(home_root) / ".ark" / "home_materialization.json"
+        payload = read_json(manifest_path)
+        declared_hash = str(payload.get("manifest_hash", ""))
+        if (
+            declared_hash != (home.materialization_manifest_hash or "")
+            or _manifest_hash(payload) != declared_hash
+        ):
+            raise RuntimeError(f"home materialization manifest hash mismatch: {home.home_id}")
+        expected = {
+            str(item["relpath"]): str(item["sha256"])
+            for item in payload.get("generated_files", [])
+        }
+        actual = {item.relpath: item.sha256 for item in _describe_generated_files(Path(home_root))}
+        changed = sorted(
+            relpath
+            for relpath in expected.keys() | actual.keys()
+            if expected.get(relpath) != actual.get(relpath)
+        )
+        if not changed:
+            return None
+        if changed != [".codex/config.toml"] or ".codex/config.toml" not in actual:
+            rendered = ", ".join(changed)
+            raise RuntimeError(
+                "unexpected Codex Home materialization changes at session start: " + rendered
+            )
+        return self.refresh_materialization(
+            home,
+            Path(home_root),
+            warning="materialization manifest refreshed at trusted Codex session-start boundary",
+        )
 
     def build_execution_context(
         self,

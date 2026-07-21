@@ -453,6 +453,47 @@ class HomeService:
         home = self.get_home(provider_type, home_id)
         home_root = self.resolve_home_root(provider_type, home_id)
         materialization = refresh(home, home_root)
+        return self._store_refreshed_materialization(
+            provider_type,
+            home_id,
+            home,
+            materialization,
+        )
+
+    def commit_provider_lifecycle_materialization(
+        self,
+        provider_type: str,
+        home_id: str,
+        *,
+        lifecycle: str,
+    ) -> HomeRecord:
+        """Commit only renderer-declared changes at a trusted provider boundary."""
+
+        renderer = self.renderers.get(provider_type)
+        commit = getattr(renderer, "commit_lifecycle_materialization", None)
+        if not callable(commit):
+            raise ValueError(
+                f"provider does not support lifecycle Home materialization commits: {provider_type}"
+            )
+        home = self.get_home(provider_type, home_id)
+        home_root = self.resolve_home_root(provider_type, home_id)
+        materialization = commit(home, home_root, lifecycle=lifecycle)
+        if materialization is None:
+            return home
+        return self._store_refreshed_materialization(
+            provider_type,
+            home_id,
+            home,
+            materialization,
+        )
+
+    def _store_refreshed_materialization(
+        self,
+        provider_type: str,
+        home_id: str,
+        home: HomeRecord,
+        materialization: object,
+    ) -> HomeRecord:
         if not isinstance(materialization, HomeMaterializationResult):
             raise TypeError(f"invalid HomeMaterializationResult from provider renderer: {provider_type}")
         if materialization.provider_type != provider_type or materialization.home_id != home_id:

@@ -26,6 +26,7 @@ from agent_runtime_kit.agent.provider_contracts import ProviderRegistry
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 
 from .fakes import FakeProvider, FakeTurnResult
+from .provider_contract_harness import make_contract_fake_bundle
 
 
 class BasicAgentType(AgentType):
@@ -38,6 +39,11 @@ class BasicAgentType(AgentType):
 class AlternateProviderAgentType(BasicAgentType):
     provider_type = "alternate"
     default_home_id = "alternate-worker"
+
+
+class ContractFakeAgentType(BasicAgentType):
+    provider_type = "contract_fake"
+    default_home_id = "contract-home"
 
 
 class OneContinueAgentType(BasicAgentType):
@@ -313,6 +319,196 @@ def test_provider_home_initialization_reseals_trusted_managed_file_changes(tmp_p
     )
     with pytest.raises(RuntimeError, match="materialized file hash mismatch"):
         service.home_service.build_execution_context("codex", "worker")
+
+
+def test_codex_new_session_start_reseals_provider_config_before_agent_turn(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    provider = CodexProvider(runtime_root=runtime_root)
+    registry = AgentTypeRegistry()
+    registry.register(BasicAgentType())
+    service = AgentService(runtime_root, agent_types=registry, providers={"codex": provider})
+    service.home_service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="worker",
+            config_overrides={"model": "gpt-before-session-start"},
+        )
+    )
+    config_path = service.home_service.resolve_home_root("codex", "worker") / ".codex" / "config.toml"
+    fake_provider = FakeProvider(runtime_root)
+    operation_order: list[str] = []
+
+    def initialize_home(**kwargs):  # noqa: ANN003, ANN202
+        marker_path = Path(kwargs["home_root"]) / ".ark" / "codex_home_initialized.json"
+        if marker_path.exists():
+            return SimpleNamespace(marker_path=marker_path)
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8") + "\n# initialization mutation\n",
+            encoding="utf-8",
+        )
+        marker_path.write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(marker_path=marker_path)
+
+    def start_thread(**kwargs):  # noqa: ANN003, ANN202
+        initialize_home(**{key: kwargs[key] for key in ("home_id", "home_root", "env", "workdir")})
+        on_thread_started = kwargs.pop("on_thread_started")
+        on_turn_started = kwargs.pop("on_turn_started")
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8") + "# first session-start mutation\n",
+            encoding="utf-8",
+        )
+        expected_thread_id = f"thread-{fake_provider.next_thread}"
+        on_thread_started(expected_thread_id)
+        service.home_service.build_execution_context("codex", "worker")
+        operation_order.append("agent_turn")
+        result = fake_provider.start_thread(**kwargs)
+        assert result.thread_id == expected_thread_id
+        on_turn_started(result.thread_id, result.turn_result.id)
+        return result
+
+    def resume_thread(**kwargs):  # noqa: ANN003, ANN202
+        initialize_home(**{key: kwargs[key] for key in ("home_id", "home_root", "env", "workdir")})
+        on_turn_started = kwargs.pop("on_turn_started")
+        result = fake_provider.resume_thread(**kwargs)
+        on_turn_started(result.thread_id, result.turn_result.id)
+        return result
+
+    provider.ensure_home_initialized = initialize_home  # type: ignore[method-assign]
+    provider.start_thread = start_thread  # type: ignore[method-assign]
+    provider.resume_thread = resume_thread  # type: ignore[method-assign]
+
+    agent = service.create_agent("repo:demo", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    first_session_manifest_hash = service.home_service.get_home(
+        "codex", "worker"
+    ).materialization_manifest_hash
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "second"}).agent_id)
+
+    context = service.home_service.build_execution_context("codex", "worker")
+    assert context.materialization_manifest is not None
+    assert context.materialization_manifest.manifest_hash == first_session_manifest_hash
+    assert operation_order == ["agent_turn"]
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "# terminal mutation\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="materialized file hash mismatch: .codex/config.toml"):
+        service.home_service.build_execution_context("codex", "worker")
+
+
+def test_codex_session_start_commit_rejects_unexpected_managed_file_changes(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = AgentService(runtime_root)
+    home = service.home_service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="worker",
+            config_overrides={"model": "gpt-before-session-start"},
+        )
+    )
+    home_root = service.home_service.resolve_home_root("codex", "worker")
+    config_path = home_root / ".codex" / "config.toml"
+    auth_path = home_root / ".codex" / "auth.json"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "# expected SDK mutation\n",
+        encoding="utf-8",
+    )
+    auth_path.write_text('{"unexpected": true}\n', encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"unexpected Codex Home materialization changes at session start: "
+        r"\.codex/auth.json, \.codex/config.toml",
+    ):
+        service.home_service.commit_provider_lifecycle_materialization(
+            "codex",
+            "worker",
+            lifecycle="session_start",
+        )
+
+    assert service.home_service.get_home(
+        "codex", "worker"
+    ).materialization_manifest_hash == home.materialization_manifest_hash
+    with pytest.raises(RuntimeError, match="materialized file hash mismatch: .codex/config.toml"):
+        service.home_service.build_execution_context("codex", "worker")
+
+
+def test_codex_session_start_commit_is_noop_without_managed_file_changes(tmp_path: Path) -> None:
+    service = AgentService(tmp_path / ".agent_runtime")
+    before = service.home_service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="worker",
+            config_overrides={"model": "gpt-without-session-start-mutation"},
+        )
+    )
+
+    committed = service.home_service.commit_provider_lifecycle_materialization(
+        "codex",
+        "worker",
+        lifecycle="session_start",
+    )
+
+    assert committed.materialization_manifest_hash == before.materialization_manifest_hash
+    assert committed.updated_at == before.updated_at
+    assert committed.warnings == before.warnings
+
+
+def test_codex_session_start_commit_does_not_cover_later_config_changes(tmp_path: Path) -> None:
+    service = AgentService(tmp_path / ".agent_runtime")
+    service.home_service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="worker",
+            config_overrides={"model": "gpt-before-session-start"},
+        )
+    )
+    config_path = service.home_service.resolve_home_root("codex", "worker") / ".codex" / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "# trusted session-start mutation\n",
+        encoding="utf-8",
+    )
+    service.home_service.commit_provider_lifecycle_materialization(
+        "codex",
+        "worker",
+        lifecycle="session_start",
+    )
+    service.home_service.build_execution_context("codex", "worker")
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "# later untrusted mutation\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="materialized file hash mismatch: .codex/config.toml"):
+        service.home_service.build_execution_context("codex", "worker")
+
+
+def test_non_codex_provider_run_does_not_receive_session_start_home_commit(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    bundle = make_contract_fake_bundle()
+    provider_registry = ProviderRegistry()
+    provider_registry.register(bundle)
+    agent_types = AgentTypeRegistry()
+    agent_types.register(ContractFakeAgentType())
+    service = AgentService(
+        runtime_root,
+        agent_types=agent_types,
+        providers={"contract_fake": object()},
+        provider_registry=provider_registry,
+    )
+    service.home_service.create_home(
+        HomeCreateSpec(cli_type="contract_fake", home_id="contract-home")
+    )
+    agent = service.create_agent("repo:demo", "worker")
+
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "work"}).agent_id)
+
+    handle = bundle.runtime.handles[0]
+    assert handle.request.session_start_home_commit is None
 
 
 def test_agent_service_prompt_direct_text_still_beats_start_template_override(tmp_path: Path) -> None:

@@ -61,6 +61,17 @@ before constructing the run execution context. This permits declared,
 one-time provider initialization changes while later unsealed changes to
 provider-managed files still fail hash validation.
 
+A new-session runtime may also declare a trusted Home commit after the native
+session exists but before its first turn starts. The Codex adapter uses this
+boundary only for an SDK rewrite of `.codex/config.toml`: it diffs every
+managed file, performs no write when nothing changed, and rejects any changed
+path outside that declaration. Resume runs never receive this commit. Changes
+made after the session-start callback, during a turn, or after terminal remain
+unsealed and fail the next execution-context validation.
+`ProviderRunRequest.session_start_home_commit` is the explicit callback for
+this boundary; a supporting runtime must invoke it at most once and before it
+starts the first turn or exposes any Agent tool execution.
+
 Adapters convert native SDK or subprocess values at their boundary. Raw native
 data may be retained in a bounded, secret-sanitized `ProviderPayload`, but it
 is not the primary application contract.

@@ -181,6 +181,8 @@ class CodexProviderRunHandle:
     def _on_thread_started(self, thread_id: str) -> None:
         with self._lock:
             if self._session is None:
+                if self.request.session_start_home_commit is not None:
+                    self.request.session_start_home_commit()
                 self._session = ProviderSessionLocator(
                     provider_type="codex",
                     session_id=thread_id,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
@@ -558,6 +559,14 @@ class AgentService:
         session_locator = (
             self._provider_session_locator(agent) if agent.thread_id is not None else None
         )
+        session_start_home_commit: Callable[[], None] | None = None
+        if agent.cli_type == "codex" and session_locator is None:
+            session_start_home_commit = (
+                lambda: self._commit_session_start_home_materialization(
+                    agent.cli_type,
+                    agent.home_id,
+                )
+            )
         request = ProviderRunRequest(
             agent_id=agent.agent_id,
             scope_id=agent.scope_id,
@@ -573,6 +582,7 @@ class AgentService:
             model_overrides=execution_context.resolved_defaults,
             metadata={"agent_created_at": agent.created_at},
             event_sink=lambda event: self._on_provider_event(agent.agent_id, event),
+            session_start_home_commit=session_start_home_commit,
             execution_context=execution_context,
         )
         active.handle_ready.clear()
@@ -606,6 +616,17 @@ class AgentService:
             standard_result,
             provider_result.session_locator.session_id,
             rollout_relpath,
+        )
+
+    def _commit_session_start_home_materialization(
+        self,
+        provider_type: str,
+        home_id: str,
+    ) -> None:
+        self.home_service.commit_provider_lifecycle_materialization(
+            provider_type,
+            home_id,
+            lifecycle="session_start",
         )
 
     def _execute_legacy_provider_turn(

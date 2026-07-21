@@ -59,6 +59,7 @@ from .protocols import (
     ProviderCompatibilityAdapter,
     ProviderContextAdapter,
     ProviderHomeRenderer,
+    ProviderLifecycleHomeRenderer,
     ProviderQueryAdapter,
     ProviderRunHandle,
     ProviderRuntimeAdapter,
