@@ -18,6 +18,11 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+openai-agents = [
+  "openai-agents==0.18.3",
+  "openai==2.46.0",
+  "httpx[socks]>=0.27,<1",
+]
 
 [project.urls]
 Homepage = "https://github.com/xukp20/agent-runtime-kit"
@@ -39,5 +44,6 @@ markers = [
   "real: tests that require external local services or real CLI/runtime configuration",
   "real_codex: tests that require Codex CLI, Codex SDK, or a usable Codex home",
   "real_codex_artifact: tests that use local real Codex JSONL artifacts under data/",
+  "real_openai_agents: tests that require OpenAI Agents SDK and a live model endpoint",
   "slow: tests that may take longer than regular unit tests",
 ]
