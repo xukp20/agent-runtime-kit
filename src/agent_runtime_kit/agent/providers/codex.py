@@ -5,13 +5,26 @@ import json
 import shutil
 import sys
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterator
+from time import monotonic, sleep
 from typing import Callable, Mapping
 
+from ..context import ProviderContextCompactionResult, ProviderContextUsage
+from ..models import (
+    AgentContextCompactionEvidenceError,
+    AgentContextCompactionRequestUnknown,
+    AgentContextCompactionTimeout,
+)
 from ..store_utils import read_json, utc_now_iso, write_json_atomic
+from .codex_context import (
+    CodexCompactBaseline,
+    capture_codex_compact_baseline,
+    inspect_codex_compact_evidence,
+    inspect_codex_rollout_context,
+)
 
 
 class CodexSdkUnavailable(RuntimeError):
@@ -317,6 +330,155 @@ class CodexProvider:
             raise RuntimeError("thread has no turns")
         return turns[-1]
 
+    def inspect_thread_context(
+        self,
+        *,
+        home_id: str,
+        home_root: Path,
+        env: Mapping[str, str],
+        thread_id: str,
+        workdir: str | None,
+        agent_id: str,
+    ) -> ProviderContextUsage:
+        del home_id, env, workdir, agent_id
+        rollout_path = self._rollout_path_for_thread(home_root=home_root, thread_id=thread_id)
+        if rollout_path is None:
+            return ProviderContextUsage(
+                session_id=thread_id,
+                total_tokens=None,
+                context_window=None,
+                observed_at=utc_now_iso(),
+                source="artifact",
+                available=False,
+                reason="rollout_missing",
+            )
+        return inspect_codex_rollout_context(rollout_path, session_id=thread_id)
+
+    def compact_thread(
+        self,
+        *,
+        home_id: str,
+        home_root: Path,
+        env: Mapping[str, str],
+        thread_id: str,
+        workdir: str | None,
+        agent_id: str,
+        timeout_s: float,
+        on_compaction_started: Callable[[dict[str, object], str | None], None] | None = None,
+    ) -> ProviderContextCompactionResult:
+        self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
+        rollout_path = self._rollout_path_for_thread(home_root=home_root, thread_id=thread_id)
+        if rollout_path is None:
+            raise AgentContextCompactionEvidenceError(f"Codex rollout is missing for agent: {agent_id}")
+        baseline = capture_codex_compact_baseline(rollout_path, session_id=thread_id)
+        self._begin_agent_run(home_id=home_id, agent_id=agent_id, thread_id=thread_id)
+        try:
+            sdk = self._sdk()
+            with self._new_codex(sdk, env=env, workdir=workdir) as codex:
+                thread = codex.thread_resume(
+                    thread_id,
+                    cwd=workdir,
+                    model=self.model,
+                    config=self.thread_config or None,
+                )
+                status = _codex_thread_status_type(thread.read(include_turns=False))
+                if status != "idle":
+                    raise AgentContextCompactionEvidenceError(
+                        f"Codex thread is not idle before compaction: {thread_id} ({status or 'unknown'})"
+                    )
+                started_at = utc_now_iso()
+                try:
+                    response = thread.compact()
+                except BaseException as exc:
+                    raise AgentContextCompactionRequestUnknown(
+                        f"Codex compaction request terminal state is unknown: {agent_id}"
+                    ) from exc
+                operation_id = _optional_operation_id(response)
+                if on_compaction_started is not None:
+                    on_compaction_started(baseline.to_dict(), operation_id)
+                deadline = monotonic() + timeout_s
+                while True:
+                    try:
+                        evidence = inspect_codex_compact_evidence(
+                            rollout_path,
+                            session_id=thread_id,
+                            baseline=baseline,
+                        )
+                    except ValueError as exc:
+                        raise AgentContextCompactionEvidenceError(str(exc)) from exc
+                    if evidence.complete:
+                        status = _codex_thread_status_type(thread.read(include_turns=False))
+                        if status == "systemError":
+                            raise AgentContextCompactionEvidenceError(
+                                f"Codex thread entered systemError after compaction: {thread_id}"
+                            )
+                        if status == "idle":
+                            return ProviderContextCompactionResult(
+                                session_id=thread_id,
+                                usage_after=evidence.usage,
+                                started_at=started_at,
+                                completed_at=utc_now_iso(),
+                                provider_operation_id=operation_id,
+                            )
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise AgentContextCompactionTimeout(
+                            f"Codex compaction did not reach a confirmed idle terminal state: {agent_id}"
+                        )
+                    sleep(min(0.1, remaining))
+        finally:
+            self._finish_agent_run(agent_id)
+
+    def reconcile_thread_compaction(
+        self,
+        *,
+        home_id: str,
+        home_root: Path,
+        env: Mapping[str, str],
+        thread_id: str,
+        workdir: str | None,
+        agent_id: str,
+        baseline: dict[str, object],
+        provider_operation_id: str | None,
+    ) -> ProviderContextCompactionResult | None:
+        del provider_operation_id
+        rollout_path = self._rollout_path_for_thread(home_root=home_root, thread_id=thread_id)
+        if rollout_path is None:
+            return None
+        try:
+            parsed_baseline = CodexCompactBaseline.from_dict(baseline)
+            evidence = inspect_codex_compact_evidence(
+                rollout_path,
+                session_id=thread_id,
+                baseline=parsed_baseline,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AgentContextCompactionEvidenceError(str(exc)) from exc
+        if not evidence.complete:
+            return None
+        self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
+        self._begin_agent_run(home_id=home_id, agent_id=agent_id, thread_id=thread_id)
+        try:
+            sdk = self._sdk()
+            with self._new_codex(sdk, env=env, workdir=workdir) as codex:
+                thread = codex.thread_resume(
+                    thread_id,
+                    cwd=workdir,
+                    model=self.model,
+                    config=self.thread_config or None,
+                )
+                if _codex_thread_status_type(thread.read(include_turns=False)) != "idle":
+                    return None
+        finally:
+            self._finish_agent_run(agent_id)
+        now = utc_now_iso()
+        return ProviderContextCompactionResult(
+            session_id=thread_id,
+            usage_after=evidence.usage,
+            started_at=now,
+            completed_at=now,
+        )
+
     def interrupt_agent(self, agent_id: str) -> bool:
         return agent_id in self._agent_runs and False
 
@@ -535,11 +697,26 @@ class CodexProvider:
             return None
         return resolved_home_root / ".codex" / str(rollout_relpath)
 
+    def _rollout_path_for_thread(self, *, home_root: Path, thread_id: str) -> Path | None:
+        rollout_relpath = _find_rollout_relpath(
+            Path(home_root) / ".codex",
+            thread_id,
+            allow_fallback=False,
+        )
+        if rollout_relpath is None:
+            return None
+        return Path(home_root) / ".codex" / rollout_relpath
+
     def find_rollout_relpath(self, *, home_root: Path, thread_id: str) -> str | None:
         return _find_rollout_relpath(Path(home_root) / ".codex", thread_id)
 
 
-def _find_rollout_relpath(codex_home: Path, thread_id: str) -> str | None:
+def _find_rollout_relpath(
+    codex_home: Path,
+    thread_id: str,
+    *,
+    allow_fallback: bool = True,
+) -> str | None:
     sessions_root = codex_home / "sessions"
     if not sessions_root.exists():
         return None
@@ -551,7 +728,25 @@ def _find_rollout_relpath(codex_home: Path, thread_id: str) -> str | None:
     for path in candidates:
         if _file_contains(path, needle):
             return str(path.relative_to(codex_home))
-    return str(candidates[0].relative_to(codex_home)) if candidates else None
+    if allow_fallback and candidates:
+        return str(candidates[0].relative_to(codex_home))
+    return None
+
+
+def _codex_thread_status_type(response: object) -> str | None:
+    thread = getattr(response, "thread", response)
+    status = getattr(thread, "status", None)
+    root = getattr(status, "root", status)
+    value = getattr(root, "type", None)
+    return value if isinstance(value, str) else None
+
+
+def _optional_operation_id(response: object) -> str | None:
+    for name in ("operation_id", "operationId", "id"):
+        value = getattr(response, name, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _file_contains(path: Path, needle: str) -> bool:

@@ -1,7 +1,18 @@
 import json
+import threading
 from pathlib import Path
 
+import pytest
+
+from agent_runtime_kit.agent.context import (
+    AgentContextMaintenanceJournal,
+    AgentContextMaintenanceJournalStatus,
+)
 from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.models import (
+    AgentAlreadyRunningError,
+    AgentContextMaintenanceBlocked,
+)
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
@@ -99,6 +110,53 @@ def test_scope_restore_replaces_scope_and_rollout_from_snapshot(tmp_path: Path) 
     assert events[-1]["prompt"] == "Start first."
     assert json.loads(report_path.read_text(encoding="utf-8"))["rollout"]["agent_id"] == agent.agent_id
     assert service.get_agent(agent.agent_id).scope_id == "scope-a"
+
+
+def test_scope_snapshot_restores_unresolved_context_maintenance_fail_closed(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope-a", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    restored_agent = service.get_agent(agent.agent_id)
+    service.store.write_context_maintenance(
+        agent.agent_id,
+        AgentContextMaintenanceJournal(
+            agent_id=agent.agent_id,
+            provider_type="codex",
+            session_id=restored_agent.thread_id,
+            status=AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL,
+            trigger="manual",
+            prepared_at="2026-07-21T00:00:00Z",
+            started_at="2026-07-21T00:00:01Z",
+            baseline={"offset": 12},
+            error_type="TimeoutError",
+        ),
+    )
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+    snapshot = snapshot_service.create_scope_snapshot("scope-a")
+    assert snapshot.snapshot_id is not None
+    service.store.write_context_maintenance(
+        agent.agent_id,
+        AgentContextMaintenanceJournal(
+            agent_id=agent.agent_id,
+            provider_type="codex",
+            session_id=restored_agent.thread_id,
+            status=AgentContextMaintenanceJournalStatus.CONFIRMED,
+            trigger="manual",
+            prepared_at="2026-07-21T00:00:00Z",
+            completed_at="2026-07-21T00:00:02Z",
+        ),
+    )
+
+    restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    journal = service.store.read_context_maintenance(agent.agent_id)
+    assert journal is not None
+    assert journal.status is AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL
+    with pytest.raises(AgentContextMaintenanceBlocked):
+        service.start_agent(agent.agent_id, variables={"item": "blocked"})
 
 
 def test_scope_restore_without_reports_removes_stale_live_reports(tmp_path: Path) -> None:
@@ -395,6 +453,41 @@ def test_scope_snapshot_blocks_when_scope_has_running_agent(tmp_path: Path) -> N
 
     assert result.status == "blocked"
     assert result.running_agent_ids == (agent.agent_id,)
+
+
+def test_manual_compaction_reservation_blocks_snapshot_and_new_turn(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service = _make_service(runtime_root)
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope-a", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    provider = service.providers["codex"]
+    assert isinstance(provider, FakeProvider)
+    provider.compact_started_event = threading.Event()
+    provider.compact_release_event = threading.Event()
+    errors: list[BaseException] = []
+
+    def compact() -> None:
+        try:
+            service.compact_agent(agent.agent_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=compact)
+    worker.start()
+    assert provider.compact_started_event.wait(timeout=5)
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+
+    snapshot = snapshot_service.create_scope_snapshot("scope-a", wait=False)
+
+    assert snapshot.status == "blocked"
+    assert snapshot.running_agent_ids == (agent.agent_id,)
+    with pytest.raises(AgentAlreadyRunningError):
+        service.start_agent(agent.agent_id, variables={"item": "concurrent"})
+    provider.compact_release_event.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert errors == []
 
 
 def _make_service(runtime_root: Path) -> AgentService:

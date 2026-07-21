@@ -14,6 +14,7 @@ from .models import (
     agent_from_dict,
     to_jsonable,
 )
+from .context import AgentContextMaintenanceJournal
 from .store_utils import encode_scope_id, read_json, utc_now_iso, write_json_atomic
 from .trace import (
     AgentRolloutInfo,
@@ -179,6 +180,38 @@ class AgentStoreService:
         if path is None or not path.exists():
             raise KeyError(f"unknown agent: {agent_id}")
         return path
+
+    def resolve_context_maintenance_path(self, agent_id: str) -> Path:
+        return self.resolve_agent_path(agent_id).parent / "context_maintenance.json"
+
+    def read_context_maintenance(self, agent_id: str) -> AgentContextMaintenanceJournal | None:
+        path = self.resolve_context_maintenance_path(agent_id)
+        if not path.exists():
+            return None
+        journal = AgentContextMaintenanceJournal.from_dict(read_json(path))
+        if journal.agent_id != agent_id:
+            raise ValueError(
+                f"context maintenance journal agent mismatch: expected {agent_id}, got {journal.agent_id}"
+            )
+        return journal
+
+    def write_context_maintenance(
+        self,
+        agent_id: str,
+        journal: AgentContextMaintenanceJournal,
+    ) -> Path:
+        if journal.agent_id != agent_id:
+            raise ValueError(
+                f"context maintenance journal agent mismatch: expected {agent_id}, got {journal.agent_id}"
+            )
+        path = self.resolve_context_maintenance_path(agent_id)
+        write_json_atomic(path, journal.to_dict())
+        return path
+
+    def clear_context_maintenance(self, agent_id: str) -> None:
+        path = self.resolve_context_maintenance_path(agent_id)
+        if path.exists():
+            path.unlink()
 
     def locate_rollout(self, agent_id: str) -> Path | None:
         agent = self.get_agent(agent_id)

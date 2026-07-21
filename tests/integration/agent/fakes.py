@@ -6,6 +6,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_runtime_kit.agent.context import (
+    ProviderContextCompactionResult,
+    ProviderContextUsage,
+)
+from agent_runtime_kit.agent.store_utils import utc_now_iso
+
 
 @dataclass
 class FakeTurnResult:
@@ -49,6 +55,29 @@ class FakeProvider:
         self.active_by_home: dict[str, set[str]] = {}
         self.max_active_by_home: dict[str, int] = {}
         self.run_delay_s = run_delay_s
+        self.operation_order: list[str] = []
+        self.compact_calls: list[dict[str, object]] = []
+        self.context_usage = ProviderContextUsage(
+            session_id=None,
+            total_tokens=90,
+            context_window=100,
+            observed_at=utc_now_iso(),
+            source="provider_api",
+            available=True,
+        )
+        self.compact_usage_after = ProviderContextUsage(
+            session_id=None,
+            total_tokens=20,
+            context_window=100,
+            observed_at=utc_now_iso(),
+            source="provider_api",
+            available=True,
+        )
+        self.compact_error_before_start: BaseException | None = None
+        self.compact_error_after_start: BaseException | None = None
+        self.compact_started_event: threading.Event | None = None
+        self.compact_release_event: threading.Event | None = None
+        self.reconcile_confirmed = True
         self._lock = threading.RLock()
 
     def start_thread(
@@ -169,6 +198,100 @@ class FakeProvider:
         self.interrupt_calls.append(agent_id)
         return False
 
+    def inspect_thread_context(
+        self,
+        *,
+        home_id: str,
+        home_root: Path,
+        env: dict[str, str],
+        thread_id: str,
+        workdir: str | None,
+        agent_id: str,
+    ) -> ProviderContextUsage:
+        del home_id, home_root, env, workdir, agent_id
+        usage = self.context_usage
+        return ProviderContextUsage(
+            session_id=thread_id,
+            total_tokens=usage.total_tokens,
+            context_window=usage.context_window,
+            observed_at=usage.observed_at,
+            source=usage.source,
+            available=usage.available,
+            reason=usage.reason,
+        )
+
+    def compact_thread(
+        self,
+        *,
+        home_id: str,
+        home_root: Path,
+        env: dict[str, str],
+        thread_id: str,
+        workdir: str | None,
+        agent_id: str,
+        timeout_s: float,
+        on_compaction_started,
+    ) -> ProviderContextCompactionResult:
+        if self.compact_error_before_start is not None:
+            raise self.compact_error_before_start
+        call = {
+            "home_id": home_id,
+            "home_root": str(home_root),
+            "env": dict(env),
+            "thread_id": thread_id,
+            "workdir": workdir,
+            "agent_id": agent_id,
+            "timeout_s": timeout_s,
+        }
+        self.compact_calls.append(call)
+        self.operation_order.append("compact")
+        on_compaction_started({"offset": 12}, "fake-operation")
+        if self.compact_started_event is not None:
+            self.compact_started_event.set()
+        if self.compact_release_event is not None:
+            assert self.compact_release_event.wait(timeout=5)
+        if self.compact_error_after_start is not None:
+            raise self.compact_error_after_start
+        usage = self.compact_usage_after
+        return ProviderContextCompactionResult(
+            session_id=thread_id,
+            usage_after=ProviderContextUsage(
+                session_id=thread_id,
+                total_tokens=usage.total_tokens,
+                context_window=usage.context_window,
+                observed_at=usage.observed_at,
+                source=usage.source,
+                available=usage.available,
+                reason=usage.reason,
+            ),
+            started_at=utc_now_iso(),
+            completed_at=utc_now_iso(),
+            provider_operation_id="fake-operation",
+        )
+
+    def reconcile_thread_compaction(
+        self,
+        *,
+        home_id: str,
+        home_root: Path,
+        env: dict[str, str],
+        thread_id: str,
+        workdir: str | None,
+        agent_id: str,
+        baseline: dict[str, object],
+        provider_operation_id: str | None,
+    ) -> ProviderContextCompactionResult | None:
+        del home_id, home_root, env, workdir, agent_id, baseline, provider_operation_id
+        if not self.reconcile_confirmed:
+            return None
+        return ProviderContextCompactionResult(
+            session_id=thread_id,
+            usage_after=self.compact_usage_after,
+            started_at=utc_now_iso(),
+            completed_at=utc_now_iso(),
+            provider_operation_id="fake-operation",
+        )
+
     def ensure_home_initialized(
         self,
         *,
@@ -211,6 +334,7 @@ class FakeProvider:
         developer_instructions: str | None,
         overwrite_developer_instructions: bool,
     ) -> FakeRunResult:
+        self.operation_order.append("turn")
         if self.run_delay_s:
             time.sleep(self.run_delay_s)
         with self._lock:

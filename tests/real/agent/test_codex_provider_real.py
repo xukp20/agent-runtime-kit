@@ -8,6 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from agent_runtime_kit.agent.context import (
+    AgentContextCompactionStatus,
+    AgentContextMaintenanceJournalStatus,
+)
 from agent_runtime_kit.agent.homes import HomeCreateSpec
 from agent_runtime_kit.agent.models import AgentPausedError, CompletionDecision
 from agent_runtime_kit.agent.providers.codex import CodexProvider
@@ -166,6 +170,49 @@ def test_real_codex_multi_scope_snapshot_flow(tmp_path: Path) -> None:
         assert service.get_agent(child_agent.agent_id).status == "idle"
         assert snapshot_service.list_scope_snapshots()
         assert snapshot_service.list_runtime_snapshots()
+    finally:
+        service.close()
+
+
+def test_real_codex_context_compact_resume_and_snapshot_restore(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "project" / ".agent_runtime"
+    service = _service(runtime_root)
+    try:
+        _create_codex_home(service, "node_worker")
+        agent = service.create_agent("repo-a:node-compact", "node_worker")
+        service.wait_agent(
+            service.start_agent(agent.agent_id, variables={"token": "ARK_COMPACT_BEFORE"}).agent_id,
+            timeout_s=600,
+        )
+
+        before = service.inspect_agent_context(agent.agent_id)
+        assert before.available
+        assert before.total_tokens is not None
+        compacted = service.compact_agent(agent.agent_id, timeout_s=600)
+        assert compacted.status is AgentContextCompactionStatus.COMPACTED
+        assert compacted.usage_after is not None
+        journal = service.store.read_context_maintenance(agent.agent_id)
+        assert journal is not None
+        assert journal.status is AgentContextMaintenanceJournalStatus.CONFIRMED
+
+        snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+        snapshot = snapshot_service.create_scope_snapshot(agent.scope_id)
+        assert snapshot.status == "created"
+        assert snapshot.snapshot_id is not None
+
+        service.wait_agent(
+            service.start_agent(agent.agent_id, variables={"token": "ARK_COMPACT_AFTER"}).agent_id,
+            timeout_s=600,
+        )
+        restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id, leave_paused=False)
+        assert restored.status == "created"
+        restored_journal = service.store.read_context_maintenance(agent.agent_id)
+        assert restored_journal is not None
+        assert restored_journal.status is AgentContextMaintenanceJournalStatus.CONFIRMED
+        service.wait_agent(
+            service.start_agent(agent.agent_id, variables={"token": "ARK_COMPACT_RESTORED"}).agent_id,
+            timeout_s=600,
+        )
     finally:
         service.close()
 

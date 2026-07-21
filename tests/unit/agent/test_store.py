@@ -1,5 +1,9 @@
 from pathlib import Path
 
+from agent_runtime_kit.agent.context import (
+    AgentContextMaintenanceJournal,
+    AgentContextMaintenanceJournalStatus,
+)
 from agent_runtime_kit.agent.models import CompletionDecision, AgentCompletionRecord
 from agent_runtime_kit.agent.store import AgentStoreService
 from agent_runtime_kit.agent.store_utils import encode_scope_id
@@ -15,6 +19,27 @@ def test_store_creates_agent_json_and_indexes(tmp_path: Path) -> None:
     assert store.get_agent(agent.agent_id).scope_id == "repo:node/a"
     assert [item.agent_id for item in store.list_agents(scope_id="repo:node/a")] == [agent.agent_id]
     assert [item.agent_id for item in store.list_agents()] == [agent.agent_id]
+
+
+def test_store_round_trips_context_maintenance_journal(tmp_path: Path) -> None:
+    store = AgentStoreService(tmp_path / ".agent_runtime")
+    agent = store.create_agent_record(scope_id="repo:node/a", agent_type="node_worker")
+    journal = AgentContextMaintenanceJournal(
+        agent_id=agent.agent_id,
+        provider_type="codex",
+        session_id=None,
+        status=AgentContextMaintenanceJournalStatus.PREPARED,
+        trigger="manual",
+        prepared_at="2026-07-21T00:00:00Z",
+    )
+
+    path = store.write_context_maintenance(agent.agent_id, journal)
+
+    assert path == store.resolve_agent_path(agent.agent_id).parent / "context_maintenance.json"
+    assert store.read_context_maintenance(agent.agent_id) == journal
+
+    store.clear_context_maintenance(agent.agent_id)
+    assert store.read_context_maintenance(agent.agent_id) is None
 
 
 def test_store_persists_completion_record(tmp_path: Path) -> None:

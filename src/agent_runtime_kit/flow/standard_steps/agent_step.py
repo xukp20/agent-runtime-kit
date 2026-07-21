@@ -4,6 +4,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
+from agent_runtime_kit.agent.context import AgentContextMaintenancePolicy
 from agent_runtime_kit.flow.contexts import StepRunContext
 from agent_runtime_kit.flow.models import (
     BaseStep,
@@ -155,6 +156,14 @@ class AgentStep(BaseStep):
             return latest.build_callback_prompt(ctx, agent_id)
         return state.prompt_override
 
+    def prepare_agent_context_before_first_turn(
+        self,
+        ctx: StepRunContext,
+        agent_id: str,
+    ) -> AgentContextMaintenancePolicy | None:
+        del ctx, agent_id
+        return None
+
     def build_callback_prompt(self, ctx: StepRunContext, agent_id: str) -> str:
         latest = self._latest_agent_step(ctx)
         state = self._agent_step_state(latest)
@@ -284,6 +293,8 @@ class AgentStep(BaseStep):
     def run(self, ctx: StepRunContext) -> StepTerminalReceipt:
         agent_id = self.prepare_agent(ctx)
         prompt = self.build_start_prompt(ctx, agent_id)
+        latest = self._latest_agent_step(ctx)
+        context_maintenance_policy = latest.prepare_agent_context_before_first_turn(ctx, agent_id)
         turn_result: object | None = None
         auto_continue_count = 0
 
@@ -294,14 +305,16 @@ class AgentStep(BaseStep):
             workdir = latest.resolve_workdir(ctx, agent_id)
             developer_instructions_override = latest.build_developer_instructions_override(ctx, agent_id)
             agent_service = self._agent_service(ctx)
-            agent_service.start_agent(
-                agent_id,
-                variables=state.variables,
-                prompt=prompt,
-                developer_instructions_template_override=developer_instructions_override,
-                env=env,
-                workdir=workdir,
-            )
+            start_kwargs = {
+                "variables": state.variables,
+                "prompt": prompt,
+                "developer_instructions_template_override": developer_instructions_override,
+                "env": env,
+                "workdir": workdir,
+            }
+            if auto_continue_count == 0 and context_maintenance_policy is not None:
+                start_kwargs["context_maintenance_policy"] = context_maintenance_policy
+            agent_service.start_agent(agent_id, **start_kwargs)
             if state.agent_wait_timeout_s is None:
                 turn_result = agent_service.wait_agent(agent_id)
             else:

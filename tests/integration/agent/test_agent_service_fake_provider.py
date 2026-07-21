@@ -3,8 +3,21 @@ from time import monotonic
 
 import pytest
 
+from agent_runtime_kit.agent.context import (
+    AgentContextCompactionStatus,
+    AgentContextMaintenanceJournalStatus,
+    AgentContextMaintenancePolicy,
+    ProviderContextUsage,
+)
 from agent_runtime_kit.agent.homes import HomeCreateSpec
-from agent_runtime_kit.agent.models import AgentIncompleteError, AgentPausedError, CompletionDecision
+from agent_runtime_kit.agent.models import (
+    AgentContextMaintenanceBlocked,
+    AgentContextMaintenanceUnsupported,
+    AgentContextCompactionRequestUnknown,
+    AgentIncompleteError,
+    AgentPausedError,
+    CompletionDecision,
+)
 from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy, TraceReportPersistence
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 
@@ -394,6 +407,189 @@ def test_agent_service_interrupt_and_close_delegate_to_provider(tmp_path: Path) 
     assert provider.interrupt_calls == [agent.agent_id]
     service.close()
     assert provider.close_calls == 1
+
+
+def test_context_compaction_skips_new_agent_without_session(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+
+    result = service.compact_agent_if_needed(agent.agent_id)
+
+    assert result.status is AgentContextCompactionStatus.SKIPPED
+    assert result.reason == "no_session"
+    assert provider.compact_calls == []
+
+
+def test_start_agent_preflight_skips_new_agent_and_starts_first_turn(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+
+    result = service.wait_agent(
+        service.start_agent(
+            agent.agent_id,
+            variables={"item": "first"},
+            context_maintenance_policy=AgentContextMaintenancePolicy(threshold=0.8),
+        ).agent_id
+    )
+
+    assert result.prompt == "Start first."
+    assert provider.compact_calls == []
+
+
+def test_context_compaction_skips_below_threshold(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    provider.context_usage = ProviderContextUsage(
+        session_id=None,
+        total_tokens=70,
+        context_window=100,
+        observed_at="2026-07-21T00:00:00Z",
+        source="provider_api",
+        available=True,
+    )
+
+    result = service.compact_agent_if_needed(agent.agent_id, threshold=0.8)
+
+    assert result.status is AgentContextCompactionStatus.SKIPPED
+    assert result.reason == "below_threshold"
+    assert provider.compact_calls == []
+
+
+def test_context_compaction_runs_and_confirms_journal(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+
+    result = service.compact_agent_if_needed(agent.agent_id, threshold=0.8)
+
+    assert result.status is AgentContextCompactionStatus.COMPACTED
+    assert result.usage_before.usage_ratio == 0.9
+    assert result.usage_after is not None
+    assert result.usage_after.usage_ratio == 0.2
+    journal = service.store.read_context_maintenance(agent.agent_id)
+    assert journal is not None
+    assert journal.status is AgentContextMaintenanceJournalStatus.CONFIRMED
+    assert service.get_agent(agent.agent_id).status == "idle"
+
+
+def test_start_agent_preflight_compacts_before_first_turn_only(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, OneContinueAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "initial"}).agent_id)
+    provider.operation_order.clear()
+
+    service.start_agent(
+        agent.agent_id,
+        variables={"item": "next"},
+        context_maintenance_policy=AgentContextMaintenancePolicy(threshold=0.8),
+    )
+    service.wait_agent(agent.agent_id)
+
+    assert provider.operation_order == ["compact", "turn", "turn"]
+    assert len(provider.compact_calls) == 1
+
+
+def test_compaction_failure_after_start_blocks_future_turns(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    provider.compact_error_after_start = TimeoutError("compact timeout")
+
+    with pytest.raises(TimeoutError, match="compact timeout"):
+        service.compact_agent(agent.agent_id)
+
+    journal = service.store.read_context_maintenance(agent.agent_id)
+    assert journal is not None
+    assert journal.status is AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL
+    with pytest.raises(AgentContextMaintenanceBlocked):
+        service.start_agent(agent.agent_id, variables={"item": "blocked"})
+
+    provider.compact_error_after_start = None
+    reconciled = service.reconcile_agent_context_maintenance(agent.agent_id)
+    assert reconciled is not None
+    assert reconciled.status is AgentContextMaintenanceJournalStatus.CONFIRMED
+    assert service.wait_agent(
+        service.start_agent(agent.agent_id, variables={"item": "after reconcile"}).agent_id
+    ).prompt == "Start after reconcile."
+
+
+def test_unconfirmed_reconciliation_remains_fail_closed(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    provider.compact_error_after_start = TimeoutError("compact timeout")
+    with pytest.raises(TimeoutError):
+        service.compact_agent(agent.agent_id)
+    provider.compact_error_after_start = None
+    provider.reconcile_confirmed = False
+
+    with pytest.raises(AgentContextMaintenanceBlocked, match="has not confirmed"):
+        service.reconcile_agent_context_maintenance(agent.agent_id)
+
+    journal = service.store.read_context_maintenance(agent.agent_id)
+    assert journal is not None and journal.unresolved
+
+
+def test_compaction_failure_before_request_clears_journal(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    provider.compact_error_before_start = RuntimeError("request rejected")
+
+    with pytest.raises(RuntimeError, match="request rejected"):
+        service.compact_agent(agent.agent_id)
+
+    assert service.store.read_context_maintenance(agent.agent_id) is None
+    provider.compact_error_before_start = None
+    assert service.wait_agent(
+        service.start_agent(agent.agent_id, variables={"item": "retry"}).agent_id
+    ).prompt == "Start retry."
+
+
+def test_ambiguous_request_failure_before_callback_remains_fail_closed(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    service, provider = _make_service(runtime_root, BasicAgentType())
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope", "worker")
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    provider.compact_error_before_start = AgentContextCompactionRequestUnknown("ambiguous")
+
+    with pytest.raises(AgentContextCompactionRequestUnknown):
+        service.compact_agent(agent.agent_id)
+
+    journal = service.store.read_context_maintenance(agent.agent_id)
+    assert journal is not None
+    assert journal.status is AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL
+
+
+def test_forced_compaction_rejects_provider_without_capability(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    registry = AgentTypeRegistry()
+    registry.register(BasicAgentType())
+    service = AgentService(runtime_root, agent_types=registry, providers={"future": object()})
+    service.home_service.create_home(HomeCreateSpec(cli_type="future", home_id="worker"))
+    agent = service.create_agent("scope", "worker", cli_type="future")
+    service.store.update_thread_locator(agent.agent_id, thread_id="session-1", rollout_relpath=None)
+
+    with pytest.raises(AgentContextMaintenanceUnsupported):
+        service.compact_agent(agent.agent_id)
 
 
 def _make_service(

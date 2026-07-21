@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.models import AgentContextCompactionEvidenceError
 from agent_runtime_kit.agent.providers.codex import CodexProvider
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 
@@ -58,6 +62,8 @@ class FakeCodex:
 class FakeHighLevelThread:
     run_started: threading.Event | None = None
     run_release: threading.Event | None = None
+    compact_callback = None
+    status_type = "idle"
 
     def __init__(self, thread_id: str) -> None:
         self.id = thread_id
@@ -71,7 +77,19 @@ class FakeHighLevelThread:
 
     def read(self, include_turns: bool = True):
         turns = [SimpleNamespace(id="turn-read", status="completed", items=[])] if include_turns else []
-        return SimpleNamespace(thread=SimpleNamespace(id=self.id, turns=turns))
+        return SimpleNamespace(
+            thread=SimpleNamespace(
+                id=self.id,
+                turns=turns,
+                status=SimpleNamespace(root=SimpleNamespace(type=self.status_type)),
+            )
+        )
+
+    def compact(self):
+        callback = type(self).compact_callback
+        if callback is not None:
+            callback()
+        return SimpleNamespace()
 
 
 class FakeClient:
@@ -328,6 +346,59 @@ def test_codex_provider_resume_without_instruction_overwrite_uses_default_resume
     assert client.turn_start_calls == []
 
 
+def test_codex_provider_compact_waits_for_rollout_evidence_and_idle(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    provider = _provider()
+    home_root = tmp_path / "home"
+    rollout = home_root / ".codex" / "sessions" / "rollout-thread-existing.jsonl"
+    _append_rollout(rollout, _token_count(total_tokens=80))
+
+    def compact() -> None:
+        _append_rollout(rollout, {"type": "compacted", "payload": {"message": "summary"}})
+        _append_rollout(rollout, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+        _append_rollout(rollout, _token_count(total_tokens=20))
+
+    FakeHighLevelThread.compact_callback = compact
+    started: list[tuple[dict[str, object], str | None]] = []
+
+    result = provider.compact_thread(
+        home_id="worker",
+        home_root=home_root,
+        env={"CODEX_HOME": str(home_root / ".codex")},
+        thread_id="thread-existing",
+        workdir=str(tmp_path),
+        agent_id="agent-a",
+        timeout_s=1,
+        on_compaction_started=lambda baseline, operation_id: started.append((baseline, operation_id)),
+    )
+
+    assert result.usage_after is not None
+    assert result.usage_after.total_tokens == 20
+    assert len(started) == 1
+    assert started[0][0]["token_count_count"] == 1
+    assert provider.list_active_agents() == []
+
+
+def test_codex_provider_compact_rejects_non_idle_thread(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    provider = _provider()
+    home_root = tmp_path / "home"
+    rollout = home_root / ".codex" / "sessions" / "rollout-thread-existing.jsonl"
+    _append_rollout(rollout, _token_count(total_tokens=80))
+    FakeHighLevelThread.status_type = "active"
+
+    with pytest.raises(AgentContextCompactionEvidenceError, match="not idle"):
+        provider.compact_thread(
+            home_id="worker",
+            home_root=home_root,
+            env={"CODEX_HOME": str(home_root / ".codex")},
+            thread_id="thread-existing",
+            workdir=str(tmp_path),
+            agent_id="agent-a",
+            timeout_s=1,
+        )
+
+
 def _provider() -> CodexProvider:
     provider = CodexProvider()
     provider._sdk = lambda: FakeSdk  # type: ignore[method-assign]
@@ -340,3 +411,24 @@ def _reset_fake_codex() -> None:
     FakeCodex.account_delay_s = 0.0
     FakeHighLevelThread.run_started = None
     FakeHighLevelThread.run_release = None
+    FakeHighLevelThread.compact_callback = None
+    FakeHighLevelThread.status_type = "idle"
+
+
+def _append_rollout(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+
+
+def _token_count(*, total_tokens: int) -> dict[str, object]:
+    return {
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {"total_tokens": total_tokens},
+                "model_context_window": 100,
+            },
+        },
+    }

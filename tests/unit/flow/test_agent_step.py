@@ -5,6 +5,7 @@ from typing import ClassVar
 import pytest
 from pydantic import BaseModel
 
+from agent_runtime_kit.agent.context import AgentContextMaintenancePolicy
 from agent_runtime_kit.agent.models import Agent
 from agent_runtime_kit.flow import (
     BaseFlow,
@@ -96,6 +97,7 @@ class FakeAgentService:
         developer_instructions_template_override: str | None = None,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
+        context_maintenance_policy: AgentContextMaintenancePolicy | None = None,
     ) -> Agent:
         call = {
             "agent_id": agent_id,
@@ -104,6 +106,7 @@ class FakeAgentService:
             "developer_instructions_template_override": developer_instructions_template_override,
             "env": env or {},
             "workdir": workdir,
+            "context_maintenance_policy": context_maintenance_policy,
         }
         self.start_calls.append(call)
         if self.submit_on_start:
@@ -412,6 +415,20 @@ class InstructionOverrideAgentStep(AgentStep):
         return "Controlled instructions for {{goal}}."
 
 
+class ContextMaintenanceAgentStep(AgentStep):
+    step_type: ClassVar[str] = "context_maintenance_agent_step"
+    prepare_calls: ClassVar[int] = 0
+
+    def prepare_agent_context_before_first_turn(
+        self,
+        ctx: StepRunContext,
+        agent_id: str,
+    ) -> AgentContextMaintenancePolicy | None:
+        del ctx, agent_id
+        type(self).prepare_calls += 1
+        return AgentContextMaintenancePolicy(threshold=0.75, timeout_s=15)
+
+
 def test_agent_step_passes_developer_instruction_override_to_agent_service(tmp_path: Path) -> None:
     flow_service, step_service, agent_service = make_services(tmp_path / ".agent_runtime", submit_on_start=True)
     step_service.step_registry.register(InstructionOverrideAgentStep)
@@ -434,6 +451,36 @@ def test_agent_step_passes_developer_instruction_override_to_agent_service(tmp_p
 
     assert latest.status is StepStatus.COMPLETED
     assert agent_service.start_calls[0]["developer_instructions_template_override"] == "Controlled instructions for {{goal}}."
+
+
+def test_agent_step_passes_context_maintenance_only_to_first_start(tmp_path: Path) -> None:
+    ContextMaintenanceAgentStep.prepare_calls = 0
+    flow_service, step_service, agent_service = make_services(tmp_path / ".agent_runtime")
+    step_service.step_registry.register(ContextMaintenanceAgentStep)
+    flow_id = create_flow(flow_service)
+    step = ContextMaintenanceAgentStep(
+        step_id="agent-step",
+        flow_id=flow_id,
+        scope_id="scope",
+        state=AgentStepState(
+            agent_role="worker",
+            agent_type="worker_type",
+            create_agent_if_missing=True,
+            max_auto_continue_turns=1,
+        ),
+    )
+    step_id = attach_agent_step(flow_service, flow_id, step)
+
+    step_service.run_step(step_id)
+    latest = step_service.wait_step(step_id)
+
+    assert latest.status is StepStatus.COMPLETED
+    assert ContextMaintenanceAgentStep.prepare_calls == 1
+    assert agent_service.start_calls[0]["context_maintenance_policy"] == AgentContextMaintenancePolicy(
+        threshold=0.75,
+        timeout_s=15,
+    )
+    assert agent_service.start_calls[1]["context_maintenance_policy"] is None
 
 
 def test_run_passes_agent_wait_timeout_to_agent_service(tmp_path: Path) -> None:

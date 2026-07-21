@@ -14,6 +14,16 @@ from agent_runtime_kit.runtime import (
     RuntimePauseController,
 )
 
+from .context import (
+    AgentContextCompactionResult,
+    AgentContextCompactionStatus,
+    AgentContextMaintenanceJournal,
+    AgentContextMaintenanceJournalStatus,
+    AgentContextMaintenancePolicy,
+    AgentContextUsage,
+    ProviderContextCompactionResult,
+    ProviderContextUsage,
+)
 from .homes import HomeCreateSpec, HomeRecord, HomeService, build_provider_env
 from .models import (
     Agent,
@@ -21,6 +31,9 @@ from .models import (
     AgentClosedError,
     AgentCompletionCheckError,
     AgentCompletionRecord,
+    AgentContextCompactionRequestUnknown,
+    AgentContextMaintenanceBlocked,
+    AgentContextMaintenanceUnsupported,
     AgentHasNoCompletedTurn,
     AgentIncompleteError,
     AgentPausedError,
@@ -252,6 +265,7 @@ class AgentService:
         continue_prompt_template_override: str | None = None,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
+        context_maintenance_policy: AgentContextMaintenancePolicy | None = None,
     ) -> Agent:
         variables = dict(variables or {})
         with self._lock:
@@ -260,6 +274,7 @@ class AgentService:
                 raise AgentClosedError(agent_id)
             if agent.status == "running" or agent_id in self._active:
                 raise AgentAlreadyRunningError(agent_id)
+            self._assert_context_maintenance_resolved(agent_id)
             self._assert_agent_can_start(agent.scope_id)
             agent_type = self.agent_types.get(agent.agent_type)
             developer_instructions = _render_developer_instructions(
@@ -291,6 +306,7 @@ class AgentService:
                     "continue_prompt_template_override": continue_prompt_template_override,
                     "env": env,
                     "workdir": workdir,
+                    "context_maintenance_policy": context_maintenance_policy,
                 },
                 daemon=True,
             )
@@ -310,10 +326,21 @@ class AgentService:
         continue_prompt_template_override: str | None,
         env: dict[str, str] | None,
         workdir: str | None,
+        context_maintenance_policy: AgentContextMaintenancePolicy | None,
     ) -> None:
         agent_id = active.agent_id
         auto_continue_count = 0
         try:
+            if context_maintenance_policy is not None and context_maintenance_policy.enabled:
+                self._compact_agent_context(
+                    agent_id,
+                    threshold=context_maintenance_policy.threshold,
+                    timeout_s=context_maintenance_policy.timeout_s,
+                    trigger="threshold_preflight",
+                    force=False,
+                    env=env,
+                    workdir=workdir,
+                )
             while True:
                 agent = self.store.get_agent(agent_id)
                 agent_type = self.agent_types.get(agent.agent_type)
@@ -469,6 +496,443 @@ class AgentService:
                 if fail_fast:
                     break
         return WaitAgentsResult(completed=completed, errors=errors, pending=tuple(pending), timeout=timeout)
+
+    def inspect_agent_context(
+        self,
+        agent_id: str,
+        *,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> AgentContextUsage:
+        agent = self.store.get_agent(agent_id)
+        if not agent.thread_id:
+            return self._unavailable_context_usage(agent, "no_session")
+        provider = self.providers.get(agent.cli_type)
+        inspect = getattr(provider, "inspect_thread_context", None)
+        if not callable(inspect):
+            return self._unavailable_context_usage(agent, "provider_unsupported")
+        home = self.home_service.get_home(agent.cli_type, agent.home_id)
+        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+        provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+        usage = inspect(
+            home_id=agent.home_id,
+            home_root=home_root,
+            env=provider_env,
+            thread_id=agent.thread_id,
+            workdir=workdir,
+            agent_id=agent.agent_id,
+        )
+        if not isinstance(usage, ProviderContextUsage):
+            raise TypeError(f"provider returned invalid context usage: {agent.cli_type}")
+        return usage.for_agent(agent_id=agent.agent_id, provider_type=agent.cli_type)
+
+    def compact_agent(
+        self,
+        agent_id: str,
+        *,
+        timeout_s: float = 120.0,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> AgentContextCompactionResult:
+        return self._run_manual_context_maintenance(
+            agent_id,
+            threshold=None,
+            timeout_s=timeout_s,
+            trigger="manual",
+            force=True,
+            env=env,
+            workdir=workdir,
+        )
+
+    def compact_agent_if_needed(
+        self,
+        agent_id: str,
+        *,
+        threshold: float = 0.80,
+        timeout_s: float = 120.0,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> AgentContextCompactionResult:
+        policy = AgentContextMaintenancePolicy(threshold=threshold, timeout_s=timeout_s)
+        return self._run_manual_context_maintenance(
+            agent_id,
+            threshold=policy.threshold,
+            timeout_s=policy.timeout_s,
+            trigger="threshold_manual",
+            force=False,
+            env=env,
+            workdir=workdir,
+        )
+
+    def _run_manual_context_maintenance(
+        self,
+        agent_id: str,
+        *,
+        threshold: float | None,
+        timeout_s: float,
+        trigger: str,
+        force: bool,
+        env: dict[str, str] | None,
+        workdir: str | None,
+    ) -> AgentContextCompactionResult:
+        active = self._begin_synchronous_maintenance(agent_id)
+        try:
+            result = self._compact_agent_context(
+                agent_id,
+                threshold=threshold,
+                timeout_s=timeout_s,
+                trigger=trigger,
+                force=force,
+                env=env,
+                workdir=workdir,
+            )
+            active.latest_result = result
+            return result
+        except BaseException as exc:
+            active.error = exc
+            raise
+        finally:
+            self._finish_synchronous_maintenance(active)
+
+    def reconcile_agent_context_maintenance(
+        self,
+        agent_id: str,
+        *,
+        env: dict[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> AgentContextMaintenanceJournal | None:
+        journal = self.store.read_context_maintenance(agent_id)
+        if journal is None or not journal.unresolved:
+            return journal
+        if not journal.session_id or not journal.baseline:
+            raise AgentContextMaintenanceBlocked(
+                f"context maintenance cannot be reconciled without session baseline: {agent_id}"
+            )
+        active = self._begin_synchronous_maintenance(
+            agent_id,
+            require_resolved=False,
+            respect_pause=False,
+        )
+        try:
+            agent = self.store.get_agent(agent_id)
+            provider = self.providers.get(agent.cli_type)
+            reconcile = getattr(provider, "reconcile_thread_compaction", None)
+            if not callable(reconcile):
+                raise AgentContextMaintenanceBlocked(
+                    f"provider cannot reconcile context maintenance: {agent.cli_type}"
+                )
+            home = self.home_service.get_home(agent.cli_type, agent.home_id)
+            home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+            provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+            provider_result = reconcile(
+                home_id=agent.home_id,
+                home_root=home_root,
+                env=provider_env,
+                thread_id=journal.session_id,
+                workdir=workdir,
+                agent_id=agent.agent_id,
+                baseline=journal.baseline,
+                provider_operation_id=journal.provider_operation_id,
+            )
+            if provider_result is None:
+                raise AgentContextMaintenanceBlocked(
+                    f"provider has not confirmed context maintenance terminal state: {agent_id}"
+                )
+            if not isinstance(provider_result, ProviderContextCompactionResult):
+                raise TypeError(f"provider returned invalid reconciliation result: {agent.cli_type}")
+            confirmed = AgentContextMaintenanceJournal(
+                agent_id=agent.agent_id,
+                provider_type=agent.cli_type,
+                session_id=journal.session_id,
+                status=AgentContextMaintenanceJournalStatus.CONFIRMED,
+                trigger=journal.trigger,
+                prepared_at=journal.prepared_at,
+                started_at=journal.started_at or provider_result.started_at,
+                completed_at=provider_result.completed_at,
+                provider_operation_id=journal.provider_operation_id,
+                baseline=journal.baseline,
+            )
+            self.store.write_context_maintenance(agent_id, confirmed)
+            active.latest_result = confirmed
+            return confirmed
+        except BaseException as exc:
+            active.error = exc
+            raise
+        finally:
+            self._finish_synchronous_maintenance(active)
+
+    def _begin_synchronous_maintenance(
+        self,
+        agent_id: str,
+        *,
+        require_resolved: bool = True,
+        respect_pause: bool = True,
+    ) -> _ActiveAgentRun:
+        with self._lock:
+            agent = self.store.get_agent(agent_id)
+            if agent.status == "closed":
+                raise AgentClosedError(agent_id)
+            if agent.status == "running" or agent_id in self._active:
+                raise AgentAlreadyRunningError(agent_id)
+            if require_resolved:
+                self._assert_context_maintenance_resolved(agent_id)
+            if respect_pause:
+                self._assert_agent_can_start(agent.scope_id)
+            self.store.patch_agent(agent_id, status="running")
+            active = _ActiveAgentRun(
+                agent_id=agent_id,
+                worker=threading.current_thread(),
+                done_event=threading.Event(),
+            )
+            self._active[agent_id] = active
+            return active
+
+    def _finish_synchronous_maintenance(self, active: _ActiveAgentRun) -> None:
+        with self._lock:
+            try:
+                agent = self.store.get_agent(active.agent_id)
+                if agent.status != "closed":
+                    self.store.patch_agent(active.agent_id, status="idle")
+            finally:
+                self._active.pop(active.agent_id, None)
+                active.done_event.set()
+
+    def _compact_agent_context(
+        self,
+        agent_id: str,
+        *,
+        threshold: float | None,
+        timeout_s: float,
+        trigger: str,
+        force: bool,
+        env: dict[str, str] | None,
+        workdir: str | None,
+    ) -> AgentContextCompactionResult:
+        self._assert_context_maintenance_resolved(agent_id)
+        agent = self.store.get_agent(agent_id)
+        usage_before = self.inspect_agent_context(agent_id, env=env, workdir=workdir)
+        now = utc_now_iso()
+        if not agent.thread_id:
+            return self._skipped_context_compaction(agent, usage_before, now, "no_session")
+        provider = self.providers.get(agent.cli_type)
+        compact = getattr(provider, "compact_thread", None)
+        if not callable(compact):
+            if force:
+                raise AgentContextMaintenanceUnsupported(agent.cli_type)
+            return self._unsupported_context_compaction(agent, usage_before, now)
+        if not force:
+            if not usage_before.available:
+                return self._skipped_context_compaction(
+                    agent,
+                    usage_before,
+                    now,
+                    usage_before.reason or "usage_unavailable",
+                )
+            if threshold is None:
+                raise ValueError("threshold is required for conditional compaction")
+            assert usage_before.usage_ratio is not None
+            if usage_before.usage_ratio < threshold:
+                return self._skipped_context_compaction(agent, usage_before, now, "below_threshold")
+
+        home = self.home_service.get_home(agent.cli_type, agent.home_id)
+        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+        provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+        prepared_at = utc_now_iso()
+        journal = AgentContextMaintenanceJournal(
+            agent_id=agent.agent_id,
+            provider_type=agent.cli_type,
+            session_id=agent.thread_id,
+            status=AgentContextMaintenanceJournalStatus.PREPARED,
+            trigger=trigger,
+            prepared_at=prepared_at,
+        )
+        self.store.write_context_maintenance(agent_id, journal)
+        request_started = False
+
+        def on_compaction_started(baseline: dict[str, object], operation_id: str | None) -> None:
+            nonlocal request_started
+            request_started = True
+            self.store.write_context_maintenance(
+                agent_id,
+                AgentContextMaintenanceJournal(
+                    agent_id=agent.agent_id,
+                    provider_type=agent.cli_type,
+                    session_id=agent.thread_id,
+                    status=AgentContextMaintenanceJournalStatus.STARTED,
+                    trigger=trigger,
+                    prepared_at=prepared_at,
+                    started_at=utc_now_iso(),
+                    provider_operation_id=operation_id,
+                    baseline=baseline,
+                ),
+            )
+
+        try:
+            provider_result = compact(
+                home_id=agent.home_id,
+                home_root=home_root,
+                env=provider_env,
+                thread_id=agent.thread_id,
+                workdir=workdir,
+                agent_id=agent.agent_id,
+                timeout_s=timeout_s,
+                on_compaction_started=on_compaction_started,
+            )
+        except BaseException as exc:
+            if request_started or isinstance(exc, AgentContextCompactionRequestUnknown):
+                started_journal = self.store.read_context_maintenance(agent_id)
+                self.store.write_context_maintenance(
+                    agent_id,
+                    AgentContextMaintenanceJournal(
+                        agent_id=agent.agent_id,
+                        provider_type=agent.cli_type,
+                        session_id=agent.thread_id,
+                        status=AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL,
+                        trigger=trigger,
+                        prepared_at=prepared_at,
+                        started_at=started_journal.started_at if started_journal is not None else None,
+                        provider_operation_id=(
+                            started_journal.provider_operation_id if started_journal is not None else None
+                        ),
+                        baseline=started_journal.baseline if started_journal is not None else {},
+                        error_type=type(exc).__name__,
+                    ),
+                )
+            else:
+                self.store.clear_context_maintenance(agent_id)
+            raise
+        if not isinstance(provider_result, ProviderContextCompactionResult):
+            if request_started:
+                started_journal = self.store.read_context_maintenance(agent_id)
+                self.store.write_context_maintenance(
+                    agent_id,
+                    AgentContextMaintenanceJournal(
+                        agent_id=agent.agent_id,
+                        provider_type=agent.cli_type,
+                        session_id=agent.thread_id,
+                        status=AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL,
+                        trigger=trigger,
+                        prepared_at=prepared_at,
+                        started_at=started_journal.started_at if started_journal is not None else None,
+                        provider_operation_id=(
+                            started_journal.provider_operation_id if started_journal is not None else None
+                        ),
+                        baseline=started_journal.baseline if started_journal is not None else {},
+                        error_type="InvalidProviderCompactionResult",
+                    ),
+                )
+            else:
+                self.store.clear_context_maintenance(agent_id)
+            raise TypeError(f"provider returned invalid compaction result: {agent.cli_type}")
+        if provider_result.session_id != agent.thread_id:
+            started_journal = self.store.read_context_maintenance(agent_id)
+            self.store.write_context_maintenance(
+                agent_id,
+                AgentContextMaintenanceJournal(
+                    agent_id=agent.agent_id,
+                    provider_type=agent.cli_type,
+                    session_id=agent.thread_id,
+                    status=AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL,
+                    trigger=trigger,
+                    prepared_at=prepared_at,
+                    started_at=started_journal.started_at if started_journal is not None else None,
+                    provider_operation_id=provider_result.provider_operation_id,
+                    baseline=started_journal.baseline if started_journal is not None else {},
+                    error_type="ProviderSessionMismatch",
+                ),
+            )
+            raise TypeError(
+                f"provider compaction session mismatch: expected {agent.thread_id}, "
+                f"got {provider_result.session_id}"
+            )
+        usage_after = (
+            provider_result.usage_after.for_agent(agent_id=agent.agent_id, provider_type=agent.cli_type)
+            if provider_result.usage_after is not None
+            else None
+        )
+        self.store.write_context_maintenance(
+            agent_id,
+            AgentContextMaintenanceJournal(
+                agent_id=agent.agent_id,
+                provider_type=agent.cli_type,
+                session_id=agent.thread_id,
+                status=AgentContextMaintenanceJournalStatus.CONFIRMED,
+                trigger=trigger,
+                prepared_at=prepared_at,
+                started_at=provider_result.started_at,
+                completed_at=provider_result.completed_at,
+                provider_operation_id=provider_result.provider_operation_id,
+            ),
+        )
+        return AgentContextCompactionResult(
+            agent_id=agent.agent_id,
+            provider_type=agent.cli_type,
+            session_id=agent.thread_id,
+            status=AgentContextCompactionStatus.COMPACTED,
+            reason="forced" if force else "threshold_reached",
+            usage_before=usage_before,
+            usage_after=usage_after,
+            started_at=provider_result.started_at,
+            completed_at=provider_result.completed_at,
+            provider_operation_id=provider_result.provider_operation_id,
+        )
+
+    def _assert_context_maintenance_resolved(self, agent_id: str) -> None:
+        journal = self.store.read_context_maintenance(agent_id)
+        if journal is not None and journal.unresolved:
+            raise AgentContextMaintenanceBlocked(
+                f"agent has unresolved context maintenance: {agent_id} ({journal.status.value})"
+            )
+
+    def _unavailable_context_usage(self, agent: Agent, reason: str) -> AgentContextUsage:
+        return AgentContextUsage(
+            agent_id=agent.agent_id,
+            provider_type=agent.cli_type,
+            session_id=agent.thread_id,
+            total_tokens=None,
+            context_window=None,
+            observed_at=utc_now_iso(),
+            source="provider",
+            available=False,
+            reason=reason,
+        )
+
+    def _skipped_context_compaction(
+        self,
+        agent: Agent,
+        usage: AgentContextUsage,
+        now: str,
+        reason: str,
+    ) -> AgentContextCompactionResult:
+        return AgentContextCompactionResult(
+            agent_id=agent.agent_id,
+            provider_type=agent.cli_type,
+            session_id=agent.thread_id,
+            status=AgentContextCompactionStatus.SKIPPED,
+            reason=reason,
+            usage_before=usage,
+            usage_after=None,
+            started_at=now,
+            completed_at=now,
+        )
+
+    def _unsupported_context_compaction(
+        self,
+        agent: Agent,
+        usage: AgentContextUsage,
+        now: str,
+    ) -> AgentContextCompactionResult:
+        return AgentContextCompactionResult(
+            agent_id=agent.agent_id,
+            provider_type=agent.cli_type,
+            session_id=agent.thread_id,
+            status=AgentContextCompactionStatus.UNSUPPORTED,
+            reason="provider_unsupported",
+            usage_before=usage,
+            usage_after=None,
+            started_at=now,
+            completed_at=now,
+        )
 
     def reconcile_stale_running_agents(self, scope_id: str | None = None) -> list[str]:
         """Compatibility helper for locator-free stale records only."""

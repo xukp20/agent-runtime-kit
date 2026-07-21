@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
+from enum import Enum
 from typing import Any
 
 
@@ -32,6 +33,34 @@ class AgentCompletionCheckError(AgentRuntimeKitError):
 
 
 class AgentHasNoCompletedTurn(AgentRuntimeKitError):
+    pass
+
+
+class AgentContextMaintenanceError(AgentRuntimeKitError):
+    pass
+
+
+class AgentContextMaintenanceUnsupported(AgentContextMaintenanceError):
+    pass
+
+
+class AgentContextCompactionTimeout(AgentContextMaintenanceError):
+    pass
+
+
+class AgentContextCompactionRequestUnknown(AgentContextMaintenanceError):
+    pass
+
+
+class AgentContextCompactionEvidenceError(AgentContextMaintenanceError):
+    pass
+
+
+class AgentContextMaintenanceBlocked(AgentContextMaintenanceError):
+    pass
+
+
+class AgentContextUsageUnavailable(AgentContextMaintenanceError):
     pass
 
 
@@ -137,6 +166,8 @@ def to_jsonable(value: Any) -> Any:
         return {str(key): to_jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [to_jsonable(item) for item in value]
+    if isinstance(value, Enum):
+        return value.value
     return value
 
 
