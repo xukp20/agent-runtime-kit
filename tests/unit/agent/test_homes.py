@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,12 @@ from agent_runtime_kit.agent.homes import (
     build_provider_env,
 )
 from agent_runtime_kit.agent.models import MissingProviderEnvError
+from agent_runtime_kit.agent.provider_contracts import (
+    BaseConfigSource,
+    HomeMaterializationResult,
+    HomeValidationResult,
+    ProviderHomeSpec,
+)
 from agent_runtime_kit.agent.skills import SkillSpec
 
 
@@ -294,3 +302,131 @@ def test_build_provider_env_reports_missing_required_env(tmp_path: Path) -> None
         build_provider_env(home=home, home_root=service.resolve_home_root("codex", "planner"), base_env={})
 
     assert exc_info.value.name == "TOKEN"
+
+
+def test_codex_home_records_versioned_materialization_manifest(tmp_path: Path) -> None:
+    service = HomeService(tmp_path / ".agent_runtime")
+    spec = HomeCreateSpec(
+        cli_type="codex",
+        home_id="planner",
+        config_overrides={"model": "gpt-example", "model_reasoning_effort": "high"},
+    )
+
+    first = service.create_home(spec)
+    second = service.create_home(spec)
+    manifest_path = service.runtime_root / str(second.materialization_manifest_ref)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert first.provider_type == "codex"
+    assert first.cli_type == "codex"
+    assert first.schema_version == 2
+    assert first.materialization_manifest_hash == second.materialization_manifest_hash
+    assert manifest["manifest_hash"] == second.materialization_manifest_hash
+    assert "home.base_config" in second.capability_snapshot["supports"]
+    assert second.resolved_defaults == {
+        "api_provider": "openai",
+        "api_mode": "responses",
+        "endpoint_id": None,
+        "requested_model": "gpt-example",
+        "resolved_model": None,
+        "model_version": None,
+        "service_tier": None,
+        "reasoning_effort": "high",
+        "tokenizer_id": None,
+        "model_config_hash": None,
+        "provider_payload": None,
+    }
+
+
+def test_provider_home_spec_uses_registered_renderer_without_service_type_branch(tmp_path: Path) -> None:
+    class DemoRenderer:
+        provider_type = "demo"
+
+        def validate(self, spec):  # noqa: ANN001, ANN201
+            return HomeValidationResult(valid=True)
+
+        def materialize(self, spec, home_root):  # noqa: ANN001, ANN201
+            (home_root / "demo.txt").write_text("demo", encoding="utf-8")
+            return HomeMaterializationResult(
+                provider_type="demo",
+                home_id=spec.home_id,
+                renderer_version="demo-1",
+                manifest_schema_version=1,
+                manifest_hash="demo-hash",
+            )
+
+    service = HomeService(
+        tmp_path / ".agent_runtime",
+        renderers={"demo": DemoRenderer()},
+    )
+    record = service.create_home(
+        ProviderHomeSpec(
+            provider_type="demo",
+            home_id="worker",
+            base_config=BaseConfigSource(text="demo"),
+        )
+    )
+
+    assert record.provider_type == "demo"
+    assert record.materialization_manifest_hash == "demo-hash"
+    assert (service.resolve_home_root("demo", "worker") / "demo.txt").read_text() == "demo"
+
+
+def test_home_store_additively_reads_legacy_sqlite_rows(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    homes_root = runtime_root / "homes"
+    homes_root.mkdir(parents=True)
+    with sqlite3.connect(homes_root / "index.sqlite") as conn:
+        conn.execute(
+            """
+            create table homes(
+              cli_type text not null,
+              home_id text not null,
+              home_relpath text not null,
+              status text not null,
+              created_at text not null,
+              updated_at text not null,
+              fixed_env_json text not null default '{}',
+              required_env_csv text not null default '',
+              primary key(cli_type, home_id)
+            )
+            """
+        )
+        conn.execute(
+            "insert into homes values (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("codex", "legacy", "homes/codex/legacy", "active", "old", "old", "{}", ""),
+        )
+
+    record = HomeService(runtime_root).get_home("codex", "legacy")
+
+    assert record.schema_version == 1
+    assert record.provider_type == "codex"
+    assert record.materialization_manifest_hash is None
+
+
+def test_codex_execution_context_checks_manifest_and_managed_file_hashes(tmp_path: Path) -> None:
+    service = HomeService(tmp_path / ".agent_runtime")
+    service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            config_overrides={"model": "gpt-example"},
+            fixed_env={"HOME_VALUE": "home"},
+            required_env={"REQUIRED"},
+        )
+    )
+
+    context = service.build_execution_context(
+        "codex",
+        "planner",
+        run_env={"REQUIRED": "yes", "HOME_VALUE": "run"},
+        workdir=str(tmp_path),
+    )
+    assert context.provider_type == "codex"
+    assert context.process_environment["HOME_VALUE"] == "run"
+    assert context.process_environment["CODEX_HOME"].endswith("/.codex")
+
+    config_path = service.resolve_home_root("codex", "planner") / ".codex" / "config.toml"
+    config_path.write_text('model = "tampered"\n', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="materialized file hash mismatch"):
+        service.build_execution_context("codex", "planner", run_env={"REQUIRED": "yes"})

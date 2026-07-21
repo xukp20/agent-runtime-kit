@@ -1,17 +1,21 @@
 from __future__ import annotations
 
-import os
 import json
-import re
-import shutil
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
-from .models import MissingProviderEnvError
-from .skills import SkillSpec, validate_skill_name, write_skill_spec
-from .store_utils import utc_now_iso
+from .models import MissingProviderEnvError, to_jsonable
+from .provider_contracts import (
+    BaseConfigSource,
+    HomeMaterializationResult,
+    HomeValidationResult,
+    ProviderHomeSpec,
+)
+from .skills import SkillSpec
+from .store_utils import utc_now_iso, write_json_atomic
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,25 @@ class HomeRecord:
     updated_at: str = ""
     fixed_env: dict[str, str] = field(default_factory=dict)
     required_env: set[str] = field(default_factory=set)
+    schema_version: int = 2
+    provider_type: str | None = None
+    materialization_manifest_ref: str | None = None
+    materialization_manifest_hash: str | None = None
+    base_config_fingerprint: str | None = None
+    resolved_defaults: dict[str, object] | None = None
+    capability_snapshot: dict[str, object] | None = None
+    warnings: list[str] = field(default_factory=list)
+    provider_payload: dict[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if self.provider_type is None:
+            self.provider_type = self.cli_type
+        if self.provider_type != self.cli_type:
+            raise ValueError("provider_type and legacy cli_type must match during compatibility migration")
+
+    @property
+    def home_root_ref(self) -> str:
+        return self.home_relpath
 
 
 @dataclass
@@ -79,6 +102,16 @@ class HomeCreateSpec:
     fixed_env: dict[str, str] = field(default_factory=dict)
     required_env: set[str] = field(default_factory=set)
     model_config_overrides: ModelConfigOverrides | None = None
+    provider_type: str | None = None
+    config_overrides: dict[str, object] = field(default_factory=dict)
+    provider_options: object | None = None
+
+    def resolved_provider_type(self) -> str:
+        provider_type = (self.provider_type or self.cli_type).strip()
+        cli_type = self.cli_type.strip()
+        if provider_type != cli_type:
+            raise ValueError("provider_type and legacy cli_type must match during compatibility migration")
+        return provider_type
 
 
 class HomeStore:
@@ -109,6 +142,21 @@ class HomeStore:
                 )
                 """
             )
+            columns = {str(row[1]) for row in conn.execute("pragma table_info(homes)").fetchall()}
+            additions = {
+                "schema_version": "integer not null default 1",
+                "provider_type": "text",
+                "materialization_manifest_ref": "text",
+                "materialization_manifest_hash": "text",
+                "base_config_fingerprint": "text",
+                "resolved_defaults_json": "text",
+                "capability_snapshot_json": "text",
+                "warnings_json": "text not null default '[]'",
+                "provider_payload_json": "text",
+            }
+            for name, declaration in additions.items():
+                if name not in columns:
+                    conn.execute(f"alter table homes add column {name} {declaration}")
 
     def upsert_home(self, record: HomeRecord) -> HomeRecord:
         import json
@@ -118,15 +166,27 @@ class HomeStore:
                 """
                 insert into homes(
                   cli_type, home_id, home_relpath, status, created_at, updated_at,
-                  fixed_env_json, required_env_csv
+                  fixed_env_json, required_env_csv, schema_version, provider_type,
+                  materialization_manifest_ref, materialization_manifest_hash,
+                  base_config_fingerprint, resolved_defaults_json, capability_snapshot_json,
+                  warnings_json, provider_payload_json
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(cli_type, home_id) do update set
                   home_relpath=excluded.home_relpath,
                   status=excluded.status,
                   updated_at=excluded.updated_at,
                   fixed_env_json=excluded.fixed_env_json,
-                  required_env_csv=excluded.required_env_csv
+                  required_env_csv=excluded.required_env_csv,
+                  schema_version=excluded.schema_version,
+                  provider_type=excluded.provider_type,
+                  materialization_manifest_ref=excluded.materialization_manifest_ref,
+                  materialization_manifest_hash=excluded.materialization_manifest_hash,
+                  base_config_fingerprint=excluded.base_config_fingerprint,
+                  resolved_defaults_json=excluded.resolved_defaults_json,
+                  capability_snapshot_json=excluded.capability_snapshot_json,
+                  warnings_json=excluded.warnings_json,
+                  provider_payload_json=excluded.provider_payload_json
                 """,
                 (
                     record.cli_type,
@@ -137,6 +197,17 @@ class HomeStore:
                     record.updated_at,
                     json.dumps(record.fixed_env, sort_keys=True),
                     ",".join(sorted(record.required_env)),
+                    record.schema_version,
+                    record.provider_type,
+                    record.materialization_manifest_ref,
+                    record.materialization_manifest_hash,
+                    record.base_config_fingerprint,
+                    json.dumps(record.resolved_defaults, sort_keys=True) if record.resolved_defaults else None,
+                    json.dumps(record.capability_snapshot, sort_keys=True)
+                    if record.capability_snapshot
+                    else None,
+                    json.dumps(record.warnings, sort_keys=True),
+                    json.dumps(record.provider_payload, sort_keys=True) if record.provider_payload else None,
                 ),
             )
         return record
@@ -146,7 +217,10 @@ class HomeStore:
             row = conn.execute(
                 """
                 select cli_type, home_id, home_relpath, status, created_at, updated_at,
-                       fixed_env_json, required_env_csv
+                       fixed_env_json, required_env_csv, schema_version, provider_type,
+                       materialization_manifest_ref, materialization_manifest_hash,
+                       base_config_fingerprint, resolved_defaults_json, capability_snapshot_json,
+                       warnings_json, provider_payload_json
                 from homes where cli_type=? and home_id=?
                 """,
                 (cli_type, home_id),
@@ -169,7 +243,10 @@ class HomeStore:
             rows = conn.execute(
                 """
                 select cli_type, home_id, home_relpath, status, created_at, updated_at,
-                       fixed_env_json, required_env_csv
+                       fixed_env_json, required_env_csv, schema_version, provider_type,
+                       materialization_manifest_ref, materialization_manifest_hash,
+                       base_config_fingerprint, resolved_defaults_json, capability_snapshot_json,
+                       warnings_json, provider_payload_json
                 from homes
                 """
                 + where
@@ -190,96 +267,176 @@ class HomeStore:
 
 
 class HomeService:
-    def __init__(self, runtime_root: Path) -> None:
+    def __init__(
+        self,
+        runtime_root: Path,
+        *,
+        renderers: Mapping[str, object] | None = None,
+    ) -> None:
         self.runtime_root = Path(runtime_root)
         self.store = HomeStore(self.runtime_root)
+        if renderers is None:
+            from .providers.codex_home import CodexHomeRenderer
 
-    def create_home(self, spec: HomeCreateSpec) -> HomeRecord:
-        cli_type = spec.cli_type.strip()
-        home_id = spec.home_id.strip()
-        if not cli_type or not home_id:
-            raise ValueError("cli_type and home_id must not be empty")
-        home_root = self.runtime_root / "homes" / cli_type / home_id
+            renderers = {"codex": CodexHomeRenderer(runtime_root=self.runtime_root)}
+        self.renderers = dict(renderers)
+
+    def create_home(self, spec: HomeCreateSpec | ProviderHomeSpec) -> HomeRecord:
+        provider_spec, legacy_spec = self._normalize_spec(spec)
+        provider_type = provider_spec.provider_type.strip()
+        home_id = provider_spec.home_id.strip()
+        home_root = self.runtime_root / "homes" / provider_type / home_id
         home_root.mkdir(parents=True, exist_ok=True)
-        if cli_type == "codex":
-            self._create_codex_home(home_root, spec)
-        elif spec.model_config_overrides is not None:
-            raise ValueError(f"model configuration overrides are not supported for provider: {cli_type}")
+        renderer = self.renderers.get(provider_type)
+        if renderer is None:
+            materialization = self._materialize_legacy_empty_home(provider_spec, legacy_spec, home_root)
+        else:
+            validation = renderer.validate(provider_spec)
+            if not isinstance(validation, HomeValidationResult):
+                raise TypeError(f"invalid HomeValidationResult from provider renderer: {provider_type}")
+            if not validation.valid:
+                message = "; ".join(validation.errors) or "provider home validation failed"
+                raise ValueError(message)
+            materialization = renderer.materialize(provider_spec, home_root)
+            if not isinstance(materialization, HomeMaterializationResult):
+                raise TypeError(f"invalid HomeMaterializationResult from provider renderer: {provider_type}")
+            if materialization.provider_type != provider_type or materialization.home_id != home_id:
+                raise ValueError("provider renderer returned materialization for a different home")
+        write_json_atomic(
+            home_root / ".ark" / "home_materialization.json",
+            to_jsonable(materialization),
+        )
         now = utc_now_iso()
         existing_created_at = now
         try:
-            existing_created_at = self.store.get_home(cli_type, home_id).created_at
+            existing_created_at = self.store.get_home(provider_type, home_id).created_at
         except KeyError:
             pass
         record = HomeRecord(
-            cli_type=cli_type,
+            cli_type=provider_type,
+            provider_type=provider_type,
             home_id=home_id,
-            home_relpath=str(Path("homes") / cli_type / home_id),
+            home_relpath=str(Path("homes") / provider_type / home_id),
             status="active",
             created_at=existing_created_at,
             updated_at=now,
-            fixed_env=dict(spec.fixed_env),
-            required_env=set(spec.required_env),
+            fixed_env=dict(provider_spec.fixed_env),
+            required_env=set(provider_spec.required_env),
+            materialization_manifest_ref=str(
+                Path("homes") / provider_type / home_id / ".ark" / "home_materialization.json"
+            ),
+            materialization_manifest_hash=materialization.manifest_hash,
+            resolved_defaults=(
+                to_jsonable(materialization.resolved_defaults)
+                if materialization.resolved_defaults is not None
+                else None
+            ),
+            capability_snapshot=(
+                to_jsonable(materialization.effective_capabilities)
+                if materialization.effective_capabilities is not None
+                else None
+            ),
+            warnings=list(materialization.warnings),
+            provider_payload=(
+                to_jsonable(materialization.provider_payload)
+                if materialization.provider_payload is not None
+                else None
+            ),
         )
         return self.store.upsert_home(record)
 
-    def _create_codex_home(self, home_root: Path, spec: HomeCreateSpec) -> None:
-        codex_root = home_root / ".codex"
-        agents_root = home_root / ".agents"
-        skills_root = agents_root / "skills"
-        codex_root.mkdir(parents=True, exist_ok=True)
-        skills_root.mkdir(parents=True, exist_ok=True)
-        self._write_codex_config(codex_root / "config.toml", spec)
-        if spec.auth_json_path is not None:
-            shutil.copyfile(spec.auth_json_path, codex_root / "auth.json")
-        self._validate_skill_inputs(spec)
-        for skill_name, skill_path in spec.skill_paths.items():
-            validated_name = validate_skill_name(skill_name)
-            if not skill_path.exists() or not skill_path.is_dir():
-                raise ValueError(f"skill path must be an existing directory: {skill_path}")
-            dest = skills_root / validated_name
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(skill_path, dest)
-        for skill_name, skill_spec in spec.skill_specs.items():
-            validated_name = validate_skill_name(skill_name)
-            if validated_name != skill_spec.name:
-                raise ValueError(f"skill spec key must match SkillSpec.name: {skill_name} != {skill_spec.name}")
-            write_skill_spec(skill_spec, skills_root / validated_name)
+    def _normalize_spec(
+        self,
+        spec: HomeCreateSpec | ProviderHomeSpec,
+    ) -> tuple[ProviderHomeSpec, HomeCreateSpec | None]:
+        if isinstance(spec, ProviderHomeSpec):
+            return spec, None
+        provider_type = spec.resolved_provider_type()
+        base_config = BaseConfigSource(path=str(spec.base_config_path)) if spec.base_config_path else None
+        from .providers.codex_home import CodexHomeOptions
 
-    def _validate_skill_inputs(self, spec: HomeCreateSpec) -> None:
-        path_names = {validate_skill_name(name) for name in spec.skill_paths}
-        spec_names = {validate_skill_name(name) for name in spec.skill_specs}
-        duplicate_names = path_names & spec_names
-        if duplicate_names:
-            duplicates = ", ".join(sorted(duplicate_names))
-            raise ValueError(f"duplicate skill names between skill_paths and skill_specs: {duplicates}")
-        for skill_name in spec.skill_paths:
-            if validate_skill_name(skill_name) != skill_name:
-                raise ValueError(f"invalid skill path name: {skill_name}")
-        for skill_name, skill_spec in spec.skill_specs.items():
-            if validate_skill_name(skill_name) != skill_spec.name:
-                raise ValueError(f"skill spec key must match SkillSpec.name: {skill_name} != {skill_spec.name}")
+        provider_options = spec.provider_options
+        if provider_type == "codex":
+            if provider_options is not None:
+                raise ValueError("legacy Codex HomeCreateSpec cannot combine provider_options with Codex fields")
+            provider_options = CodexHomeOptions(
+                auth_json_path=spec.auth_json_path,
+                skill_paths=dict(spec.skill_paths),
+                skill_specs=dict(spec.skill_specs),
+                mcp_servers=tuple(spec.mcp_servers),
+                model_config_overrides=spec.model_config_overrides,
+            )
+        return (
+            ProviderHomeSpec(
+                provider_type=provider_type,
+                home_id=spec.home_id,
+                base_config=base_config,
+                config_overrides=dict(spec.config_overrides),
+                mcp_servers=tuple(spec.mcp_servers),
+                skills=tuple(spec.skill_specs.values()),
+                fixed_env=dict(spec.fixed_env),
+                required_env=tuple(sorted(spec.required_env)),
+                provider_options=provider_options,
+            ),
+            spec,
+        )
 
-    def _write_codex_config(self, config_path: Path, spec: HomeCreateSpec) -> None:
-        if spec.base_config_path is None and not spec.mcp_servers and spec.model_config_overrides is None:
-            return
-        if spec.base_config_path is not None:
-            text = spec.base_config_path.read_text(encoding="utf-8")
-        else:
-            text = ""
-        if spec.model_config_overrides is not None:
-            text = _apply_codex_model_config_overrides(text, spec.model_config_overrides)
-        if spec.mcp_servers:
-            text = text.rstrip() + "\n\n" + _render_mcp_servers_toml(spec.mcp_servers)
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(text, encoding="utf-8")
+    def _materialize_legacy_empty_home(
+        self,
+        provider_spec: ProviderHomeSpec,
+        legacy_spec: HomeCreateSpec | None,
+        home_root: Path,
+    ) -> HomeMaterializationResult:
+        # COMPAT(legacy-unregistered-home): older callers could create an empty
+        # home for injected providers. Remove when every injected provider is
+        # registered through ProviderRegistry with an explicit Home renderer.
+        # Covered by external takeover and runtime-matrix compatibility tests.
+        if legacy_spec is not None and legacy_spec.model_config_overrides is not None:
+            raise ValueError(
+                f"model configuration overrides are not supported for provider: {provider_spec.provider_type}"
+            )
+        if legacy_spec is None or any(
+            (
+                provider_spec.base_config is not None,
+                bool(provider_spec.config_overrides),
+                bool(provider_spec.skills),
+                bool(provider_spec.mcp_servers),
+                provider_spec.provider_options is not None,
+            )
+        ):
+            raise ValueError(f"no Home renderer registered for provider: {provider_spec.provider_type}")
+        result = HomeMaterializationResult(
+            provider_type=provider_spec.provider_type,
+            home_id=provider_spec.home_id,
+            renderer_version="ark-empty-compat-1",
+            manifest_schema_version=1,
+            manifest_hash="ark-empty-home-v1",
+            required_env=provider_spec.required_env,
+            warnings=("legacy empty home without registered Provider renderer",),
+        )
+        manifest_path = home_root / ".ark" / "home_materialization.json"
+        write_json_atomic(manifest_path, to_jsonable(result))
+        return result
 
     def get_home(self, cli_type: str, home_id: str) -> HomeRecord:
         return self.store.get_home(cli_type, home_id)
 
     def resolve_home_root(self, cli_type: str, home_id: str) -> Path:
         return self.store.resolve_home_root(cli_type, home_id)
+
+    def build_execution_context(
+        self,
+        provider_type: str,
+        home_id: str,
+        *,
+        run_env: Mapping[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> object:
+        renderer = self.renderers.get(provider_type)
+        if renderer is None:
+            raise ValueError(f"no Home renderer registered for provider: {provider_type}")
+        home = self.get_home(provider_type, home_id)
+        return renderer.build_execution_context(home, run_env=run_env, workdir=workdir)
 
 
 def build_provider_env(
@@ -296,117 +453,16 @@ def build_provider_env(
     for name in home.required_env:
         if not env.get(name):
             raise MissingProviderEnvError(name)
+    # COMPAT(legacy-build-provider-env): legacy callers construct provider
+    # environment without HomeService.build_execution_context(). Remove once
+    # LC and all external providers consume ProviderExecutionContext.
     if home.cli_type == "codex":
         env["HOME"] = str(home_root)
         env["CODEX_HOME"] = str(home_root / ".codex")
     return env
 
 
-def _render_mcp_servers_toml(servers: list[McpServerSpec]) -> str:
-    lines: list[str] = []
-    seen: set[str] = set()
-    for server in servers:
-        name = server.name.strip()
-        if not name:
-            raise ValueError("MCP server name must not be empty")
-        if name in seen:
-            raise ValueError(f"duplicate MCP server name: {name}")
-        seen.add(name)
-        lines.append(f"[mcp_servers.{_toml_key(name)}]")
-        if server.transport and server.url and server.transport != "http":
-            lines.append(f"transport = {_toml_value(server.transport)}")
-        for field_name in [
-            "enabled",
-            "url",
-            "command",
-            "args",
-            "cwd",
-            "startup_timeout_sec",
-            "tool_timeout_sec",
-            "required",
-            "enabled_tools",
-            "disabled_tools",
-            "env_vars",
-            "bearer_token_env_var",
-        ]:
-            value = getattr(server, field_name)
-            if value is None:
-                continue
-            if isinstance(value, list) and not value:
-                continue
-            lines.append(f"{field_name} = {_toml_value(value)}")
-        for table_name in ["env", "http_headers", "env_http_headers"]:
-            values = getattr(server, table_name)
-            if not values:
-                continue
-            lines.append("")
-            lines.append(f"[mcp_servers.{_toml_key(name)}.{table_name}]")
-            for key, value in sorted(values.items()):
-                lines.append(f"{_toml_key(key)} = {_toml_value(value)}")
-        lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def _apply_codex_model_config_overrides(text: str, overrides: ModelConfigOverrides) -> str:
-    replacements = {
-        "model": overrides.model,
-        "model_reasoning_effort": overrides.reasoning_effort,
-    }
-    active = {key: value for key, value in replacements.items() if value is not None}
-    if not active:
-        return text
-
-    lines = text.splitlines()
-    first_table = next(
-        (index for index, line in enumerate(lines) if line.strip().startswith("[")),
-        len(lines),
-    )
-    found: set[str] = set()
-    rendered: list[str] = []
-    for index, line in enumerate(lines):
-        if index < first_table and "=" in line and not line.lstrip().startswith("#"):
-            key = line.split("=", 1)[0].strip()
-            if key in active:
-                if key not in found:
-                    rendered.append(f"{key} = {_toml_value(active[key])}")
-                    found.add(key)
-                continue
-        rendered.append(line)
-
-    missing = [key for key in active if key not in found]
-    if missing:
-        insert_at = next(
-            (index for index, line in enumerate(rendered) if line.strip().startswith("[")),
-            len(rendered),
-        )
-        additions = [f"{key} = {_toml_value(active[key])}" for key in missing]
-        if insert_at and rendered[insert_at - 1].strip():
-            additions.append("")
-        rendered[insert_at:insert_at] = additions
-    return "\n".join(rendered).rstrip() + "\n"
-
-
-def _toml_key(value: str) -> str:
-    if re.fullmatch(r"[A-Za-z0-9_-]+", value):
-        return value
-    return json.dumps(value)
-
-
-def _toml_value(value: object) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, str):
-        return json.dumps(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
-    raise TypeError(f"unsupported TOML value: {value!r}")
-
-
 def _home_from_row(row: tuple) -> HomeRecord:
-    import json
-
     required = {item for item in str(row[7]).split(",") if item}
     return HomeRecord(
         cli_type=str(row[0]),
@@ -417,4 +473,13 @@ def _home_from_row(row: tuple) -> HomeRecord:
         updated_at=str(row[5]),
         fixed_env=dict(json.loads(row[6] or "{}")),
         required_env=required,
+        schema_version=int(row[8] or 1),
+        provider_type=str(row[9] or row[0]),
+        materialization_manifest_ref=row[10],
+        materialization_manifest_hash=row[11],
+        base_config_fingerprint=row[12],
+        resolved_defaults=dict(json.loads(row[13])) if row[13] else None,
+        capability_snapshot=dict(json.loads(row[14])) if row[14] else None,
+        warnings=list(json.loads(row[15] or "[]")),
+        provider_payload=dict(json.loads(row[16])) if row[16] else None,
     )
