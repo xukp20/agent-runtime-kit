@@ -56,7 +56,6 @@ from .models import (
 from .protocols import (
     ProviderArtifactAdapter,
     ProviderCapabilityResolver,
-    ProviderCompatibilityAdapter,
     ProviderContextAdapter,
     ProviderHomeRenderer,
     ProviderQueryAdapter,

@@ -345,16 +345,17 @@ def test_pi_agent_service_snapshot_restore_and_standard_query(tmp_path: Path) ->
         )
     )
     service.ensure_provider_home_initialized("pi", "pi-worker", workdir=str(tmp_path))
-    agent = service.create_agent("scope-pi", "pi-worker", cli_type="pi")
+    agent = service.create_agent("scope-pi", "pi-worker", provider_type="pi")
     service.start_agent(agent.agent_id, workdir=str(tmp_path))
     result = service.wait_agent(agent.agent_id, 60)
     assert result.final_text == "ARK_PI_PROVIDER_DONE"
     persisted = service.get_agent(agent.agent_id)
-    assert persisted.thread_id == result.session_locator.session_id
+    assert persisted.session_locator == result.session_locator
     usage = service.query_usage(agent.agent_id, latest=True)
     assert usage.request_count == 2
 
-    session_path = tmp_path / str(persisted.rollout_relpath)
+    assert persisted.artifact_locator is not None
+    session_path = tmp_path / str(persisted.artifact_locator.native_primary_ref)
     original = session_path.read_bytes()
     snapshots = AgentSnapshotService(tmp_path, store=service.store, agent_service=service)
     snapshot = snapshots.create_scope_snapshot("scope-pi")
@@ -364,7 +365,7 @@ def test_pi_agent_service_snapshot_restore_and_standard_query(tmp_path: Path) ->
     assert restored.status == "created"
     assert session_path.read_bytes() == original
     assert service.query_usage(agent.agent_id, latest=True).request_count == 2
-    restored_session_id = service.get_agent(agent.agent_id).thread_id
+    restored_session_id = service.get_agent(agent.agent_id).session_locator.session_id
     service.pause_controller.resume("scope-pi")
     service.start_agent(agent.agent_id, workdir=str(tmp_path))
     resumed = service.wait_agent(agent.agent_id, 60)

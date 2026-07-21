@@ -70,14 +70,14 @@ class SubmittingAgentService:
         self,
         scope_id: str,
         agent_type: str,
-        cli_type: str = "codex",
+        provider_type: str = "codex",
         home_id: str | None = None,
     ) -> Agent:
         agent = Agent(
             agent_id="agent-1",
             scope_id=scope_id,
             agent_type=agent_type,
-            cli_type=cli_type,
+            provider_type=provider_type or "codex",
             home_id=home_id or agent_type,
         )
         self.agents[agent.agent_id] = agent

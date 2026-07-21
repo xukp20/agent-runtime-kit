@@ -25,19 +25,24 @@ from pathlib import Path
 from agent_runtime_kit.agent.provider_contracts import (
     ModelBackendIdentity,
     ProviderHomeSpec,
+    ProviderRegistry,
 )
 from agent_runtime_kit.agent.providers import (
     ClaudeCodeHomeOptions,
     ClaudeCodeProvider,
 )
 from agent_runtime_kit.agent.service import AgentService
+from agent_runtime_kit.agent.providers.claude_code_bundle import (
+    build_claude_code_provider_bundle,
+)
 
 runtime_root = Path(".agent_runtime")
+provider = ClaudeCodeProvider(runtime_root=runtime_root)
 service = AgentService(
     runtime_root,
-    providers={
-        "claude_code": ClaudeCodeProvider(runtime_root=runtime_root),
-    },
+    provider_registry=ProviderRegistry(
+        (build_claude_code_provider_bundle(provider, runtime_root=runtime_root),)
+    ),
 )
 service.create_home(
     ProviderHomeSpec(

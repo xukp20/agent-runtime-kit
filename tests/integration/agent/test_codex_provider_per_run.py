@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.homes import ProviderHomeSpec
 from agent_runtime_kit.agent.models import AgentContextCompactionEvidenceError
-from agent_runtime_kit.agent.provider_contracts import ProviderRunState
+from agent_runtime_kit.agent.provider_contracts import ProviderRegistry, ProviderRunState
 from agent_runtime_kit.agent.providers.codex import CodexProvider
+from agent_runtime_kit.agent.providers.codex_bundle import build_codex_provider_bundle
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 
 
@@ -310,9 +311,11 @@ def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
     service = AgentService(
         tmp_path / "runtime",
         agent_types=registry,
-        providers={"codex": provider},
+        provider_registry=ProviderRegistry(
+            (build_codex_provider_bundle(provider, runtime_root=tmp_path / "runtime"),)
+        ),
     )
-    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="live-locator"))
+    service.home_service.create_home(ProviderHomeSpec(provider_type="codex", home_id="live-locator"))
     agent = service.create_agent("scope", "live-locator")
 
     service.start_agent(agent.agent_id, variables={"item": "state"})
@@ -320,26 +323,24 @@ def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
 
     running = service.get_agent(agent.agent_id)
     assert running.status == "running"
-    assert running.thread_id == "thread-started"
+    assert running.session_locator is not None
+    assert running.session_locator.session_id == "thread-started"
     assert provider.list_active_agents("live-locator") == [agent.agent_id]
 
     release.set()
-    legacy_result = service.wait_agent(agent.agent_id)
-    standard_result = service.wait_agent_result(agent.agent_id)
-    assert legacy_result.id == "turn-Start state."
-    assert standard_result.status is ProviderRunState.COMPLETED
-    assert standard_result.session_locator.session_id == "thread-started"
-    assert standard_result.turn_locator is not None
-    assert standard_result.turn_locator.turn_id == "turn-Start state."
-    assert standard_result.completion is not None
-    assert standard_result.completion.status == "complete"
+    result = service.wait_agent(agent.agent_id)
+    assert result.status is ProviderRunState.COMPLETED
+    assert result.session_locator.session_id == "thread-started"
+    assert result.turn_locator is not None
+    assert result.turn_locator.turn_id == "turn-Start state."
+    assert result.completion is not None
+    assert result.completion.status == "complete"
     persisted = service.get_agent(agent.agent_id)
-    assert persisted.schema_version == 2
+    assert persisted.schema_version == 3
     assert persisted.provider_type == "codex"
-    assert persisted.session_locator == standard_result.session_locator
-    assert persisted.latest_turn_locator == standard_result.turn_locator
-    assert persisted.artifact_locator == standard_result.provider_result.artifact_locator
-    assert persisted.thread_id == standard_result.session_locator.session_id
+    assert persisted.session_locator == result.session_locator
+    assert persisted.latest_turn_locator == result.turn_locator
+    assert persisted.artifact_locator == result.provider_result.artifact_locator
     assert service.provider_registry.get("codex").provider_type == "codex"
     assert provider.list_active_agents("live-locator") == []
 
@@ -356,9 +357,11 @@ def test_agent_service_interrupt_waits_until_codex_turn_is_terminal(tmp_path: Pa
     service = AgentService(
         tmp_path / "runtime",
         agent_types=registry,
-        providers={"codex": provider},
+        provider_registry=ProviderRegistry(
+            (build_codex_provider_bundle(provider, runtime_root=tmp_path / "runtime"),)
+        ),
     )
-    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="live-locator"))
+    service.home_service.create_home(ProviderHomeSpec(provider_type="codex", home_id="live-locator"))
     agent = service.create_agent("scope", "live-locator")
     service.start_agent(agent.agent_id, variables={"item": "state"})
     assert started.wait(timeout=5)
@@ -481,7 +484,7 @@ def test_codex_provider_compact_waits_for_rollout_evidence_and_idle(tmp_path: Pa
     )
 
     assert result.usage_after is not None
-    assert result.usage_after.total_tokens == 20
+    assert result.usage_after.used_tokens == 20
     assert len(started) == 1
     assert started[0][0]["token_count_count"] == 1
     assert provider.list_active_agents() == []

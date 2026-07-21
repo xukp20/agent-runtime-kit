@@ -594,8 +594,7 @@ class OpenAIAgentsRuntimeAdapter:
             home_id=session.home_id,
             session_id=session.session_id,
             adapter_version="1",
-            # Keep the legacy Agent.rollout_relpath field Codex-only. The artifact
-            # adapter derives the SQLite path from the neutral session locator.
+            # The artifact adapter derives the SQLite path from the session locator.
             native_primary_ref=None,
         )
 

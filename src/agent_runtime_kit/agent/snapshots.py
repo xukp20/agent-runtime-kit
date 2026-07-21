@@ -398,7 +398,7 @@ class AgentSnapshotService:
                 if restored_scope_dir.exists():
                     shutil.copytree(restored_scope_dir, current_scope_dir)
                 self._restore_report_files(files_root)
-                self._restore_provider_artifacts_or_legacy(manifest, files_root)
+                self._restore_provider_artifacts(manifest, files_root)
                 self.store.rebuild_scope_index(scope_id)
                 self.store.rebuild_global_index()
                 self._rebuild_flow_indexes(scope_id)
@@ -492,7 +492,7 @@ class AgentSnapshotService:
                         if restored_scope_dir.exists():
                             shutil.copytree(restored_scope_dir, current_scope_dir)
                         self._restore_report_files(files_root)
-                        self._restore_provider_artifacts_or_legacy(scope_manifest, files_root)
+                        self._restore_provider_artifacts(scope_manifest, files_root)
                     except BaseException as exc:
                         errors[scope_id] = exc
                 self.store.rebuild_global_index()
@@ -671,16 +671,11 @@ class AgentSnapshotService:
             snapshot_relpath=snapshot_relpath,
         )
 
-    def _restore_home_files(self, files_root: Path) -> None:
-        homes_root = files_root / "homes"
-        if not homes_root.exists():
-            return
-        shutil.copytree(homes_root, self.runtime_root / "homes", dirs_exist_ok=True)
-
     def _copy_report_files(self, agent_id: str, files_root: Path) -> None:
         if not self.trace_report_policy.include_in_snapshots:
             return
-        source = self.store.report_dir(agent_id)
+        paths = self.agent_service.get_default_trace_report_paths(agent_id)
+        source = Path(paths.reports_root)
         if not source.exists():
             return
         target = files_root / source.relative_to(self.runtime_root)
@@ -696,7 +691,8 @@ class AgentSnapshotService:
 
     def _remove_report_files_for_agents(self, agents: list[Any]) -> None:
         for agent in agents:
-            report_dir = self.store.report_dir(str(agent.agent_id))
+            paths = self.agent_service.get_default_trace_report_paths(str(agent.agent_id))
+            report_dir = Path(paths.reports_root)
             if report_dir.exists():
                 shutil.rmtree(report_dir)
 
@@ -706,21 +702,11 @@ class AgentSnapshotService:
         files_root: Path,
     ) -> ProviderArtifactManifest | None:
         session = self._provider_session(agent)
-        bundle = self._provider_bundle(str(getattr(agent, "cli_type", "")))
-        adapter = bundle.artifacts if bundle is not None else None
-        if session is not None and adapter is not None:
-            native = session.native_locator if isinstance(session.native_locator, dict) else {}
-            if (
-                getattr(agent, "artifact_locator", None) is None
-                and not native.get("rollout_relpath")
-                and not getattr(agent, "rollout_relpath", None)
-            ):
-                # COMPAT(legacy-placeholder-session): LC and older callers may
-                # create an Agent with a placeholder thread_id before any
-                # provider run. Old snapshots skipped its absent rollout. Keep
-                # that behavior only while no artifact was ever declared; a
-                # declared-but-missing artifact still fails closed below.
-                return None
+        if session is None:
+            return None
+        bundle = self._provider_bundle(agent.provider_type)
+        adapter = bundle.artifacts
+        if adapter is not None:
             stability = adapter.wait_quiescent(
                 ArtifactStabilityRequest(session=session, agent_id=str(agent.agent_id))
             )
@@ -739,24 +725,16 @@ class AgentSnapshotService:
             if not captured.manifest.stable:
                 raise RuntimeError(f"provider returned an unstable artifact manifest: {agent.agent_id}")
             return captured.manifest
-
-        # COMPAT(legacy-provider-artifact-copy): injected providers without a
-        # Provider bundle still use AgentStore.locate_rollout(). Remove after
-        # external provider takeover tests register an Artifact adapter.
-        rollout = self.store.locate_rollout(str(agent.agent_id))
-        if rollout is not None and rollout.exists():
-            relpath = rollout.relative_to(self.runtime_root)
-            target = files_root / relpath
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(rollout, target)
-        return None
+        raise RuntimeError(f"provider does not support artifact snapshot: {agent.provider_type}")
 
     def _prepare_provider_artifacts(self, agents: list[Any]) -> None:
         for agent in agents:
             session = self._provider_session(agent)
-            bundle = self._provider_bundle(str(getattr(agent, "cli_type", "")))
-            adapter = bundle.artifacts if bundle is not None else None
-            if session is not None and adapter is not None:
+            if session is None:
+                continue
+            bundle = self._provider_bundle(agent.provider_type)
+            adapter = bundle.artifacts
+            if adapter is not None:
                 manifest = adapter.describe(
                     ArtifactDescribeRequest(session=session, agent_id=str(agent.agent_id))
                 )
@@ -767,24 +745,14 @@ class AgentSnapshotService:
                     )
                 )
                 continue
-            # COMPAT(legacy-provider-artifact-cleanup): no Provider bundle is
-            # available, so remove only the path resolved by AgentStore.
-            rollout = self.store.locate_rollout(str(agent.agent_id))
-            if rollout is not None and rollout.is_file():
-                rollout.unlink()
+            raise RuntimeError(f"provider does not support artifact restore: {agent.provider_type}")
 
-    def _restore_provider_artifacts_or_legacy(
+    def _restore_provider_artifacts(
         self,
         snapshot_manifest: dict[str, Any],
         files_root: Path,
     ) -> None:
         artifact_records = snapshot_manifest.get("provider_artifacts")
-        if not artifact_records:
-            # COMPAT(legacy-snapshot-provider-files): schema v1/v2 and injected
-            # provider snapshots stored files under homes/ without a Provider
-            # Artifact Manifest. Remove after the supported migration window.
-            self._restore_home_files(files_root)
-            return
         if not isinstance(artifact_records, list):
             raise RuntimeError("scope snapshot has an invalid provider_artifacts manifest")
         for record in artifact_records:
@@ -792,7 +760,7 @@ class AgentSnapshotService:
                 raise RuntimeError("scope snapshot has an invalid provider artifact record")
             manifest = _provider_artifact_manifest_from_dict(record["manifest"])
             bundle = self._provider_bundle(manifest.provider_type)
-            if bundle is None or bundle.artifacts is None:
+            if bundle.artifacts is None:
                 raise RuntimeError(
                     f"provider Artifact adapter is unavailable during restore: {manifest.provider_type}"
                 )
@@ -809,23 +777,15 @@ class AgentSnapshotService:
             bundle.artifacts.rebuild_after_restore(request)
 
     def _provider_bundle(self, provider_type: str):  # noqa: ANN202
-        getter = getattr(self.agent_service, "get_provider_bundle", None)
-        return getter(provider_type) if callable(getter) else None
+        if self.agent_service is None:
+            raise RuntimeError("agent_service is required for provider snapshot operations")
+        return self.agent_service.get_provider_bundle(provider_type)
 
     def _provider_session(self, agent: Any) -> ProviderSessionLocator | None:
-        session_id = getattr(agent, "thread_id", None)
-        if not session_id:
-            return None
-        exact = getattr(agent, "session_locator", None)
-        if isinstance(exact, ProviderSessionLocator):
-            return exact
-        return ProviderSessionLocator(
-            provider_type=str(getattr(agent, "cli_type", "")),
-            session_id=str(session_id),
-            home_id=str(getattr(agent, "home_id", "")),
-            created_at=str(getattr(agent, "created_at", "") or utc_now_iso()),
-            native_locator={"rollout_relpath": getattr(agent, "rollout_relpath", None)},
-        )
+        session = getattr(agent, "session_locator", None)
+        if session is None or isinstance(session, ProviderSessionLocator):
+            return session
+        raise TypeError(f"invalid ProviderSessionLocator for agent: {agent.agent_id}")
 
     def _read_scope_manifest(self, snapshot_id: str) -> dict[str, Any]:
         return read_json(self._scope_snapshot_dir(snapshot_id) / "snapshot.json")
@@ -850,9 +810,11 @@ class AgentSnapshotService:
         return entries
 
     def _preflight_scope_snapshot(self, snapshot_id: str, *, manifest: dict[str, Any]) -> None:
+        if int(manifest.get("schema_version", 0)) != 3:
+            raise RuntimeError(f"unsupported scope snapshot schema: {manifest.get('schema_version')}")
+        if not isinstance(manifest.get("provider_artifacts"), list):
+            raise RuntimeError(f"scope snapshot {snapshot_id} lacks provider artifact manifests")
         entries = manifest.get("files")
-        if entries is None:
-            return
         if not isinstance(entries, list):
             raise RuntimeError(f"scope snapshot {snapshot_id} has an invalid files manifest")
         files_root = self._scope_snapshot_dir(snapshot_id) / "files"

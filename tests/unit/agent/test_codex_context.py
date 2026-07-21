@@ -19,8 +19,8 @@ def test_inspect_codex_rollout_context_uses_last_usage_total_tokens(tmp_path: Pa
     usage = inspect_codex_rollout_context(rollout, session_id="thread-1")
 
     assert usage.available
-    assert usage.total_tokens == 80
-    assert usage.context_window == 100
+    assert usage.used_tokens == 80
+    assert usage.effective_context_window_tokens == 100
 
 
 def test_inspect_codex_rollout_context_uses_latest_complete_token_event(tmp_path: Path) -> None:
@@ -32,7 +32,7 @@ def test_inspect_codex_rollout_context_uses_latest_complete_token_event(tmp_path
 
     usage = inspect_codex_rollout_context(rollout, session_id="thread-1")
 
-    assert usage.total_tokens == 20
+    assert usage.used_tokens == 20
 
 
 def test_inspect_codex_rollout_context_reports_missing_fields(tmp_path: Path) -> None:
@@ -49,7 +49,7 @@ def test_inspect_codex_rollout_context_reports_missing_fields(tmp_path: Path) ->
 
     assert not usage.available
     assert usage.reason == "context_window_missing"
-    assert usage.total_tokens == 10
+    assert usage.used_tokens == 10
 
 
 def test_compact_evidence_requires_new_markers_after_baseline(tmp_path: Path) -> None:
@@ -68,7 +68,7 @@ def test_compact_evidence_requires_new_markers_after_baseline(tmp_path: Path) ->
     )
 
     assert evidence.complete
-    assert evidence.usage.total_tokens == 20
+    assert evidence.usage.used_tokens == 20
 
 
 def test_compact_evidence_does_not_reuse_old_markers(tmp_path: Path) -> None:

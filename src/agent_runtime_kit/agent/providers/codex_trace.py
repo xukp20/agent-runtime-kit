@@ -1,22 +1,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Literal
-
-
-@dataclass(frozen=True)
-class AgentRolloutInfo:
-    agent_id: str
-    agent_type: str
-    home_id: str
-    thread_id: str | None
-    rollout_relpath: str | None
-    rollout_path: str | None
-    exists: bool
-    event_count: int
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -68,65 +55,12 @@ class AgentToolCallView:
     raw_output_event: dict[str, Any] | None = None
 
 
-@dataclass(frozen=True)
-class AgentArtifactView:
-    path: str | None
-    exists: bool
-    json: object | None = None
-    summary: dict[str, Any] | None = None
-    read_error: str | None = None
-
-
-@dataclass(frozen=True)
-class AgentTraceReport:
-    rollout: AgentRolloutInfo
-    turns: list[AgentTurnSummary]
-    latest_turn: AgentTurnSummary | None
-    response_texts: list[AgentResponseTextView]
-    tool_search_count: int
-    tool_calls: list[AgentToolCallView]
-    slow_tool_calls: list[AgentToolCallView]
-    artifact: AgentArtifactView | None = None
-    warnings: list[str] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class AgentTraceReportPaths:
-    agent_id: str
-    reports_root: str
-    latest_json_path: str
-    latest_markdown_path: str
-    turn_json_path: str | None = None
-    turn_markdown_path: str | None = None
-    written_paths: list[str] = field(default_factory=list)
-
-
 class AgentTraceReader:
-    """Read-only parser for provider rollout JSONL events."""
+    """Parse Codex rollout events for the provider-neutral query adapter."""
 
-    def __init__(
-        self,
-        *,
-        agent: object,
-        rollout_path: Path | None,
-        events: list[dict[str, Any]],
-    ) -> None:
-        self.agent = agent
-        self.rollout_path = Path(rollout_path) if rollout_path is not None else None
+    def __init__(self, *, events: list[dict[str, Any]]) -> None:
         self.events = list(events)
         self._parsed: _ParsedTrace | None = None
-
-    def get_rollout_info(self) -> AgentRolloutInfo:
-        return AgentRolloutInfo(
-            agent_id=str(getattr(self.agent, "agent_id", "")),
-            agent_type=str(getattr(self.agent, "agent_type", "")),
-            home_id=str(getattr(self.agent, "home_id", "")),
-            thread_id=_optional_str(getattr(self.agent, "thread_id", None)),
-            rollout_relpath=_optional_str(getattr(self.agent, "rollout_relpath", None)),
-            rollout_path=str(self.rollout_path) if self.rollout_path is not None else None,
-            exists=bool(self.rollout_path is not None and self.rollout_path.exists()),
-            event_count=len(self.events),
-        )
 
     def list_turns(self) -> list[AgentTurnSummary]:
         return list(self._parse().turns)
@@ -226,60 +160,6 @@ class AgentTraceReader:
         if index is not None:
             return _get_by_index(calls, index)
         return None
-
-    def build_trace_report(
-        self,
-        *,
-        artifact_path: str | Path | None = None,
-        slow_call_limit: int = 20,
-    ) -> AgentTraceReport:
-        parsed = self._parse()
-        warnings = list(parsed.warnings)
-        rollout = self.get_rollout_info()
-        if not rollout.exists:
-            warnings.append("rollout file is missing")
-        if rollout.rollout_relpath is None:
-            warnings.append("agent has no rollout_relpath")
-        slow_calls = sorted(
-            [call for call in parsed.tool_calls if call.duration_ms is not None],
-            key=lambda call: call.duration_ms or 0,
-            reverse=True,
-        )[: max(slow_call_limit, 0)]
-        return AgentTraceReport(
-            rollout=rollout,
-            turns=list(parsed.turns),
-            latest_turn=parsed.turns[-1] if parsed.turns else None,
-            response_texts=list(parsed.responses),
-            tool_search_count=parsed.tool_search_count,
-            tool_calls=list(parsed.tool_calls),
-            slow_tool_calls=slow_calls,
-            artifact=_read_artifact(artifact_path) if artifact_path is not None else None,
-            warnings=warnings,
-        )
-
-    def export_trace_report(
-        self,
-        *,
-        output_path: str | Path,
-        format: Literal["json", "markdown"] = "json",
-        artifact_path: str | Path | None = None,
-        slow_call_limit: int = 20,
-    ) -> AgentTraceReport:
-        report = self.build_trace_report(
-            artifact_path=artifact_path,
-            slow_call_limit=slow_call_limit,
-        )
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if format == "json":
-            from ..models import to_jsonable
-
-            path.write_text(json.dumps(to_jsonable(report), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        elif format == "markdown":
-            path.write_text(_trace_report_markdown(report), encoding="utf-8")
-        else:
-            raise ValueError(f"unsupported trace report format: {format}")
-        return report
 
     def _parse(self) -> "_ParsedTrace":
         if self._parsed is None:
@@ -684,101 +564,6 @@ def _maybe_parse_json(value: object) -> object:
     return value
 
 
-def _read_artifact(path: str | Path | None) -> AgentArtifactView:
-    if path is None:
-        return AgentArtifactView(path=None, exists=False)
-    artifact_path = Path(path)
-    if not artifact_path.exists():
-        return AgentArtifactView(path=str(artifact_path), exists=False)
-    try:
-        data = json.loads(artifact_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001 - report should preserve artifact read failures.
-        return AgentArtifactView(path=str(artifact_path), exists=True, read_error=str(exc))
-    return AgentArtifactView(
-        path=str(artifact_path),
-        exists=True,
-        json=data,
-        summary=_artifact_summary(data),
-    )
-
-
-def _artifact_summary(data: object) -> dict[str, Any]:
-    if not isinstance(data, dict):
-        return {"type": type(data).__name__}
-    summary: dict[str, Any] = {"keys": sorted(str(key) for key in data)}
-    for key in (
-        "prompt_marker_seen",
-        "developer_marker_seen",
-        "skill_keys_seen",
-        "application_tools_called",
-        "submit_tool_called",
-        "tool_results",
-    ):
-        if key not in data:
-            continue
-        value = data[key]
-        if isinstance(value, list):
-            summary[key] = {"count": len(value), "items": value[:20]}
-        elif isinstance(value, dict):
-            summary[key] = {"keys": sorted(str(item_key) for item_key in value)}
-        else:
-            summary[key] = value
-    return summary
-
-
-def _trace_report_markdown(report: AgentTraceReport) -> str:
-    latest = report.latest_turn
-    lines = [
-        "# Agent Trace Report",
-        "",
-        "## Rollout",
-        "",
-        f"- Agent: `{report.rollout.agent_id}` (`{report.rollout.agent_type}`)",
-        f"- Thread: `{report.rollout.thread_id}`",
-        f"- Rollout: `{report.rollout.rollout_path}`",
-        f"- Events: {report.rollout.event_count}",
-        "",
-        "## Latest Turn",
-        "",
-    ]
-    if latest is None:
-        lines.append("- No parsed turns.")
-    else:
-        lines.extend(
-            [
-                f"- Turn: `{latest.turn_id}`",
-                f"- Status: `{latest.status}`",
-                f"- Duration ms: `{latest.duration_ms}`",
-                f"- Final response: {latest.final_response or ''}",
-            ]
-        )
-    lines.extend(["", "## Tool Calls", "", "| # | Tool | Duration ms | OK |", "|---:|---|---:|---|"])
-    for call in report.tool_calls:
-        lines.append(
-            f"| {call.call_index} | `{call.tool_name or ''}` | "
-            f"{'' if call.duration_ms is None else call.duration_ms} | "
-            f"{'' if call.ok is None else call.ok} |"
-        )
-    lines.extend(["", "## Slow Tool Calls", "", "| # | Tool | Duration ms |", "|---:|---|---:|"])
-    for call in report.slow_tool_calls:
-        lines.append(f"| {call.call_index} | `{call.tool_name or ''}` | {call.duration_ms} |")
-    if report.artifact is not None:
-        lines.extend(
-            [
-                "",
-                "## Artifact",
-                "",
-                f"- Path: `{report.artifact.path}`",
-                f"- Exists: `{report.artifact.exists}`",
-                f"- Summary: `{json.dumps(report.artifact.summary or {}, sort_keys=True)}`",
-            ]
-        )
-    if report.warnings:
-        lines.extend(["", "## Warnings", ""])
-        lines.extend(f"- {warning}" for warning in report.warnings)
-    return "\n".join(lines) + "\n"
-
-
 def _duration_ms(started_at: object | None, completed_at: object | None) -> int | None:
     start = _timestamp_ms(started_at)
     end = _timestamp_ms(completed_at)
@@ -828,10 +613,6 @@ def _string_from(mapping: dict[str, Any], *keys: str) -> str | None:
         if isinstance(value, str):
             return value
     return None
-
-
-def _optional_str(value: object | None) -> str | None:
-    return str(value) if value is not None else None
 
 
 def _get_by_index(values: list[Any], index: int) -> Any | None:

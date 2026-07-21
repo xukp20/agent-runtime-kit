@@ -49,7 +49,7 @@ current-code reference are the authoritative API guides.
   fail-closed recovery, snapshot behavior, and the optional provider contract.
 - [Provider adapters and normalized Agent runtime](provider-adapters.md):
   Provider Registry, capabilities, Home/runtime/query/context/artifact SPI,
-  normalized records and results, and migration compatibility.
+  normalized records and results, and strict schema-v3 persistence.
 - [Claude Code provider](claude-code-provider.md): isolated Claude Homes,
   Claude Agent SDK runtime assembly, normalized queries, context/compact,
   session-only fork, and transcript snapshot/restore.

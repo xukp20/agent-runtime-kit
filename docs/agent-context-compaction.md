@@ -11,7 +11,6 @@ applications.
 from agent_runtime_kit.agent import AgentContextMaintenancePolicy
 
 usage = agent_service.inspect_agent_context(agent_id)
-expanded_usage = agent_service.inspect_agent_context_result(agent_id)
 
 result = agent_service.compact_agent_if_needed(
     agent_id,
@@ -63,11 +62,11 @@ The journal belongs to scope truth, so scope and runtime snapshots preserve the
 same fail-closed state. Active manual or automatic compaction also participates
 in the existing running-Agent snapshot barrier.
 
-`inspect_agent_context()` retains the compact legacy projection used by
-existing applications. `inspect_agent_context_result()` returns the expanded
-provider-neutral model, including optional effective windows, remaining and
-reserved tokens, categories, measurement quality, model identity, staleness,
-and sanitized provider payload.
+`inspect_agent_context()` returns the provider-neutral expanded model,
+including optional effective windows, remaining and reserved tokens,
+categories, measurement quality, model identity, staleness, and sanitized
+provider payload. Unavailable provider evidence remains `None` and is never
+invented from a Codex-specific alias.
 
 ## Provider contract
 
@@ -77,8 +76,6 @@ A provider bundle exposes a `ProviderContextAdapter` with:
 - `compact(ProviderContextCompactionRequest) -> ProviderContextCompactionResult`
 - `reconcile(ProviderContextReconcileRequest) -> ProviderContextCompactionResult | None`
 
-`compact()` must wait for provider-specific completion and idle
-evidence. Returning immediately after a native “start compaction” response does
-not satisfy the ARK contract. The older `inspect_thread_context()`,
-`compact_thread()`, and `reconcile_thread_compaction()` shapes are retained only
-as a compatibility bridge for existing injected providers.
+`compact()` must wait for provider-specific completion and idle evidence.
+Returning immediately after a native “start compaction” response does not
+satisfy the ARK contract.

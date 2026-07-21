@@ -12,9 +12,11 @@ from agent_runtime_kit.agent.context import (
     AgentContextCompactionStatus,
     AgentContextMaintenanceJournalStatus,
 )
-from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.homes import ProviderHomeSpec
 from agent_runtime_kit.agent.models import AgentPausedError, CompletionDecision
+from agent_runtime_kit.agent.provider_contracts import BaseConfigSource, ProviderRegistry
 from agent_runtime_kit.agent.providers.codex import CodexProvider
+from agent_runtime_kit.agent.providers.codex_home import CodexHomeOptions
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
 
@@ -32,8 +34,8 @@ class RealCodexSmokeAgentType(AgentType):
     continue_prompt_template = "Reply again with exactly this token and no extra text: {{token}}"
 
     def check_completion(self, ctx: AgentCompletionContext) -> CompletionDecision:
-        if not getattr(ctx.turn_result, "id", None):
-            return CompletionDecision(complete=False, reason="turn result has no id")
+        if not ctx.turn_result.run_id:
+            return CompletionDecision(complete=False, reason="turn result has no run id")
         return CompletionDecision(complete=True)
 
 
@@ -55,25 +57,23 @@ def test_real_codex_minimal_run_resume_store_and_pause(tmp_path: Path) -> None:
         )
         restored = service.get_agent(agent.agent_id)
         assert restored.status == "idle"
-        assert restored.thread_id
-        assert restored.rollout_relpath
-        assert getattr(first, "id", None)
-        assert service.store.locate_rollout(agent.agent_id).exists()
-        assert service.read_rollout_events(agent.agent_id)
-        assert service.read_thread(agent.agent_id, include_turns=True) is not None
-        assert service.list_turns(agent.agent_id)
+        assert restored.session_locator is not None
+        assert restored.artifact_locator is not None
+        assert first.run_id
+        assert service.query_events(agent.agent_id).items
+        assert service.query_turns(agent.agent_id).items
 
-        before_events = len(service.read_rollout_events(agent.agent_id))
+        before_events = len(service.query_events(agent.agent_id).items)
         second = service.wait_agent(
             service.start_agent(agent.agent_id, variables={"token": "ARK_OK_SECOND"}).agent_id,
             timeout_s=600,
         )
         resumed = service.get_agent(agent.agent_id)
-        assert resumed.thread_id == restored.thread_id
-        assert resumed.rollout_relpath == restored.rollout_relpath
-        assert getattr(second, "id", None)
-        assert len(service.read_rollout_events(agent.agent_id)) > before_events
-        assert service.read_latest_turn_result(agent.agent_id) is not None
+        assert resumed.session_locator == restored.session_locator
+        assert resumed.artifact_locator == restored.artifact_locator
+        assert second.run_id
+        assert len(service.query_events(agent.agent_id).items) > before_events
+        assert service.query_turn(agent.agent_id, latest=True) is not None
     finally:
         service.close()
 
@@ -100,7 +100,7 @@ def test_real_codex_developer_instruction_override_on_resume(tmp_path: Path) -> 
             timeout_s=600,
         )
         first_agent = service.get_agent(agent.agent_id)
-        assert first_agent.thread_id
+        assert first_agent.session_locator is not None
         first_text = _latest_text(service, agent.agent_id)
         assert "ARK_DYNAMIC_INSTRUCTION_FIRST" in first_text
 
@@ -120,7 +120,7 @@ def test_real_codex_developer_instruction_override_on_resume(tmp_path: Path) -> 
         )
         second_agent = service.get_agent(agent.agent_id)
         second_text = _latest_text(service, agent.agent_id)
-        assert second_agent.thread_id == first_agent.thread_id
+        assert second_agent.session_locator == first_agent.session_locator
         assert "ARK_DYNAMIC_INSTRUCTION_SECOND" in second_text
     finally:
         service.close()
@@ -138,10 +138,10 @@ def test_real_codex_multi_scope_snapshot_flow(tmp_path: Path) -> None:
         service.start_agent(child_agent.agent_id, variables={"token": "ARK_CHILD"})
         waited = service.wait_agents([root_agent.agent_id, child_agent.agent_id], timeout_s=600)
         assert waited.clean
-        assert service.get_agent(root_agent.agent_id).thread_id
-        assert service.get_agent(child_agent.agent_id).thread_id
-        assert service.get_agent(root_agent.agent_id).rollout_relpath
-        assert service.get_agent(child_agent.agent_id).rollout_relpath
+        assert service.get_agent(root_agent.agent_id).session_locator is not None
+        assert service.get_agent(child_agent.agent_id).session_locator is not None
+        assert service.get_agent(root_agent.agent_id).artifact_locator is not None
+        assert service.get_agent(child_agent.agent_id).artifact_locator is not None
         assert not service.list_running_agents()
         assert not service.has_running_agents()
         assert service.is_stable()
@@ -187,7 +187,7 @@ def test_real_codex_context_compact_resume_and_snapshot_restore(tmp_path: Path) 
 
         before = service.inspect_agent_context(agent.agent_id)
         assert before.available
-        assert before.total_tokens is not None
+        assert before.used_tokens is not None
         compacted = service.compact_agent(agent.agent_id, timeout_s=600)
         assert compacted.status is AgentContextCompactionStatus.COMPACTED
         assert compacted.usage_after is not None
@@ -227,32 +227,38 @@ def _service(runtime_root: Path) -> AgentService:
         sdk_python_root=_sdk_python_root(),
         model=os.environ.get("ARK_REAL_CODEX_MODEL"),
     )
-    return AgentService(runtime_root, agent_types=registry, providers={"codex": provider})
+    return AgentService(
+        runtime_root,
+        agent_types=registry,
+        provider_registry=ProviderRegistry((provider.build_provider_bundle(runtime_root=runtime_root),)),
+    )
 
 
 def _create_codex_home(service: AgentService, home_id: str) -> None:
     config_dir = _config_dir()
     skills_dir = config_dir / "skills"
     service.home_service.create_home(
-        HomeCreateSpec(
-            cli_type="codex",
+        ProviderHomeSpec(
+            provider_type="codex",
             home_id=home_id,
-            base_config_path=config_dir / "config.toml",
-            auth_json_path=config_dir / "auth.json",
-            skill_paths={
-                path.name: path
-                for path in sorted(skills_dir.iterdir())
-                if path.is_dir() and (path / "SKILL.md").exists()
-            }
-            if skills_dir.exists()
-            else {},
+            base_config=BaseConfigSource(path=str(config_dir / "config.toml")),
+            provider_options=CodexHomeOptions(
+                auth_json_path=config_dir / "auth.json",
+                skill_paths={
+                    path.name: path
+                    for path in sorted(skills_dir.iterdir())
+                    if path.is_dir() and (path / "SKILL.md").exists()
+                }
+                if skills_dir.exists()
+                else {},
+            ),
         )
     )
 
 
 def _latest_text(service: AgentService, agent_id: str) -> str:
-    latest = service.read_latest_turn_result(agent_id)
-    text = getattr(latest, "final_response", None)
+    latest = service.query_turn(agent_id, latest=True)
+    text = latest.result.final_text if latest is not None and latest.result is not None else None
     assert isinstance(text, str), f"latest turn has no final response: {latest!r}"
     return text
 

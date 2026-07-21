@@ -23,9 +23,7 @@ class AgentStepState(BaseStepState):
     state_type: str = "agent_step"
     agent_role: str
     agent_type: str | None = None
-    # Empty means: resolve the Provider from the registered AgentType. Existing
-    # persisted states that explicitly contain "codex" keep their old binding.
-    cli_type: str = ""
+    provider_type: str | None = None
     home_id: str | None = None
     create_agent_if_missing: bool = False
     bind_created_agent_to: Literal["step", "flow"] = "step"
@@ -131,7 +129,7 @@ class AgentStep(BaseStep):
         agent = agent_service.create_agent(
             ctx.scope_id,
             state.agent_type,
-            cli_type=state.cli_type,
+            provider_type=state.provider_type,
             home_id=state.home_id,
         )
         return str(agent.agent_id)
@@ -405,7 +403,7 @@ def build_followup_agent_step_from_dispatch(
     followup_state = AgentStepState(
         agent_role=source_state.agent_role,
         agent_type=source_state.agent_type,
-        cli_type=source_state.cli_type,
+        provider_type=source_state.provider_type,
         home_id=source_state.home_id,
         create_agent_if_missing=False,
         bind_created_agent_to="step",

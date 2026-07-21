@@ -59,10 +59,9 @@ data may be retained in a bounded, secret-sanitized `ProviderPayload`, but it
 is not the primary application contract.
 
 `AgentType.provider_type` and `AgentType.default_home_id` declare the normal
-execution binding. `AgentStepState.cli_type` is an optional per-Step override;
-when omitted, `AgentService` resolves the Provider and Home from `AgentType`.
-Legacy Step records that explicitly contain `cli_type = "codex"` continue to
-run with Codex.
+execution binding. `AgentStepState.provider_type` is an optional per-Step
+override; when omitted, `AgentService` resolves the Provider and Home from
+`AgentType`.
 
 ## Capability Rules
 
@@ -84,10 +83,11 @@ responsibilities.
 
 ## Persistent Records and Snapshots
 
-Agent record schema v2 stores `provider_type`, session/latest-turn/artifact
-locators, and explicit fork information. During migration, Codex records also
-write `cli_type`, `thread_id`, and `rollout_relpath`. Existing schema-v1 records
-and scope snapshots remain readable.
+Agent record schema v3 stores `provider_type`, exact session/latest-turn/
+artifact locators, and explicit fork information. ARK 0.3 reads and writes
+schema v3 only. Pre-v3 Agent, Home, and snapshot records must be migrated by an
+external one-time tool before this runtime is started; the runtime never
+guesses missing provider identity or artifact ownership.
 
 `AgentSnapshotService` owns scope/runtime pausing, stable-point coordination,
 archive integrity, and index rebuilding. It delegates every provider-specific
@@ -119,14 +119,13 @@ the hash of the ARK Home materialization manifest as a restore-time reference;
 the Home is validated but not duplicated into every session snapshot. Pi
 snapshot and fork operations do not capture or roll back workspace files.
 
-## Codex Compatibility
+## Standard AgentService Results
 
-Existing application calls such as `wait_agent()`, legacy trace readers, and
-Codex-shaped completion checkers keep their current behavior. New integrations
-can use `wait_agent_result()`, `query_*()`, and
-`inspect_agent_context_result()` for normalized values. Compatibility paths
-are explicitly marked in source and have migration tests; they are not the
-template for new provider implementations.
+`wait_agent()` returns `AgentTurnResult`. Completion checkers receive that same
+normalized object. Applications inspect `provider_result`, `session_locator`,
+`turn_locator`, `final_text`, and `query_*()` results without depending on a
+provider SDK object. Native evidence is retained only in sanitized
+`ProviderPayload` or provider-private locators.
 
 ## Pi Adapter
 
@@ -153,7 +152,7 @@ strategy is configured; ARK does not silently substitute a summarizer. See
 [OpenAI Agents provider](openai-agents-provider.md) for assembly and limits.
 
 The low-level OpenAI Agents and OpenCode run handles can represent provider
-approval/input boundaries, but ARK 0.2 does not expose a complete
+approval/input boundaries, but ARK 0.3 does not expose a complete
 `AgentService`/Flow `NEEDS_INPUT` lifecycle. Applications using those layers
 must configure non-interactive operation; direct handle controls remain an
 extension point for a later common lifecycle.

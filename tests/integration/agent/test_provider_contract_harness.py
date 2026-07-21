@@ -14,7 +14,7 @@ from agent_runtime_kit.agent.provider_contracts import (
     ProviderSessionLocator,
 )
 from agent_runtime_kit.agent.context import AgentContextCompactionStatus
-from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.homes import ProviderHomeSpec
 from agent_runtime_kit.agent.models import AgentContextMaintenanceUnsupported
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 
@@ -117,7 +117,6 @@ def _contract_agent_service(tmp_path, bundle: AgentProviderBundle) -> AgentServi
     return AgentService(
         tmp_path / ".agent_runtime",
         agent_types=agent_types,
-        providers={"contract_fake": object()},
         provider_registry=ProviderRegistry((bundle,)),
     )
 
@@ -126,12 +125,12 @@ def test_agent_service_resume_preserves_exact_provider_session_locator(tmp_path)
     bundle = make_contract_fake_bundle()
     service = _contract_agent_service(tmp_path, bundle)
     service.home_service.create_home(
-        HomeCreateSpec(cli_type="contract_fake", home_id="contract-home")
+        ProviderHomeSpec(provider_type="contract_fake", home_id="contract-home")
     )
     agent = service.create_agent(
         "scope-contract",
         "contract-agent",
-        cli_type="contract_fake",
+        provider_type="contract_fake",
         home_id="contract-home",
     )
     exact = ProviderSessionLocator(
@@ -146,15 +145,13 @@ def test_agent_service_resume_preserves_exact_provider_session_locator(tmp_path)
             requested_model="model-a",
         ),
     )
-    service.store.update_thread_locator(
+    service.store.update_session_locators(
         agent.agent_id,
-        thread_id=exact.session_id,
-        rollout_relpath=None,
         session_locator=exact,
     )
 
     service.start_agent(agent.agent_id)
-    result = service.wait_agent_result(agent.agent_id, timeout_s=2)
+    result = service.wait_agent(agent.agent_id, timeout_s=2)
 
     runtime = bundle.runtime
     assert runtime.handles[-1].request.session_locator == exact
@@ -175,18 +172,16 @@ def test_agent_service_compact_fails_closed_when_context_exists_without_capabili
     )
     service = _contract_agent_service(tmp_path, bundle)
     service.home_service.create_home(
-        HomeCreateSpec(cli_type="contract_fake", home_id="contract-home")
+        ProviderHomeSpec(provider_type="contract_fake", home_id="contract-home")
     )
     agent = service.create_agent(
         "scope-contract",
         "contract-agent",
-        cli_type="contract_fake",
+        provider_type="contract_fake",
         home_id="contract-home",
     )
-    service.store.update_thread_locator(
+    service.store.update_session_locators(
         agent.agent_id,
-        thread_id="session-1",
-        rollout_relpath=None,
         session_locator=ProviderSessionLocator(
             provider_type="contract_fake",
             session_id="session-1",

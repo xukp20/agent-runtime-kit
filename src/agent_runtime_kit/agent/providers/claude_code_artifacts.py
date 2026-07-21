@@ -134,7 +134,7 @@ class ClaudeCodeArtifactAdapter:
     def prepare_restore(self, request: ArtifactRestoreRequest) -> None:
         if Path(request.snapshot_root).resolve() == self.runtime_root.resolve():
             # SnapshotManager first calls prepare_restore with a manifest
-            # described from the live Agent as a legacy cleanup phase. It has
+            # described from the live Agent as a cleanup phase. It has
             # not exposed the snapshot's external Home dependency yet, so
             # deleting here would make a later dependency mismatch destructive.
             # The snapshot-backed prepare call below replaces the exact target.

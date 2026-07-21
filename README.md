@@ -20,11 +20,9 @@ The current implementation includes:
   requirements, MCP server definitions, and materialized skills;
 - a provider-neutral contract layer with descriptors, capabilities, Home
   renderers, runtime handles, query/context/artifact adapters, and a registry;
-- bundled Codex, Claude Code, Pi, OpenAI Agents, and OpenCode providers: Codex
-  preserves its existing SDK compatibility surface, while the other adapters
-  use isolated native Homes and provider-owned session artifacts;
-- versioned Agent records with provider/session/turn/artifact locators plus
-  compatibility aliases for existing Codex runtimes and snapshots;
+- bundled Codex, Claude Code, Pi, OpenAI Agents, and OpenCode providers, all
+  connected through the same provider-neutral contracts and isolated Homes;
+- schema-v3 Agent records with exact provider/session/turn/artifact locators;
 - Agent start, wait, interrupt, session-only fork, close, stale-run
   reconciliation, lifecycle-status observation, normalized results, usage,
   and offline query APIs;
@@ -269,8 +267,8 @@ Agent status wait contracts intended for application monitoring adapters.
   documents context usage, compaction admission, failure recovery, and the
   optional provider contract.
 - [`docs/provider-adapters.md`](docs/provider-adapters.md) documents the
-  provider-neutral contracts, capability rules, extension points, and Codex
-  compatibility surface.
+  provider-neutral contracts, capability rules, extension points, and bundled
+  provider adapters.
 - [`docs/claude-code-provider.md`](docs/claude-code-provider.md) documents the
   bundled Claude Code adapter, configuration, controls, query projection, and
   snapshot semantics.

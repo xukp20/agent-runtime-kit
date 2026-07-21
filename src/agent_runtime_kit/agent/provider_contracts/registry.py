@@ -6,7 +6,6 @@ from .capabilities import ProviderCapabilityUnavailable, ProviderCapabilities, P
 from .protocols import (
     ProviderArtifactAdapter,
     ProviderCapabilityResolver,
-    ProviderCompatibilityAdapter,
     ProviderContextAdapter,
     ProviderHomeRenderer,
     ProviderQueryAdapter,
@@ -23,7 +22,6 @@ class AgentProviderBundle:
     query: ProviderQueryAdapter | None = None
     context: ProviderContextAdapter | None = None
     artifacts: ProviderArtifactAdapter | None = None
-    compatibility: ProviderCompatibilityAdapter | None = None
 
     @property
     def provider_type(self) -> str:
@@ -84,7 +82,6 @@ class ProviderRegistry:
             ("query", bundle.query),
             ("context", bundle.context),
             ("artifacts", bundle.artifacts),
-            ("compatibility", bundle.compatibility),
         ):
             if adapter is None:
                 continue

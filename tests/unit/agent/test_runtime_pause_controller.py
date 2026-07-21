@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.homes import ProviderHomeSpec
 from agent_runtime_kit.agent.models import AgentPausedError
 from agent_runtime_kit.agent.service import AgentRunPauseController, AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.runtime import ARKServices, RuntimePausedError, RuntimePauseController
@@ -79,10 +79,9 @@ def test_agent_service_reuses_shared_runtime_pause_controller(tmp_path: Path) ->
     service = AgentService(
         runtime_root,
         agent_types=registry,
-        providers={"codex": object()},
         ark_services=ark,
     )
-    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="pause_worker"))
+    service.home_service.create_home(ProviderHomeSpec(provider_type="codex", home_id="pause_worker"))
     agent = service.create_agent("scope-a", "pause_worker")
 
     assert service.pause_controller is controller
@@ -103,7 +102,6 @@ def test_agent_service_start_paused_sets_shared_global_pause(tmp_path: Path) -> 
     service = AgentService(
         tmp_path / ".agent_runtime",
         agent_types=registry,
-        providers={"codex": object()},
         ark_services=ark,
         start_paused=True,
     )

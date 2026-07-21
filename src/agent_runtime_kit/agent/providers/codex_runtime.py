@@ -56,11 +56,6 @@ class CodexProviderRunHandle:
     def run_id(self) -> str:
         return self._run_id
 
-    @property
-    def legacy_turn_result(self) -> object | None:
-        native = self._native_result
-        return native.turn_result if native is not None else None
-
     def session_locator(self) -> ProviderSessionLocator | None:
         with self._lock:
             return self._session

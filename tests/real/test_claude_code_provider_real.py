@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.provider_contracts import ModelBackendIdentity, ProviderHomeSpec
+from agent_runtime_kit.agent.provider_contracts import ModelBackendIdentity, ProviderHomeSpec, ProviderRegistry
 from agent_runtime_kit.agent.providers.claude_code import ClaudeCodeProvider
+from agent_runtime_kit.agent.providers.claude_code_bundle import build_claude_code_provider_bundle
 from agent_runtime_kit.agent.providers.claude_code_home import ClaudeCodeHomeOptions
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
@@ -43,20 +44,20 @@ def test_real_claude_deepseek_runtime_context_fork_and_snapshot(tmp_path: Path) 
     agent = service.create_agent(
         "real-claude-scope",
         RealClaudeWorker.agent_type,
-        cli_type="claude_code",
+        provider_type="claude_code",
         home_id="worker",
     )
 
     service.start_agent(agent.agent_id, env=env, workdir=str(tmp_path))
-    first = service.wait_agent_result(agent.agent_id, timeout_s=180).provider_result
+    first = service.wait_agent(agent.agent_id, timeout_s=180).provider_result
     service.start_agent(
         agent.agent_id,
         prompt="Reply with exactly ARK_CLAUDE_REAL_TWO.",
         env=env,
         workdir=str(tmp_path),
     )
-    second = service.wait_agent_result(agent.agent_id, timeout_s=180).provider_result
-    usage = service.inspect_agent_context_result(
+    second = service.wait_agent(agent.agent_id, timeout_s=180).provider_result
+    usage = service.inspect_agent_context(
         agent.agent_id,
         env=env,
         workdir=str(tmp_path),
@@ -108,14 +109,14 @@ def test_real_claude_interrupt_waits_for_terminal_result(tmp_path: Path) -> None
     agent = service.create_agent(
         "real-claude-interrupt-scope",
         RealClaudeInterruptWorker.agent_type,
-        cli_type="claude_code",
+        provider_type="claude_code",
         home_id="worker",
     )
 
     service.start_agent(agent.agent_id, env=env, workdir=str(tmp_path))
     time.sleep(2)
     accepted = service.interrupt_agent(agent.agent_id, timeout_s=30)
-    result = service.wait_agent_result(agent.agent_id, timeout_s=30).provider_result
+    result = service.wait_agent(agent.agent_id, timeout_s=30).provider_result
 
     assert accepted
     assert result.status.value == "interrupted"
@@ -141,10 +142,13 @@ def _service(
     runtime_root = tmp_path / ".agent_runtime"
     registry = AgentTypeRegistry()
     registry.register(agent_type)
+    provider = ClaudeCodeProvider(runtime_root=runtime_root)
     service = AgentService(
         runtime_root,
         agent_types=registry,
-        providers={"claude_code": ClaudeCodeProvider(runtime_root=runtime_root)},
+        provider_registry=ProviderRegistry(
+            (build_claude_code_provider_bundle(provider, runtime_root=runtime_root),)
+        ),
     )
     service.create_home(
         ProviderHomeSpec(

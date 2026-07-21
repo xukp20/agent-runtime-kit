@@ -22,9 +22,11 @@ except ImportError:  # pragma: no cover - real Codex tests skip when MCP is unav
     Context = Any  # type: ignore[misc, assignment]
     FastMCP = None  # type: ignore[assignment]
 
-from agent_runtime_kit.agent.homes import HomeCreateSpec, McpServerSpec
+from agent_runtime_kit.agent.homes import ProviderHomeSpec, McpServerSpec
 from agent_runtime_kit.agent.models import CompletionDecision
+from agent_runtime_kit.agent.provider_contracts import BaseConfigSource, ProviderRegistry
 from agent_runtime_kit.agent.providers.codex import CodexProvider
+from agent_runtime_kit.agent.providers.codex_home import CodexHomeOptions
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
 from agent_runtime_kit.agent.store import AgentStoreService
@@ -82,8 +84,8 @@ class RealFlowSubmitAgentType(AgentType):
     continue_prompt_template = "{{prompt}}"
 
     def check_completion(self, ctx: AgentCompletionContext) -> CompletionDecision:
-        if not getattr(ctx.turn_result, "id", None):
-            return CompletionDecision(complete=False, reason="turn result has no id")
+        if not ctx.turn_result.run_id:
+            return CompletionDecision(complete=False, reason="turn result has no run id")
         return CompletionDecision(complete=True)
 
 
@@ -791,7 +793,7 @@ def make_real_flow_runtime(
     agent_service = AgentService(
         runtime_root,
         agent_types=agent_types,
-        providers={"codex": provider},
+        provider_registry=ProviderRegistry((provider.build_provider_bundle(runtime_root=runtime_root),)),
         ark_services=ark,
         app_services=app,
     )
@@ -825,21 +827,21 @@ def make_real_flow_runtime(
     submit_bridge.start()
     config_dir = codex_config_dir()
     agent_service.create_home(
-        HomeCreateSpec(
-            cli_type="codex",
+        ProviderHomeSpec(
+            provider_type="codex",
             home_id=SUBMIT_HOME_ID,
-            base_config_path=config_dir / "config.toml",
-            auth_json_path=config_dir / "auth.json",
+            base_config=BaseConfigSource(path=str(config_dir / "config.toml")),
+            provider_options=CodexHomeOptions(auth_json_path=config_dir / "auth.json"),
             mcp_servers=[submit_bridge.as_mcp_server_spec()],
         ),
         initialize_provider_home=True,
     )
     agent_service.create_home(
-        HomeCreateSpec(
-            cli_type="codex",
+        ProviderHomeSpec(
+            provider_type="codex",
             home_id=NO_TOOL_HOME_ID,
-            base_config_path=config_dir / "config.toml",
-            auth_json_path=config_dir / "auth.json",
+            base_config=BaseConfigSource(path=str(config_dir / "config.toml")),
+            provider_options=CodexHomeOptions(auth_json_path=config_dir / "auth.json"),
         ),
         initialize_provider_home=True,
     )

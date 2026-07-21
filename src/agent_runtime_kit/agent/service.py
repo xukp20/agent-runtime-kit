@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 import uuid
+import json
+import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
@@ -21,10 +23,8 @@ from .context import (
     AgentContextMaintenanceJournalStatus,
     AgentContextMaintenancePolicy,
     AgentContextUsage,
-    ProviderContextCompactionResult,
-    ProviderContextUsage,
 )
-from .homes import HomeCreateSpec, HomeRecord, HomeService, build_provider_env
+from .homes import HomeRecord, HomeService
 from .models import (
     Agent,
     AgentAlreadyRunningError,
@@ -43,7 +43,7 @@ from .models import (
     WaitAgentsResult,
 )
 from .provider_contracts import (
-    AgentContextUsage as StandardAgentContextUsage,
+    AgentContextUsage,
     AgentEvent,
     AgentProviderBundle,
     AgentTurnResult,
@@ -52,10 +52,10 @@ from .provider_contracts import (
     Page,
     ProviderCapabilityUnavailable,
     ProviderContextCompactionRequest,
-    ProviderContextCompactionResult as StandardProviderContextCompactionResult,
+    ProviderContextCompactionResult,
     ProviderContextQuery,
     ProviderContextReconcileRequest,
-    ProviderContextUsage as StandardProviderContextUsage,
+    ProviderContextUsage,
     ProviderEventQuery,
     ProviderForkRequest,
     ProviderCapabilities,
@@ -67,14 +67,16 @@ from .provider_contracts import (
     ProviderToolQuery,
     ProviderTurnLocator,
     ProviderTurnQuery,
-    ProviderTurnResult,
+    ProviderHomeSpec,
     ProviderUsageQuery,
 )
 from .providers.codex import CodexProvider
+from .providers.codex_bundle import build_codex_provider_bundle
 from .report_policy import AgentTraceReportPolicy, TraceReportPersistence
 from .store import AgentStoreService
 from .store_utils import utc_now_iso
 from .templates import render_template
+from .trace import AgentTraceReport, AgentTraceReportPaths, export_trace_report as write_trace_report
 
 
 @dataclass(frozen=True)
@@ -82,8 +84,8 @@ class RunningAgentAuditRecord:
     agent_id: str
     scope_id: str
     classification: str
-    thread_id: str | None
-    rollout_relpath: str | None
+    session_id: str | None
+    artifact_ref: str | None
     evidence: tuple[str, ...]
 
 
@@ -160,10 +162,9 @@ class AgentTypeRegistry:
 @dataclass(frozen=True)
 class AgentCompletionContext(RuntimeContext):
     agent: Agent
-    turn_result: object
+    turn_result: AgentTurnResult
     auto_continue_count: int
     variables: dict[str, object]
-    standard_turn_result: AgentTurnResult | None = None
 
 
 AgentRunPauseController = RuntimePauseController
@@ -176,8 +177,7 @@ class _ActiveAgentRun:
     done_event: threading.Event
     handle_ready: threading.Event = field(default_factory=threading.Event)
     provider_handle: ProviderRunHandle | None = None
-    latest_result: object | None = None
-    latest_standard_result: AgentTurnResult | None = None
+    latest_result: AgentTurnResult | None = None
     latest_completion: AgentCompletionRecord | None = None
     error: BaseException | None = None
 
@@ -190,7 +190,6 @@ class AgentService:
         agent_types: AgentTypeRegistry | None = None,
         store: AgentStoreService | None = None,
         home_service: HomeService | None = None,
-        providers: dict[str, object] | None = None,
         provider_registry: ProviderRegistry | None = None,
         ark_services: ARKServices | None = None,
         app_services: AppServices | None = None,
@@ -199,21 +198,13 @@ class AgentService:
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.agent_types = agent_types or AgentTypeRegistry()
-        self.providers = providers or {"codex": CodexProvider(runtime_root=self.runtime_root)}
-        self.provider_registry = provider_registry or ProviderRegistry()
-        self._provider_bundle_sources: dict[str, object] = {}
-        for provider_type, provider in self.providers.items():
-            if provider_type in self.provider_registry:
-                continue
-            bundle = _build_provider_bundle(provider, runtime_root=self.runtime_root)
-            if bundle is not None:
-                if bundle.provider_type != provider_type:
-                    raise ValueError(
-                        f"provider bundle key mismatch: {provider_type} != {bundle.provider_type}"
-                    )
-                self.provider_registry.register(bundle)
-                self._provider_bundle_sources[provider_type] = provider
-        self.store = store or AgentStoreService(self.runtime_root, providers=self.providers)
+        if provider_registry is None:
+            codex = CodexProvider(runtime_root=self.runtime_root)
+            provider_registry = ProviderRegistry(
+                (build_codex_provider_bundle(codex, runtime_root=self.runtime_root),)
+            )
+        self.provider_registry = provider_registry
+        self.store = store or AgentStoreService(self.runtime_root)
         if home_service is None:
             renderers = {
                 bundle.provider_type: bundle.home_renderer for bundle in self.provider_registry.list()
@@ -235,32 +226,32 @@ class AgentService:
         self._lock = threading.RLock()
         self._status_condition = threading.Condition(self._lock)
         self._active: dict[str, _ActiveAgentRun] = {}
-        self._latest_standard_results: dict[str, AgentTurnResult] = {}
+        self._latest_results: dict[str, AgentTurnResult] = {}
         self.trace_report_errors: list[dict[str, str]] = []
 
     def create_agent(
         self,
         scope_id: str,
         agent_type: str,
-        cli_type: str | None = None,
+        provider_type: str | None = None,
         home_id: str | None = None,
     ) -> Agent:
         agent_type_spec = self.agent_types.get(agent_type)
-        resolved_cli_type = cli_type or agent_type_spec.provider_type
+        resolved_provider_type = provider_type or agent_type_spec.provider_type
         resolved_home_id = home_id or agent_type_spec.default_home_id or agent_type
-        home = self.home_service.get_home(resolved_cli_type, resolved_home_id)
+        home = self.home_service.get_home(resolved_provider_type, resolved_home_id)
         if home.status != "active":
-            raise RuntimeError(f"home is not active: {resolved_cli_type}/{resolved_home_id}")
+            raise RuntimeError(f"home is not active: {resolved_provider_type}/{resolved_home_id}")
         return self.store.create_agent_record(
             scope_id=scope_id,
             agent_type=agent_type,
-            cli_type=resolved_cli_type,
+            provider_type=resolved_provider_type,
             home_id=resolved_home_id,
         )
 
     def create_home(
         self,
-        spec: HomeCreateSpec,
+        spec: ProviderHomeSpec,
         *,
         initialize_provider_home: bool = True,
         env: dict[str, str] | None = None,
@@ -269,7 +260,7 @@ class AgentService:
         home = self.home_service.create_home(spec)
         if initialize_provider_home:
             self.ensure_provider_home_initialized(
-                home.cli_type,
+                home.provider_type,
                 home.home_id,
                 env=env,
                 workdir=workdir,
@@ -278,37 +269,21 @@ class AgentService:
 
     def ensure_provider_home_initialized(
         self,
-        cli_type: str,
+        provider_type: str,
         home_id: str,
         *,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
     ) -> object | None:
-        bundle = self._provider_bundle(cli_type)
-        if bundle is not None:
-            home = self.home_service.get_home(cli_type, home_id)
-            context = self.home_service.build_execution_context(
-                cli_type,
-                home_id,
-                run_env=env,
-                workdir=workdir,
-            )
-            return bundle.home_renderer.initialize(home, context)
-        provider = self.providers.get(cli_type)
-        if provider is None:
-            raise RuntimeError(f"no provider registered for {cli_type}")
-        ensure = getattr(provider, "ensure_home_initialized", None)
-        if not callable(ensure):
-            return None
-        home = self.home_service.get_home(cli_type, home_id)
-        home_root = self.home_service.resolve_home_root(cli_type, home_id)
-        provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
-        return ensure(
-            home_id=home_id,
-            home_root=home_root,
-            env=provider_env,
+        bundle = self._provider_bundle(provider_type)
+        home = self.home_service.get_home(provider_type, home_id)
+        context = self.home_service.build_execution_context(
+            provider_type,
+            home_id,
+            run_env=env,
             workdir=workdir,
         )
+        return bundle.home_renderer.initialize(home, context)
 
     def get_agent(self, agent_id: str) -> Agent:
         return self.store.get_agent(agent_id)
@@ -416,7 +391,7 @@ class AgentService:
             while True:
                 agent = self.store.get_agent(agent_id)
                 agent_type = self.agent_types.get(agent.agent_type)
-                turn_result, standard_result, thread_id, rollout_relpath = self._execute_provider_turn(
+                turn_result = self._execute_provider_turn(
                     active=active,
                     agent=agent,
                     prompt=current_prompt,
@@ -426,24 +401,12 @@ class AgentService:
                     workdir=workdir,
                 )
                 active.latest_result = turn_result
-                active.latest_standard_result = standard_result
-                if standard_result is not None:
-                    self._latest_standard_results[agent_id] = standard_result
-                self.store.update_thread_locator(
+                self._latest_results[agent_id] = turn_result
+                self.store.update_session_locators(
                     agent_id,
-                    thread_id=thread_id,
-                    rollout_relpath=rollout_relpath,
-                    session_locator=(
-                        standard_result.session_locator if standard_result is not None else None
-                    ),
-                    latest_turn_locator=(
-                        standard_result.turn_locator if standard_result is not None else None
-                    ),
-                    artifact_locator=(
-                        standard_result.provider_result.artifact_locator
-                        if standard_result is not None
-                        else None
-                    ),
+                    session_locator=turn_result.session_locator,
+                    latest_turn_locator=turn_result.turn_locator,
+                    artifact_locator=turn_result.provider_result.artifact_locator,
                 )
                 agent = self.store.get_agent(agent_id)
                 ctx = AgentCompletionContext(
@@ -453,12 +416,11 @@ class AgentService:
                     turn_result=turn_result,
                     auto_continue_count=auto_continue_count,
                     variables=variables,
-                    standard_turn_result=standard_result,
                 )
                 try:
                     decision = agent_type.check_completion(ctx)
                     record = AgentCompletionRecord(
-                        turn_id=_standard_or_legacy_turn_id(standard_result, turn_result),
+                        turn_id=_turn_id(turn_result),
                         decision=decision,
                         status="complete" if decision.complete else "incomplete",
                         auto_continue_count=auto_continue_count,
@@ -466,7 +428,7 @@ class AgentService:
                     )
                 except BaseException as exc:
                     record = AgentCompletionRecord(
-                        turn_id=_standard_or_legacy_turn_id(standard_result, turn_result),
+                        turn_id=_turn_id(turn_result),
                         decision=CompletionDecision(complete=False, reason=str(exc)),
                         status="checker_failed",
                         auto_continue_count=auto_continue_count,
@@ -474,18 +436,16 @@ class AgentService:
                         error_message=str(exc),
                     )
                     self.store.update_completion(agent_id, record)
-                    if standard_result is not None:
-                        standard_result = replace(standard_result, completion=record)
-                        active.latest_standard_result = standard_result
-                        self._latest_standard_results[agent_id] = standard_result
+                    turn_result = replace(turn_result, completion=record)
+                    active.latest_result = turn_result
+                    self._latest_results[agent_id] = turn_result
                     self._export_trace_reports_best_effort(agent_id)
                     active.latest_completion = record
                     raise AgentCompletionCheckError(str(exc)) from exc
                 self.store.update_completion(agent_id, record)
-                if standard_result is not None:
-                    standard_result = replace(standard_result, completion=record)
-                    active.latest_standard_result = standard_result
-                    self._latest_standard_results[agent_id] = standard_result
+                turn_result = replace(turn_result, completion=record)
+                active.latest_result = turn_result
+                self._latest_results[agent_id] = turn_result
                 self._export_trace_reports_best_effort(agent_id)
                 active.latest_completion = record
                 if decision.close_agent:
@@ -528,31 +488,20 @@ class AgentService:
         overwrite_developer_instructions: bool,
         env: dict[str, str] | None,
         workdir: str | None,
-    ) -> tuple[object, AgentTurnResult | None, str, str | None]:
-        bundle = self._provider_bundle(agent.cli_type)
-        if bundle is None:
-            return self._execute_legacy_provider_turn(
-                agent=agent,
-                prompt=prompt,
-                developer_instructions=developer_instructions,
-                overwrite_developer_instructions=overwrite_developer_instructions,
-                env=env,
-                workdir=workdir,
-            )
+    ) -> AgentTurnResult:
+        bundle = self._provider_bundle(agent.provider_type)
         execution_context = self.home_service.build_execution_context(
-            agent.cli_type,
+            agent.provider_type,
             agent.home_id,
             run_env=env,
             workdir=workdir,
         )
-        session_locator = (
-            self._provider_session_locator(agent) if agent.thread_id is not None else None
-        )
+        session_locator = agent.session_locator
         request = ProviderRunRequest(
             agent_id=agent.agent_id,
             scope_id=agent.scope_id,
             agent_type=agent.agent_type,
-            provider_type=agent.cli_type,
+            provider_type=agent.provider_type,
             home_id=agent.home_id,
             session_locator=session_locator,
             prompt=prompt,
@@ -571,10 +520,8 @@ class AgentService:
         active.handle_ready.set()
         locator = handle.session_locator()
         if locator is not None:
-            self.store.update_thread_locator(
+            self.store.update_session_locators(
                 agent.agent_id,
-                thread_id=locator.session_id,
-                rollout_relpath=agent.rollout_relpath,
                 session_locator=locator,
             )
         provider_result = handle.wait_terminal()
@@ -585,78 +532,12 @@ class AgentService:
             home_id=agent.home_id,
             provider_result=provider_result,
         )
-        compatibility_result: object = standard_result
-        if bundle.compatibility is not None:
-            compatibility_result = bundle.compatibility.completion_turn_result(handle, provider_result)
-        rollout_relpath = agent.rollout_relpath
-        if provider_result.artifact_locator is not None:
-            rollout_relpath = provider_result.artifact_locator.native_primary_ref or rollout_relpath
-        return (
-            compatibility_result,
-            standard_result,
-            provider_result.session_locator.session_id,
-            rollout_relpath,
-        )
+        return standard_result
 
-    def _execute_legacy_provider_turn(
-        self,
-        *,
-        agent: Agent,
-        prompt: str,
-        developer_instructions: str | None,
-        overwrite_developer_instructions: bool,
-        env: dict[str, str] | None,
-        workdir: str | None,
-    ) -> tuple[object, None, str, str | None]:
-        # COMPAT(legacy-provider-runtime): preserves injected providers that
-        # implement start_thread/resume_thread instead of ProviderRuntimeAdapter.
-        # Remove after LC runtime-matrix fakes register AgentProviderBundle.
-        home = self.home_service.get_home(agent.cli_type, agent.home_id)
-        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-        provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
-        provider = self.providers[agent.cli_type]
-        common = {
-            "home_id": agent.home_id,
-            "home_root": home_root,
-            "env": provider_env,
-            "workdir": workdir,
-            "prompt": prompt,
-            "developer_instructions": developer_instructions,
-            "overwrite_developer_instructions": overwrite_developer_instructions,
-            "agent_id": agent.agent_id,
-        }
-        if agent.thread_id is None:
-            result = provider.start_thread(**common)
-        else:
-            result = provider.resume_thread(**common, thread_id=agent.thread_id)
-        return result.turn_result, None, result.thread_id, result.rollout_relpath
+    def _provider_bundle(self, provider_type: str) -> AgentProviderBundle:
+        return self.provider_registry.get(provider_type)
 
-    def _provider_bundle(self, provider_type: str) -> AgentProviderBundle | None:
-        current_provider = self.providers.get(provider_type)
-        source = self._provider_bundle_sources.get(provider_type)
-        if provider_type in self.provider_registry and (source is None or source is current_provider):
-            return self.provider_registry.get(provider_type)
-        if source is not None and source is not current_provider:
-            # COMPAT(mutable-providers-dict): LC tests replace providers directly.
-            # Rebuild a bundle when supported, otherwise deliberately fall back
-            # to the legacy provider path for that replacement.
-            replacement = _build_provider_bundle(current_provider, runtime_root=self.runtime_root)
-            if replacement is None:
-                self.provider_registry.unregister(provider_type)
-                self._provider_bundle_sources.pop(provider_type, None)
-                return None
-            self.provider_registry.replace(replacement)
-            self._provider_bundle_sources[provider_type] = current_provider
-            return replacement
-        if provider_type not in self.provider_registry:
-            replacement = _build_provider_bundle(current_provider, runtime_root=self.runtime_root)
-            if replacement is not None:
-                self.provider_registry.register(replacement)
-                self._provider_bundle_sources[provider_type] = current_provider
-                return replacement
-        return None
-
-    def get_provider_bundle(self, provider_type: str) -> AgentProviderBundle | None:
+    def get_provider_bundle(self, provider_type: str) -> AgentProviderBundle:
         """Return the currently effective provider bundle for runtime services."""
 
         return self._provider_bundle(provider_type)
@@ -668,15 +549,19 @@ class AgentService:
             agent = self.store.get_agent(agent_id)
         except KeyError:
             return
-        if agent.thread_id == event.session_id:
+        if agent.session_locator is not None and agent.session_locator.session_id == event.session_id:
             return
-        self.store.update_thread_locator(
+        self.store.update_session_locators(
             agent_id,
-            thread_id=event.session_id,
-            rollout_relpath=agent.rollout_relpath,
+            session_locator=ProviderSessionLocator(
+                provider_type=agent.provider_type,
+                session_id=event.session_id,
+                home_id=agent.home_id,
+                created_at=agent.created_at,
+            ),
         )
 
-    def wait_agent(self, agent_id: str, timeout_s: float | None = None) -> object:
+    def wait_agent(self, agent_id: str, timeout_s: float | None = None) -> AgentTurnResult:
         active = self._active.get(agent_id)
         if active is not None:
             if not active.done_event.wait(timeout_s):
@@ -691,7 +576,21 @@ class AgentService:
                 raise AgentIncompleteError(agent_id, agent.last_completion)
             if agent.last_completion.status == "checker_failed":
                 raise AgentCompletionCheckError(agent.last_completion.error_message or agent_id)
-        return self.read_latest_turn_result(agent_id)
+        result = self._latest_results.get(agent_id)
+        if result is not None:
+            return result
+        view = self.query_turn(agent_id, latest=True)
+        provider_result = getattr(view, "result", None)
+        if provider_result is None:
+            raise AgentHasNoCompletedTurn(agent_id)
+        return AgentTurnResult(
+            agent_id=agent.agent_id,
+            scope_id=agent.scope_id,
+            agent_type=agent.agent_type,
+            home_id=agent.home_id,
+            provider_result=provider_result,
+            completion=agent.last_completion,
+        )
 
     def wait_agent_status_change(
         self,
@@ -722,24 +621,6 @@ class AgentService:
                         observed_at=utc_now_iso(),
                     )
                 self._status_condition.wait(remaining)
-
-    def wait_agent_result(
-        self,
-        agent_id: str,
-        timeout_s: float | None = None,
-    ) -> AgentTurnResult:
-        """Wait for and return the Provider-neutral result for the latest turn."""
-
-        active = self._active.get(agent_id)
-        if active is not None:
-            if not active.done_event.wait(timeout_s):
-                raise TimeoutError(agent_id)
-            if active.error is not None:
-                raise active.error
-        result = self._latest_standard_results.get(agent_id)
-        if result is None:
-            raise AgentHasNoCompletedTurn(agent_id)
-        return result
 
     def wait_agents(
         self,
@@ -781,64 +662,26 @@ class AgentService:
         workdir: str | None = None,
     ) -> AgentContextUsage:
         agent = self.store.get_agent(agent_id)
-        if not agent.thread_id:
-            return self._unavailable_context_usage(agent, "no_session")
-        bundle = self._provider_bundle(agent.cli_type)
-        if bundle is not None and bundle.context is not None:
-            usage = self.inspect_agent_context_result(agent_id, env=env, workdir=workdir)
-            return _legacy_agent_context_usage(usage)
-        # COMPAT(legacy-provider-context-methods): injected providers may expose
-        # inspect_thread_context without a bundle. Remove when they register a
-        # ProviderContextAdapter; covered by fake-provider context tests.
-        provider = self.providers.get(agent.cli_type)
-        inspect = getattr(provider, "inspect_thread_context", None)
-        if not callable(inspect):
-            return self._unavailable_context_usage(agent, "provider_unsupported")
-        home = self.home_service.get_home(agent.cli_type, agent.home_id)
-        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-        provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
-        usage = inspect(
-            home_id=agent.home_id,
-            home_root=home_root,
-            env=provider_env,
-            thread_id=agent.thread_id,
-            workdir=workdir,
-            agent_id=agent.agent_id,
-        )
-        if not isinstance(usage, ProviderContextUsage):
-            raise TypeError(f"provider returned invalid context usage: {agent.cli_type}")
-        return usage.for_agent(agent_id=agent.agent_id, provider_type=agent.cli_type)
-
-    def inspect_agent_context_result(
-        self,
-        agent_id: str,
-        *,
-        env: dict[str, str] | None = None,
-        workdir: str | None = None,
-    ) -> StandardAgentContextUsage:
-        """Inspect context through the provider-neutral Context adapter."""
-
-        agent = self.store.get_agent(agent_id)
-        if not agent.thread_id:
+        if agent.session_locator is None:
             return _standard_unavailable_context_usage(agent, "no_session")
-        bundle = self._provider_bundle(agent.cli_type)
-        if bundle is None or bundle.context is None:
+        bundle = self._provider_bundle(agent.provider_type)
+        if bundle.context is None:
             return _standard_unavailable_context_usage(agent, "provider_unsupported")
         usage = bundle.context.inspect(
             ProviderContextQuery(
                 session=self._provider_session_locator(agent),
                 agent_id=agent.agent_id,
                 execution_context=self.home_service.build_execution_context(
-                    agent.cli_type,
+                    agent.provider_type,
                     agent.home_id,
                     run_env=env,
                     workdir=workdir,
                 ),
             )
         )
-        if not isinstance(usage, StandardProviderContextUsage):
-            raise TypeError(f"provider returned invalid standard context usage: {agent.cli_type}")
-        return usage.for_agent(agent_id=agent.agent_id, provider_type=agent.cli_type)
+        if not isinstance(usage, ProviderContextUsage):
+            raise TypeError(f"provider returned invalid standard context usage: {agent.provider_type}")
+        return usage.for_agent(agent_id=agent.agent_id, provider_type=agent.provider_type)
 
     def compact_agent(
         self,
@@ -929,59 +772,35 @@ class AgentService:
         )
         try:
             agent = self.store.get_agent(agent_id)
-            bundle = self._provider_bundle(agent.cli_type)
-            context_adapter = bundle.context if bundle is not None else None
-            # COMPAT(legacy-provider-context-reconcile): retain the old method
-            # only for injected providers without a ProviderContextAdapter.
-            provider = self.providers.get(agent.cli_type)
-            reconcile = getattr(provider, "reconcile_thread_compaction", None)
-            if context_adapter is None and not callable(reconcile):
+            bundle = self._provider_bundle(agent.provider_type)
+            context_adapter = bundle.context
+            if context_adapter is None:
                 raise AgentContextMaintenanceBlocked(
-                    f"provider cannot reconcile context maintenance: {agent.cli_type}"
+                    f"provider cannot reconcile context maintenance: {agent.provider_type}"
                 )
-            if context_adapter is not None:
-                standard_result = context_adapter.reconcile(
-                    ProviderContextReconcileRequest(
-                        session=self._provider_session_locator(agent),
-                        operation_id=journal.provider_operation_id,
-                        baseline=journal.baseline,
-                        agent_id=agent.agent_id,
-                        execution_context=self.home_service.build_execution_context(
-                            agent.cli_type,
-                            agent.home_id,
-                            run_env=env,
-                            workdir=workdir,
-                        ),
-                    )
-                )
-                provider_result = (
-                    _legacy_provider_compaction_result(standard_result)
-                    if standard_result is not None
-                    else None
-                )
-            else:
-                home = self.home_service.get_home(agent.cli_type, agent.home_id)
-                home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-                provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
-                provider_result = reconcile(
-                    home_id=agent.home_id,
-                    home_root=home_root,
-                    env=provider_env,
-                    thread_id=journal.session_id,
-                    workdir=workdir,
-                    agent_id=agent.agent_id,
+            provider_result = context_adapter.reconcile(
+                ProviderContextReconcileRequest(
+                    session=self._provider_session_locator(agent),
+                    operation_id=journal.provider_operation_id,
                     baseline=journal.baseline,
-                    provider_operation_id=journal.provider_operation_id,
+                    agent_id=agent.agent_id,
+                    execution_context=self.home_service.build_execution_context(
+                        agent.provider_type,
+                        agent.home_id,
+                        run_env=env,
+                        workdir=workdir,
+                    ),
                 )
+            )
             if provider_result is None:
                 raise AgentContextMaintenanceBlocked(
                     f"provider has not confirmed context maintenance terminal state: {agent_id}"
                 )
             if not isinstance(provider_result, ProviderContextCompactionResult):
-                raise TypeError(f"provider returned invalid reconciliation result: {agent.cli_type}")
+                raise TypeError(f"provider returned invalid reconciliation result: {agent.provider_type}")
             confirmed = AgentContextMaintenanceJournal(
                 agent_id=agent.agent_id,
-                provider_type=agent.cli_type,
+                provider_type=agent.provider_type,
                 session_id=journal.session_id,
                 status=AgentContextMaintenanceJournalStatus.CONFIRMED,
                 trigger=journal.trigger,
@@ -1053,35 +872,30 @@ class AgentService:
         agent = self.store.get_agent(agent_id)
         usage_before = self.inspect_agent_context(agent_id, env=env, workdir=workdir)
         now = utc_now_iso()
-        if not agent.thread_id:
+        if agent.session_locator is None:
             return self._skipped_context_compaction(agent, usage_before, now, "no_session")
-        bundle = self._provider_bundle(agent.cli_type)
-        context_adapter = bundle.context if bundle is not None else None
-        # COMPAT(legacy-provider-context-compact): retain compact_thread only
-        # for injected providers without a ProviderContextAdapter.
-        provider = self.providers.get(agent.cli_type)
-        compact = getattr(provider, "compact_thread", None)
-        if context_adapter is None and not callable(compact):
+        bundle = self._provider_bundle(agent.provider_type)
+        context_adapter = bundle.context
+        if context_adapter is None:
             if force:
-                raise AgentContextMaintenanceUnsupported(agent.cli_type)
+                raise AgentContextMaintenanceUnsupported(agent.provider_type)
             return self._unsupported_context_compaction(agent, usage_before, now)
-        if context_adapter is not None:
-            home = self.home_service.get_home(agent.cli_type, agent.home_id)
-            model_backend = self._provider_session_locator(agent).backend_identity
-            try:
-                compact_support = bundle.resolve_capabilities(home, model_backend).get(
-                    CapabilityKey.CONTROL_COMPACT
+        home = self.home_service.get_home(agent.provider_type, agent.home_id)
+        model_backend = self._provider_session_locator(agent).backend_identity
+        try:
+            compact_support = bundle.resolve_capabilities(home, model_backend).get(
+                CapabilityKey.CONTROL_COMPACT
+            )
+        except ProviderCapabilityUnavailable:
+            compact_support = None
+        if compact_support is None or not compact_support.available:
+            if force:
+                reason = compact_support.reason if compact_support is not None else None
+                detail = f": {reason}" if reason else ""
+                raise AgentContextMaintenanceUnsupported(
+                    f"{agent.provider_type} does not support {CapabilityKey.CONTROL_COMPACT.value}{detail}"
                 )
-            except ProviderCapabilityUnavailable:
-                compact_support = None
-            if compact_support is None or not compact_support.available:
-                if force:
-                    reason = compact_support.reason if compact_support is not None else None
-                    detail = f": {reason}" if reason else ""
-                    raise AgentContextMaintenanceUnsupported(
-                        f"{agent.cli_type} does not support {CapabilityKey.CONTROL_COMPACT.value}{detail}"
-                    )
-                return self._unsupported_context_compaction(agent, usage_before, now)
+            return self._unsupported_context_compaction(agent, usage_before, now)
         if not force:
             if not usage_before.available:
                 return self._skipped_context_compaction(
@@ -1096,24 +910,17 @@ class AgentService:
             if usage_before.usage_ratio < threshold:
                 return self._skipped_context_compaction(agent, usage_before, now, "below_threshold")
 
-        if context_adapter is not None:
-            execution_context = self.home_service.build_execution_context(
-                agent.cli_type,
-                agent.home_id,
-                run_env=env,
-                workdir=workdir,
-            )
-            home_root = provider_env = None
-        else:
-            home = self.home_service.get_home(agent.cli_type, agent.home_id)
-            home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-            provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
-            execution_context = None
+        execution_context = self.home_service.build_execution_context(
+            agent.provider_type,
+            agent.home_id,
+            run_env=env,
+            workdir=workdir,
+        )
         prepared_at = utc_now_iso()
         journal = AgentContextMaintenanceJournal(
             agent_id=agent.agent_id,
-            provider_type=agent.cli_type,
-            session_id=agent.thread_id,
+            provider_type=agent.provider_type,
+            session_id=(agent.session_locator.session_id if agent.session_locator is not None else None),
             status=AgentContextMaintenanceJournalStatus.PREPARED,
             trigger=trigger,
             prepared_at=prepared_at,
@@ -1128,8 +935,8 @@ class AgentService:
                 agent_id,
                 AgentContextMaintenanceJournal(
                     agent_id=agent.agent_id,
-                    provider_type=agent.cli_type,
-                    session_id=agent.thread_id,
+                    provider_type=agent.provider_type,
+                    session_id=agent.session_locator.session_id,
                     status=AgentContextMaintenanceJournalStatus.STARTED,
                     trigger=trigger,
                     prepared_at=prepared_at,
@@ -1140,29 +947,16 @@ class AgentService:
             )
 
         try:
-            if context_adapter is not None:
-                standard_result = context_adapter.compact(
-                    ProviderContextCompactionRequest(
-                        session=self._provider_session_locator(agent),
-                        trigger=trigger,
-                        timeout_s=timeout_s,
-                        agent_id=agent.agent_id,
-                        execution_context=execution_context,
-                        on_started=on_compaction_started,
-                    )
-                )
-                provider_result = _legacy_provider_compaction_result(standard_result)
-            else:
-                provider_result = compact(
-                    home_id=agent.home_id,
-                    home_root=home_root,
-                    env=provider_env,
-                    thread_id=agent.thread_id,
-                    workdir=workdir,
-                    agent_id=agent.agent_id,
+            provider_result = context_adapter.compact(
+                ProviderContextCompactionRequest(
+                    session=self._provider_session_locator(agent),
+                    trigger=trigger,
                     timeout_s=timeout_s,
-                    on_compaction_started=on_compaction_started,
+                    agent_id=agent.agent_id,
+                    execution_context=execution_context,
+                    on_started=on_compaction_started,
                 )
+            )
         except BaseException as exc:
             if request_started or isinstance(exc, AgentContextCompactionRequestUnknown):
                 started_journal = self.store.read_context_maintenance(agent_id)
@@ -1170,8 +964,8 @@ class AgentService:
                     agent_id,
                     AgentContextMaintenanceJournal(
                         agent_id=agent.agent_id,
-                        provider_type=agent.cli_type,
-                        session_id=agent.thread_id,
+                        provider_type=agent.provider_type,
+                        session_id=agent.session_locator.session_id,
                         status=AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL,
                         trigger=trigger,
                         prepared_at=prepared_at,
@@ -1193,8 +987,8 @@ class AgentService:
                     agent_id,
                     AgentContextMaintenanceJournal(
                         agent_id=agent.agent_id,
-                        provider_type=agent.cli_type,
-                        session_id=agent.thread_id,
+                        provider_type=agent.provider_type,
+                        session_id=agent.session_locator.session_id,
                         status=AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL,
                         trigger=trigger,
                         prepared_at=prepared_at,
@@ -1208,15 +1002,15 @@ class AgentService:
                 )
             else:
                 self.store.clear_context_maintenance(agent_id)
-            raise TypeError(f"provider returned invalid compaction result: {agent.cli_type}")
-        if provider_result.session_id != agent.thread_id:
+            raise TypeError(f"provider returned invalid compaction result: {agent.provider_type}")
+        if provider_result.session_id != agent.session_locator.session_id:
             started_journal = self.store.read_context_maintenance(agent_id)
             self.store.write_context_maintenance(
                 agent_id,
                 AgentContextMaintenanceJournal(
                     agent_id=agent.agent_id,
-                    provider_type=agent.cli_type,
-                    session_id=agent.thread_id,
+                    provider_type=agent.provider_type,
+                    session_id=agent.session_locator.session_id,
                     status=AgentContextMaintenanceJournalStatus.UNKNOWN_TERMINAL,
                     trigger=trigger,
                     prepared_at=prepared_at,
@@ -1227,11 +1021,11 @@ class AgentService:
                 ),
             )
             raise TypeError(
-                f"provider compaction session mismatch: expected {agent.thread_id}, "
+                f"provider compaction session mismatch: expected {agent.session_locator.session_id}, "
                 f"got {provider_result.session_id}"
             )
         usage_after = (
-            provider_result.usage_after.for_agent(agent_id=agent.agent_id, provider_type=agent.cli_type)
+            provider_result.usage_after.for_agent(agent_id=agent.agent_id, provider_type=agent.provider_type)
             if provider_result.usage_after is not None
             else None
         )
@@ -1239,8 +1033,8 @@ class AgentService:
             agent_id,
             AgentContextMaintenanceJournal(
                 agent_id=agent.agent_id,
-                provider_type=agent.cli_type,
-                session_id=agent.thread_id,
+                provider_type=agent.provider_type,
+                session_id=agent.session_locator.session_id,
                 status=AgentContextMaintenanceJournalStatus.CONFIRMED,
                 trigger=trigger,
                 prepared_at=prepared_at,
@@ -1251,8 +1045,8 @@ class AgentService:
         )
         return AgentContextCompactionResult(
             agent_id=agent.agent_id,
-            provider_type=agent.cli_type,
-            session_id=agent.thread_id,
+            provider_type=agent.provider_type,
+            session_id=(agent.session_locator.session_id if agent.session_locator is not None else None),
             status=AgentContextCompactionStatus.COMPACTED,
             reason="forced" if force else "threshold_reached",
             usage_before=usage_before,
@@ -1269,19 +1063,6 @@ class AgentService:
                 f"agent has unresolved context maintenance: {agent_id} ({journal.status.value})"
             )
 
-    def _unavailable_context_usage(self, agent: Agent, reason: str) -> AgentContextUsage:
-        return AgentContextUsage(
-            agent_id=agent.agent_id,
-            provider_type=agent.cli_type,
-            session_id=agent.thread_id,
-            total_tokens=None,
-            context_window=None,
-            observed_at=utc_now_iso(),
-            source="provider",
-            available=False,
-            reason=reason,
-        )
-
     def _skipped_context_compaction(
         self,
         agent: Agent,
@@ -1291,8 +1072,8 @@ class AgentService:
     ) -> AgentContextCompactionResult:
         return AgentContextCompactionResult(
             agent_id=agent.agent_id,
-            provider_type=agent.cli_type,
-            session_id=agent.thread_id,
+            provider_type=agent.provider_type,
+            session_id=(agent.session_locator.session_id if agent.session_locator is not None else None),
             status=AgentContextCompactionStatus.SKIPPED,
             reason=reason,
             usage_before=usage,
@@ -1309,8 +1090,8 @@ class AgentService:
     ) -> AgentContextCompactionResult:
         return AgentContextCompactionResult(
             agent_id=agent.agent_id,
-            provider_type=agent.cli_type,
-            session_id=agent.thread_id,
+            provider_type=agent.provider_type,
+            session_id=(agent.session_locator.session_id if agent.session_locator is not None else None),
             status=AgentContextCompactionStatus.UNSUPPORTED,
             reason="provider_unsupported",
             usage_before=usage,
@@ -1320,8 +1101,6 @@ class AgentService:
         )
 
     def reconcile_stale_running_agents(self, scope_id: str | None = None) -> list[str]:
-        """Compatibility helper for locator-free stale records only."""
-
         repaired: list[str] = []
         for audit in self.audit_running_agents(scope_id=scope_id):
             if audit.classification != "safe_to_mark_idle":
@@ -1329,8 +1108,8 @@ class AgentService:
             result = self.repair_running_agent(
                 audit.agent_id,
                 expected_scope_id=audit.scope_id,
-                expected_thread_id=audit.thread_id,
-                expected_rollout_relpath=audit.rollout_relpath,
+                expected_session_id=audit.session_id,
+                expected_artifact_ref=audit.artifact_ref,
                 action="mark_idle",
                 dry_run=False,
             )
@@ -1343,20 +1122,16 @@ class AgentService:
         with self._lock:
             active_ids = set(self._active)
             for agent in self.store.list_agents(scope_id=scope_id, status="running"):
-                provider = self.providers.get(agent.cli_type)
-                provider_active = False
-                if provider is not None and hasattr(provider, "list_active_agents"):
-                    provider_active = agent.agent_id in provider.list_active_agents(agent.home_id)
-                if agent.agent_id in active_ids or provider_active:
+                if agent.agent_id in active_ids:
                     classification = "healthy_running"
-                    evidence = ("active_worker",) if agent.agent_id in active_ids else ("provider_active",)
-                elif agent.thread_id or agent.rollout_relpath:
+                    evidence = ("active_worker",)
+                elif agent.session_locator is not None or agent.artifact_locator is not None:
                     classification = "requires_review"
                     evidence = tuple(
                         item
                         for item in (
-                            "thread_locator_present" if agent.thread_id else None,
-                            "rollout_locator_present" if agent.rollout_relpath else None,
+                            "session_locator_present" if agent.session_locator is not None else None,
+                            "artifact_locator_present" if agent.artifact_locator is not None else None,
                         )
                         if item is not None
                     )
@@ -1368,8 +1143,16 @@ class AgentService:
                         agent_id=agent.agent_id,
                         scope_id=agent.scope_id,
                         classification=classification,
-                        thread_id=agent.thread_id,
-                        rollout_relpath=agent.rollout_relpath,
+                        session_id=(
+                            agent.session_locator.session_id
+                            if agent.session_locator is not None
+                            else None
+                        ),
+                        artifact_ref=(
+                            agent.artifact_locator.native_primary_ref
+                            if agent.artifact_locator is not None
+                            else None
+                        ),
                         evidence=evidence,
                     )
                 )
@@ -1380,8 +1163,8 @@ class AgentService:
         agent_id: str,
         *,
         expected_scope_id: str,
-        expected_thread_id: str | None,
-        expected_rollout_relpath: str | None,
+        expected_session_id: str | None,
+        expected_artifact_ref: str | None,
         action: str,
         dry_run: bool = True,
     ) -> RunningAgentRepairResult:
@@ -1393,8 +1176,8 @@ class AgentService:
             raise RuntimeError(f"agent is not a running repair candidate: {agent_id}")
         if (
             audit.scope_id != expected_scope_id
-            or audit.thread_id != expected_thread_id
-            or audit.rollout_relpath != expected_rollout_relpath
+            or audit.session_id != expected_session_id
+            or audit.artifact_ref != expected_artifact_ref
         ):
             raise RuntimeError(f"agent repair identity changed: {agent_id}")
         if audit.classification == "healthy_running":
@@ -1418,9 +1201,9 @@ class AgentService:
 
     def interrupt_agent(self, agent_id: str, timeout_s: float | None = None) -> bool:
         agent = self.store.get_agent(agent_id)
-        bundle = self._provider_bundle(agent.cli_type)
+        bundle = self._provider_bundle(agent.provider_type)
         active = self._active.get(agent_id)
-        if bundle is not None and active is not None:
+        if active is not None:
             deadline = None if timeout_s is None else monotonic() + timeout_s
             if active.provider_handle is None:
                 remaining = None if deadline is None else max(0.0, deadline - monotonic())
@@ -1435,21 +1218,7 @@ class AgentService:
                 return False
             remaining = None if deadline is None else max(0.0, deadline - monotonic())
             return active.done_event.wait(remaining)
-        provider = self.providers.get(agent.cli_type)
-        # COMPAT(legacy-provider-interrupt): providers registered through the
-        # old dictionary expose interrupt_agent(agent_id). Provider bundles use
-        # the active ProviderRunHandle directly. Remove with the providers dict.
-        if provider is None or not hasattr(provider, "interrupt_agent"):
-            return False
-        accepted = bool(provider.interrupt_agent(agent_id))
-        if not accepted:
-            return False
-        active = self._active.get(agent_id)
-        if active is None:
-            return True
-        if not active.done_event.wait(timeout_s):
-            return False
-        return True
+        return False
 
     def pause_runs(self, scope_id: str | None = None) -> None:
         with self._lock:
@@ -1499,117 +1268,50 @@ class AgentService:
             source = self.store.get_agent(source_agent_id)
             if source.status != "idle":
                 raise AgentAlreadyRunningError(source_agent_id)
-            if not source.thread_id:
+            if source.session_locator is None:
                 raise AgentHasNoCompletedTurn(source_agent_id)
             target_scope = target_scope_id or source.scope_id
             self._assert_agent_can_start(source.scope_id)
             self._assert_agent_can_start(target_scope)
-        bundle = self._provider_bundle(source.cli_type)
-        if bundle is not None:
-            target_agent_id = f"a_{uuid.uuid4().hex}"
-            source_session = source.session_locator or self._provider_session_locator(source)
-            forked_standard = bundle.runtime.fork(
-                ProviderForkRequest(
-                    source_agent_id=source.agent_id,
-                    source_session=source_session,
-                    source_turn=source.latest_turn_locator,
-                    target_agent_id=target_agent_id,
-                    target_scope_id=target_scope,
-                    target_home_id=source.home_id,
-                    execution_context=self.home_service.build_execution_context(
-                        source.cli_type,
-                        source.home_id,
-                    ),
-                )
-            )
-            rollout_relpath = (
-                forked_standard.artifact_locator.native_primary_ref
-                if forked_standard.artifact_locator is not None
-                else _native_rollout_relpath(forked_standard.target_session.native_locator)
-            )
-            return self.store.create_agent_record(
-                agent_id=target_agent_id,
-                scope_id=target_scope,
-                agent_type=source.agent_type,
-                cli_type=source.cli_type,
-                provider_type=source.provider_type,
-                home_id=source.home_id,
-                session_locator=forked_standard.target_session,
-                artifact_locator=forked_standard.artifact_locator,
-                thread_id=forked_standard.target_session.session_id,
-                rollout_relpath=rollout_relpath,
-                fork_info=AgentForkInfo(
-                    source_agent_id=source.agent_id,
-                    source_session_id=source_session.session_id,
-                    source_turn_id=(
-                        forked_standard.source_turn.turn_id
-                        if forked_standard.source_turn is not None
-                        else None
-                    ),
-                    fork_mode=forked_standard.fork_mode,
-                    workspace_isolated=forked_standard.workspace_isolated,
-                    created_at=utc_now_iso(),
+        bundle = self._provider_bundle(source.provider_type)
+        target_agent_id = f"a_{uuid.uuid4().hex}"
+        source_session = source.session_locator
+        forked_standard = bundle.runtime.fork(
+            ProviderForkRequest(
+                source_agent_id=source.agent_id,
+                source_session=source_session,
+                source_turn=source.latest_turn_locator,
+                target_agent_id=target_agent_id,
+                target_scope_id=target_scope,
+                target_home_id=source.home_id,
+                execution_context=self.home_service.build_execution_context(
+                    source.provider_type,
+                    source.home_id,
                 ),
-                fork_source_agent_id=source.agent_id,
-                fork_source_thread_id=source.thread_id,
             )
-
-        # COMPAT(legacy-provider-fork): injected providers without a bundle use
-        # fork_thread and the legacy locator fields. Remove when LC fakes and
-        # external takeover providers implement ProviderRuntimeAdapter.fork().
-        home = self.home_service.get_home(source.cli_type, source.home_id)
-        home_root = self.home_service.resolve_home_root(source.cli_type, source.home_id)
-        provider_env = build_provider_env(home=home, home_root=home_root)
-        forked = self.providers[source.cli_type].fork_thread(
-            home_id=source.home_id,
-            home_root=home_root,
-            env=provider_env,
-            thread_id=source.thread_id,
-            agent_id=source.agent_id,
         )
         return self.store.create_agent_record(
+            agent_id=target_agent_id,
             scope_id=target_scope,
             agent_type=source.agent_type,
-            cli_type=source.cli_type,
+            provider_type=source.provider_type,
             home_id=source.home_id,
-            thread_id=forked.thread_id,
-            rollout_relpath=forked.rollout_relpath,
-            fork_source_agent_id=source.agent_id,
-            fork_source_thread_id=source.thread_id,
+            session_locator=forked_standard.target_session,
+            latest_turn_locator=forked_standard.target_turn,
+            artifact_locator=forked_standard.artifact_locator,
+            fork_info=AgentForkInfo(
+                source_agent_id=source.agent_id,
+                source_session_id=source_session.session_id,
+                source_turn_id=(
+                    forked_standard.source_turn.turn_id
+                    if forked_standard.source_turn is not None
+                    else None
+                ),
+                fork_mode=forked_standard.fork_mode,
+                workspace_isolated=forked_standard.workspace_isolated,
+                created_at=utc_now_iso(),
+            ),
         )
-
-    def read_thread(self, agent_id: str, include_turns: bool = True) -> object:
-        agent = self.store.get_agent(agent_id)
-        if not agent.thread_id:
-            raise AgentHasNoCompletedTurn(agent_id)
-        provider = self.providers.get(agent.cli_type)
-        if provider is None:
-            raise RuntimeError(f"no provider registered for {agent.cli_type}")
-        home = self.home_service.get_home(agent.cli_type, agent.home_id)
-        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-        provider_env = build_provider_env(home=home, home_root=home_root)
-        return provider.read_thread(
-            agent,
-            home_root=home_root,
-            env=provider_env,
-            include_turns=include_turns,
-        )
-
-    def list_turns(self, agent_id: str) -> list[object]:
-        thread = self.read_thread(agent_id, include_turns=True)
-        return list(getattr(thread, "turns", []) or [])
-
-    def read_latest_turn_result(self, agent_id: str) -> object:
-        agent = self.store.get_agent(agent_id)
-        if not agent.thread_id:
-            raise AgentHasNoCompletedTurn(agent_id)
-        provider = self.providers.get(agent.cli_type)
-        if provider is None:
-            raise RuntimeError(f"no provider registered for {agent.cli_type}")
-        home = self.home_service.get_home(agent.cli_type, agent.home_id)
-        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-        provider_env = build_provider_env(home=home, home_root=home_root)
-        return provider.read_latest_turn_result(agent, home_root=home_root, env=provider_env)
 
     def resolve_provider_capabilities(
         self,
@@ -1620,8 +1322,6 @@ class AgentService:
     ) -> ProviderCapabilities:
         home = self.home_service.get_home(provider_type, home_id)
         bundle = self._provider_bundle(provider_type)
-        if bundle is None:
-            raise RuntimeError(f"provider does not expose standard capabilities: {provider_type}")
         return bundle.resolve_capabilities(home, model_backend)
 
     def query_sessions(
@@ -1731,131 +1431,17 @@ class AgentService:
         agent_id: str,
     ) -> tuple[AgentProviderBundle, ProviderSessionLocator]:
         agent = self.store.get_agent(agent_id)
-        if not agent.thread_id:
+        if agent.session_locator is None:
             raise AgentHasNoCompletedTurn(agent_id)
-        bundle = self._provider_bundle(agent.cli_type)
-        if bundle is None or bundle.query is None:
-            raise RuntimeError(f"provider does not support standard query: {agent.cli_type}")
-        return bundle, self._provider_session_locator(agent)
+        bundle = self._provider_bundle(agent.provider_type)
+        if bundle.query is None:
+            raise RuntimeError(f"provider does not support standard query: {agent.provider_type}")
+        return bundle, agent.session_locator
 
     def _provider_session_locator(self, agent: Agent) -> ProviderSessionLocator:
-        if not agent.thread_id:
+        if agent.session_locator is None:
             raise AgentHasNoCompletedTurn(agent.agent_id)
-        if agent.session_locator is not None:
-            return agent.session_locator
-        return ProviderSessionLocator(
-            provider_type=agent.cli_type,
-            session_id=agent.thread_id,
-            home_id=agent.home_id,
-            created_at=agent.created_at or utc_now_iso(),
-            native_locator={"rollout_relpath": agent.rollout_relpath},
-        )
-
-    def _refresh_codex_rollout_locator(self, agent_id: str) -> Agent:
-        agent = self.store.get_agent(agent_id)
-        if agent.cli_type != "codex" or not agent.thread_id or agent.rollout_relpath:
-            return agent
-        provider = self.providers.get(agent.cli_type)
-        find = getattr(provider, "find_rollout_relpath", None)
-        if not callable(find):
-            return agent
-        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-        rollout_relpath = find(home_root=home_root, thread_id=agent.thread_id)
-        if not rollout_relpath:
-            return agent
-        return self.store.update_thread_locator(
-            agent_id,
-            thread_id=agent.thread_id,
-            rollout_relpath=rollout_relpath,
-        )
-
-    def read_rollout_events(self, agent_id: str) -> list[dict]:
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.read_rollout_events(agent_id)
-
-    def trace_reader(self, agent_id: str):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.trace_reader(agent_id)
-
-    def get_rollout_info(self, agent_id: str):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.get_rollout_info(agent_id)
-
-    def list_trace_turns(self, agent_id: str):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.list_trace_turns(agent_id)
-
-    def get_trace_turn(
-        self,
-        agent_id: str,
-        *,
-        turn_id: str | None = None,
-        index: int | None = None,
-        latest: bool = False,
-    ):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.get_trace_turn(agent_id, turn_id=turn_id, index=index, latest=latest)
-
-    def get_trace_event(
-        self,
-        agent_id: str,
-        *,
-        index: int | None = None,
-        last: bool = False,
-    ):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.get_trace_event(agent_id, index=index, last=last)
-
-    def tail_trace_events(
-        self,
-        agent_id: str,
-        *,
-        limit: int = 20,
-        event_type: str | None = None,
-        payload_type: str | None = None,
-    ):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.tail_trace_events(
-            agent_id,
-            limit=limit,
-            event_type=event_type,
-            payload_type=payload_type,
-        )
-
-    def list_response_texts(
-        self,
-        agent_id: str,
-        *,
-        turn_id: str | None = None,
-        latest: bool = False,
-    ):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.list_response_texts(agent_id, turn_id=turn_id, latest=latest)
-
-    def get_latest_response_text(self, agent_id: str) -> str | None:
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.get_latest_response_text(agent_id)
-
-    def list_tool_calls(
-        self,
-        agent_id: str,
-        *,
-        turn_id: str | None = None,
-        latest: bool = False,
-    ):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.list_tool_calls(agent_id, turn_id=turn_id, latest=latest)
-
-    def get_tool_call(
-        self,
-        agent_id: str,
-        *,
-        call_id: str | None = None,
-        index: int | None = None,
-        last: bool = False,
-    ):
-        self._refresh_codex_rollout_locator(agent_id)
-        return self.store.get_tool_call(agent_id, call_id=call_id, index=index, last=last)
+        return agent.session_locator
 
     def build_trace_report(
         self,
@@ -1863,11 +1449,25 @@ class AgentService:
         *,
         artifact_path: str | Path | None = None,
         slow_call_limit: int = 20,
-    ):
-        return self.store.build_trace_report(
-            agent_id,
-            artifact_path=artifact_path,
-            slow_call_limit=slow_call_limit,
+    ) -> AgentTraceReport:
+        del artifact_path, slow_call_limit
+        agent = self.store.get_agent(agent_id)
+        session = self._provider_session_locator(agent)
+        turns = tuple(self.query_turns(agent_id, limit=10_000).items)
+        events = tuple(self.query_events(agent_id, limit=100_000).items)
+        tool_calls = tuple(self.query_tool_calls(agent_id, limit=100_000).items)
+        try:
+            usage = self.query_usage(agent_id, include_session_aggregate=True)
+        except (RuntimeError, LookupError):
+            usage = None
+        return AgentTraceReport(
+            agent_id=agent.agent_id,
+            provider_type=agent.provider_type,
+            session=session,
+            turns=turns,
+            events=events,
+            tool_calls=tool_calls,
+            usage=usage,
         )
 
     def export_trace_report(
@@ -1878,17 +1478,21 @@ class AgentService:
         format: str = "json",
         artifact_path: str | Path | None = None,
         slow_call_limit: int = 20,
-    ):
-        return self.store.export_trace_report(
-            agent_id,
-            output_path=output_path,
-            format=format,
-            artifact_path=artifact_path,
-            slow_call_limit=slow_call_limit,
+    ) -> AgentTraceReport:
+        report = self.build_trace_report(
+            agent_id, artifact_path=artifact_path, slow_call_limit=slow_call_limit
         )
+        write_trace_report(report, Path(output_path), format)
+        return report
 
-    def get_default_trace_report_paths(self, agent_id: str):
-        return self.store.get_default_trace_report_paths(agent_id)
+    def get_default_trace_report_paths(self, agent_id: str) -> AgentTraceReportPaths:
+        root = self.runtime_root / "reports" / "agents" / _safe_report_key(agent_id)
+        return AgentTraceReportPaths(
+            agent_id=agent_id,
+            reports_root=str(root),
+            latest_json_path=str(root / "latest.json"),
+            latest_markdown_path=str(root / "latest.md"),
+        )
 
     def export_default_trace_reports(
         self,
@@ -1896,35 +1500,57 @@ class AgentService:
         *,
         artifact_path: str | Path | None = None,
         slow_call_limit: int = 20,
-    ):
-        return self.store.export_default_trace_reports(
+        include_turn_history: bool = True,
+    ) -> AgentTraceReportPaths:
+        paths = self.get_default_trace_report_paths(agent_id)
+        report = self.export_trace_report(
             agent_id,
+            output_path=paths.latest_json_path,
+            format="json",
             artifact_path=artifact_path,
             slow_call_limit=slow_call_limit,
         )
+        self.export_trace_report(agent_id, output_path=paths.latest_markdown_path, format="markdown")
+        written = [paths.latest_json_path, paths.latest_markdown_path]
+        turn_json = turn_markdown = None
+        if include_turn_history and report.latest_turn is not None:
+            turn_key = _safe_report_key(report.latest_turn.locator.turn_id)
+            turn_json = str(Path(paths.reports_root) / "turns" / f"{turn_key}.json")
+            turn_markdown = str(Path(paths.reports_root) / "turns" / f"{turn_key}.md")
+            Path(turn_json).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(paths.latest_json_path, turn_json)
+            shutil.copyfile(paths.latest_markdown_path, turn_markdown)
+            written.extend((turn_json, turn_markdown))
+        return AgentTraceReportPaths(
+            agent_id=agent_id,
+            reports_root=paths.reports_root,
+            latest_json_path=paths.latest_json_path,
+            latest_markdown_path=paths.latest_markdown_path,
+            turn_json_path=turn_json,
+            turn_markdown_path=turn_markdown,
+            written_paths=tuple(written),
+        )
 
     def read_default_trace_report(self, agent_id: str, *, format: str = "json") -> object | None:
-        return self.store.read_default_trace_report(agent_id, format=format)
+        paths = self.get_default_trace_report_paths(agent_id)
+        path = Path(paths.latest_json_path if format == "json" else paths.latest_markdown_path)
+        if not path.exists():
+            return None
+        if format == "json":
+            return json.loads(path.read_text(encoding="utf-8"))
+        if format == "markdown":
+            return path.read_text(encoding="utf-8")
+        raise ValueError(f"unsupported trace report format: {format}")
 
     def close(self) -> None:
-        closed_provider_ids: set[int] = set()
         for bundle in self.provider_registry.list():
             bundle.runtime.close()
-            source = self._provider_bundle_sources.get(bundle.provider_type)
-            if source is not None:
-                closed_provider_ids.add(id(source))
-        for provider in self.providers.values():
-            if id(provider) in closed_provider_ids:
-                continue
-            close = getattr(provider, "close", None)
-            if callable(close):
-                close()
 
     def _export_trace_reports_best_effort(self, agent_id: str) -> None:
         if self.trace_report_policy.persistence == TraceReportPersistence.DISABLED:
             return
         try:
-            self.store.export_default_trace_reports(
+            self.export_default_trace_reports(
                 agent_id,
                 include_turn_history=(
                     self.trace_report_policy.persistence == TraceReportPersistence.LATEST_AND_TURNS
@@ -1946,44 +1572,10 @@ class AgentService:
             raise AgentPausedError(f"agent runs are paused for scope: {scope_id}") from exc
 
 
-def _turn_id(turn_result: object) -> str:
-    value = getattr(turn_result, "id", None)
-    return str(value or f"turn_{uuid.uuid4().hex}")
-
-
-def _standard_or_legacy_turn_id(
-    standard_result: AgentTurnResult | None,
-    legacy_result: object,
-) -> str:
-    if standard_result is not None and standard_result.turn_locator is not None:
-        return standard_result.turn_locator.turn_id
-    return _turn_id(legacy_result)
-
-
-def _native_rollout_relpath(native_locator: object | None) -> str | None:
-    if not isinstance(native_locator, dict):
-        return None
-    value = native_locator.get("rollout_relpath")
-    return str(value) if value is not None else None
-
-
-def _build_provider_bundle(
-    provider: object | None,
-    *,
-    runtime_root: Path,
-) -> AgentProviderBundle | None:
-    if provider is None:
-        return None
-    # COMPAT(provider-self-bundle-bootstrap): lets existing constructor callers
-    # pass a CodexProvider while AgentService migrates to ProviderRegistry.
-    # Future providers should pass ProviderRegistry explicitly.
-    builder = getattr(provider, "build_provider_bundle", None)
-    if not callable(builder):
-        return None
-    bundle = builder(runtime_root=runtime_root)
-    if not isinstance(bundle, AgentProviderBundle):
-        raise TypeError("build_provider_bundle() must return AgentProviderBundle")
-    return bundle
+def _turn_id(turn_result: AgentTurnResult) -> str:
+    if turn_result.turn_locator is not None:
+        return turn_result.turn_locator.turn_id
+    return f"turn_{uuid.uuid4().hex}"
 
 
 def _render_developer_instructions(
@@ -2027,11 +1619,11 @@ def _render_continue_prompt(
     return rendered
 
 
-def _standard_unavailable_context_usage(agent: Agent, reason: str) -> StandardAgentContextUsage:
-    return StandardAgentContextUsage(
+def _standard_unavailable_context_usage(agent: Agent, reason: str) -> AgentContextUsage:
+    return AgentContextUsage(
         agent_id=agent.agent_id,
-        provider_type=agent.cli_type,
-        session_id=agent.thread_id,
+        provider_type=agent.provider_type,
+        session_id=(agent.session_locator.session_id if agent.session_locator is not None else None),
         observed_at=utc_now_iso(),
         source="unavailable",
         available=False,
@@ -2040,51 +1632,6 @@ def _standard_unavailable_context_usage(agent: Agent, reason: str) -> StandardAg
     )
 
 
-def _legacy_agent_context_usage(usage: StandardAgentContextUsage) -> AgentContextUsage:
-    window = usage.context_window
-    available = usage.available and usage.used_tokens is not None and window is not None
-    return AgentContextUsage(
-        agent_id=usage.agent_id,
-        provider_type=usage.provider_type,
-        session_id=usage.session_id,
-        total_tokens=usage.used_tokens,
-        context_window=window,
-        observed_at=usage.observed_at,
-        source=usage.source,
-        available=available,
-        reason=usage.reason if available else usage.reason or "context_window_unavailable",
-    )
-
-
-def _legacy_provider_context_usage(
-    usage: StandardProviderContextUsage,
-) -> ProviderContextUsage:
-    window = usage.context_window
-    available = usage.available and usage.used_tokens is not None and window is not None
-    return ProviderContextUsage(
-        session_id=usage.session_id,
-        total_tokens=usage.used_tokens,
-        context_window=window,
-        observed_at=usage.observed_at,
-        source=usage.source,
-        available=available,
-        reason=usage.reason if available else usage.reason or "context_window_unavailable",
-    )
-
-
-def _legacy_provider_compaction_result(
-    result: StandardProviderContextCompactionResult,
-) -> ProviderContextCompactionResult:
-    if not isinstance(result, StandardProviderContextCompactionResult):
-        raise TypeError("provider returned invalid standard compaction result")
-    return ProviderContextCompactionResult(
-        session_id=result.session_id,
-        usage_after=(
-            _legacy_provider_context_usage(result.usage_after)
-            if result.usage_after is not None
-            else None
-        ),
-        started_at=result.started_at,
-        completed_at=result.completed_at,
-        provider_operation_id=result.provider_operation_id,
-    )
+def _safe_report_key(value: str) -> str:
+    text = str(value).strip()
+    return "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in text)

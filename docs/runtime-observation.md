@@ -32,7 +32,7 @@ wait. Multiple waiters are supported by a service-level condition.
 timeout_s=...)` returns an `AgentStatusWaitResult` with the latest Agent,
 `changed`, `timed_out`, and `observed_at`.
 
-Unlike `wait_agent()` and `wait_agent_result()`, this method does not interpret
+Unlike `wait_agent()`, this method does not interpret
 completion-check failures or incomplete turns as exceptions. It observes only
 the Agent lifecycle status. Agent start, terminal cleanup, synchronous context
 maintenance, close, and explicit stale-record repair notify the shared status
