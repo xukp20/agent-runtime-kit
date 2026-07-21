@@ -15,6 +15,7 @@ from ..provider_contracts import (
     ProviderTurnResult,
 )
 from .codex import CodexProvider
+from .codex_artifacts import CodexArtifactAdapter
 from .codex_context_adapter import CodexContextAdapter
 from .codex_home import CodexHomeRenderer
 from .codex_query import CodexQueryAdapter
@@ -64,6 +65,7 @@ def build_codex_provider_bundle(
         CapabilityKey.QUERY_REQUEST_USAGE,
         CapabilityKey.QUERY_SESSION_USAGE,
         CapabilityKey.ARTIFACT_OFFLINE_QUERY,
+        CapabilityKey.ARTIFACT_SNAPSHOT,
         CapabilityKey.QUERY_CONTEXT_USAGE,
         CapabilityKey.CONTROL_COMPACT,
         CapabilityKey.MODEL_RESPONSES,
@@ -95,5 +97,6 @@ def build_codex_provider_bundle(
         home_renderer=CodexHomeRenderer(runtime_root=runtime_root, provider=provider),
         query=CodexQueryAdapter(runtime_root=runtime_root, provider=provider),
         context=CodexContextAdapter(provider),
+        artifacts=CodexArtifactAdapter(runtime_root=runtime_root, provider=provider),
         compatibility=CodexCompatibilityBridge(),
     )

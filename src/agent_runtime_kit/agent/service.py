@@ -632,6 +632,11 @@ class AgentService:
                 return replacement
         return None
 
+    def get_provider_bundle(self, provider_type: str) -> AgentProviderBundle | None:
+        """Return the currently effective provider bundle for runtime services."""
+
+        return self._provider_bundle(provider_type)
+
     def _on_provider_event(self, agent_id: str, event: AgentEvent) -> None:
         if event.session_id is None:
             return

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .homes import ProviderExecutionContext
 from .identities import ProviderPayload
 from .locators import AgentArtifactLocator, ProviderSessionLocator
 
@@ -37,6 +38,8 @@ class ProviderArtifactManifest:
 class ArtifactStabilityRequest:
     session: ProviderSessionLocator
     timeout_s: float | None = None
+    agent_id: str | None = None
+    execution_context: ProviderExecutionContext | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -49,12 +52,16 @@ class ArtifactStabilityResult:
 @dataclass(frozen=True)
 class ArtifactDescribeRequest:
     session: ProviderSessionLocator
+    agent_id: str | None = None
+    execution_context: ProviderExecutionContext | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
 class ArtifactCaptureRequest:
     session: ProviderSessionLocator
     snapshot_root: str
+    agent_id: str | None = None
+    execution_context: ProviderExecutionContext | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,7 @@ class ArtifactRestoreRequest:
     manifest: ProviderArtifactManifest
     snapshot_root: str
     target_home_id: str | None = None
+    execution_context: ProviderExecutionContext | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

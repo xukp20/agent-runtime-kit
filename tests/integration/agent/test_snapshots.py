@@ -15,6 +15,7 @@ from agent_runtime_kit.agent.models import (
 )
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.report_policy import AgentTraceReportPolicy
+from agent_runtime_kit.agent.providers.codex import CodexProvider
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
 from agent_runtime_kit.agent.store_utils import encode_scope_id
 
@@ -26,6 +27,49 @@ class SnapshotAgentType(AgentType):
     developer_instructions_template = "Developer."
     start_prompt_template = "Start {{item}}."
     continue_prompt_template = "Continue {{item}}."
+
+
+def test_codex_snapshot_uses_provider_artifact_manifest_for_restore(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    registry = AgentTypeRegistry()
+    registry.register(SnapshotAgentType())
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        providers={"codex": CodexProvider(runtime_root=runtime_root)},
+    )
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="worker"))
+    agent = service.create_agent("scope-a", "worker")
+    rollout_relpath = "sessions/2026/07/21/rollout-session-1.jsonl"
+    service.store.update_thread_locator(
+        agent.agent_id,
+        thread_id="session-1",
+        rollout_relpath=rollout_relpath,
+    )
+    codex_root = runtime_root / "homes" / "codex" / "worker" / ".codex"
+    rollout = codex_root / rollout_relpath
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text('{"type":"event_msg","payload":{"type":"task_complete"}}\n', encoding="utf-8")
+    state_db = codex_root / "state_5.sqlite"
+    state_db.write_bytes(b"rebuildable")
+    snapshot_service = AgentSnapshotService(runtime_root, store=service.store, agent_service=service)
+
+    snapshot = snapshot_service.create_scope_snapshot("scope-a")
+
+    assert snapshot.snapshot_id is not None
+    snapshot_root = runtime_root / str(snapshot.snapshot_relpath)
+    manifest = json.loads((snapshot_root / "snapshot.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 3
+    assert manifest["provider_artifacts"][0]["manifest"]["provider_type"] == "codex"
+    assert manifest["provider_artifacts"][0]["manifest"]["entries"][0]["kind"] == "session_transcript"
+    assert not (snapshot_root / "files" / state_db.relative_to(runtime_root)).exists()
+
+    rollout.write_text("corrupted\n", encoding="utf-8")
+    restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    assert "task_complete" in rollout.read_text(encoding="utf-8")
+    assert not state_db.exists()
 
 
 def test_scope_snapshot_copies_scope_metadata_and_only_scope_rollouts(tmp_path: Path) -> None:
