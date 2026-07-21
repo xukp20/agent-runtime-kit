@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime_kit.agent.homes import HomeRecord
+from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.provider_contracts import (
     BaseConfigSource,
     ArtifactCaptureRequest,
@@ -17,9 +18,11 @@ from agent_runtime_kit.agent.provider_contracts import (
     ProviderHomeSpec,
     ProviderRunOptions,
     ProviderRunRequest,
+    ProviderRegistry,
     ProviderTurnQuery,
 )
 from agent_runtime_kit.agent.providers.opencode_artifacts import OpenCodeArtifactAdapter
+from agent_runtime_kit.agent.providers.opencode_bundle import build_opencode_provider_bundle
 from agent_runtime_kit.agent.providers.opencode_context import OpenCodeContextAdapter
 from agent_runtime_kit.agent.providers.opencode_home import OpenCodeHomeRenderer
 from agent_runtime_kit.agent.providers.opencode_models import OpenCodeHomeOptions
@@ -32,6 +35,10 @@ from agent_runtime_kit.agent.providers.opencode_runtime import (
 
 
 pytestmark = pytest.mark.real
+
+
+class _OpenCodeRealAgentType(AgentType):
+    agent_type = "OpenCodeRealAgent"
 
 
 def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Path) -> None:
@@ -318,3 +325,62 @@ def test_real_opencode_beeapi_responses_run(tmp_path: Path) -> None:
         assert result.turn_usage.requests[-1].model_identity.api_mode == "responses"
     finally:
         runtime.close()
+
+
+def test_real_opencode_first_turn_through_agent_service(tmp_path: Path) -> None:
+    binary = os.environ.get("ARK_OPENCODE_TEST_BINARY")
+    key = os.environ.get("ARK_OPENCODE_REAL_DEEPSEEK_KEY")
+    if os.environ.get("ARK_OPENCODE_RUN_REAL_MODELS") != "1" or not binary or not key:
+        pytest.skip("enable the gated OpenCode AgentService real test")
+    runtime_root = tmp_path / "runtime"
+    agent_types = AgentTypeRegistry()
+    agent_types.register(_OpenCodeRealAgentType())
+    registry = ProviderRegistry(
+        (build_opencode_provider_bundle(runtime_root=runtime_root, binary_path=binary),)
+    )
+    service = AgentService(
+        runtime_root,
+        agent_types=agent_types,
+        providers={"opencode": object()},
+        provider_registry=registry,
+    )
+    service.create_home(
+        ProviderHomeSpec(
+            provider_type="opencode",
+            home_id="service-home",
+            base_config=BaseConfigSource(
+                mapping={
+                    "model": "deepseek/deepseek-chat",
+                    "provider": {
+                        "deepseek": {
+                            "npm": "@ai-sdk/openai-compatible",
+                            "options": {
+                                "baseURL": "https://api.deepseek.com/v1",
+                                "apiKey": "{env:DEEPSEEK_API_KEY}",
+                            },
+                            "models": {"deepseek-chat": {"name": "DeepSeek Chat"}},
+                        }
+                    },
+                }
+            ),
+            provider_options=OpenCodeHomeOptions(binary_path=binary),
+        )
+    )
+    agent = service.create_agent(
+        "scope-service", "OpenCodeRealAgent", cli_type="opencode", home_id="service-home"
+    )
+    try:
+        service.start_agent(
+            agent.agent_id,
+            prompt="Reply with exactly SERVICE_OK and no other text.",
+            env={"DEEPSEEK_API_KEY": key},
+            workdir=str(tmp_path),
+        )
+        result = service.wait_agent_result(agent.agent_id, timeout_s=130)
+        assert result.provider_type == "opencode"
+        assert "SERVICE_OK" in (result.final_text or "")
+        stored = service.get_agent(agent.agent_id)
+        assert stored.session_locator is not None
+        assert stored.session_locator.native_locator is not None
+    finally:
+        service.close()
