@@ -66,7 +66,7 @@ class FakeAgentService:
         self,
         scope_id: str,
         agent_type: str,
-        cli_type: str | None = None,
+        cli_type: str = "",
         home_id: str | None = None,
     ) -> Agent:
         resolved_cli_type = cli_type or "codex"

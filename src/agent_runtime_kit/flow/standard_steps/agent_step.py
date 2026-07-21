@@ -23,7 +23,9 @@ class AgentStepState(BaseStepState):
     state_type: str = "agent_step"
     agent_role: str
     agent_type: str | None = None
-    cli_type: str | None = None
+    # Empty means: resolve the Provider from the registered AgentType. Existing
+    # persisted states that explicitly contain "codex" keep their old binding.
+    cli_type: str = ""
     home_id: str | None = None
     create_agent_if_missing: bool = False
     bind_created_agent_to: Literal["step", "flow"] = "step"
