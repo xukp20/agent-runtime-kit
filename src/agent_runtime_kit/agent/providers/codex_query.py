@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,11 +13,11 @@ from ..provider_contracts import (
     AgentToolCall,
     AgentTurnUsage,
     AgentTurnView,
-    ModelBackendIdentity,
     Page,
     ProviderEventQuery,
     ProviderRunState,
     ProviderSessionListQuery,
+    ProviderSessionLocator,
     ProviderSessionQuery,
     ProviderToolQuery,
     ProviderTurnLocator,
@@ -44,9 +45,39 @@ class CodexQueryAdapter:
             raise ValueError("Codex session listing requires home_id")
         sessions_root = self.runtime_root / "homes" / "codex" / query.home_id / ".codex" / "sessions"
         paths = sorted(sessions_root.rglob("*.jsonl")) if sessions_root.exists() else []
-        start, end = _page_bounds(query.cursor, query.limit, len(paths))
-        items = tuple(str(path.relative_to(sessions_root.parent)) for path in paths[start:end])
-        return Page(items=items, next_cursor=str(end) if end < len(paths) else None)
+        sessions = tuple(
+            view
+            for path in paths
+            if (view := self._session_view(path=path, home_id=query.home_id)) is not None
+        )
+        start, end = _page_bounds(query.cursor, query.limit, len(sessions))
+        return Page(
+            items=sessions[start:end],
+            next_cursor=str(end) if end < len(sessions) else None,
+        )
+
+    def _session_view(self, *, path: Path, home_id: str) -> AgentSessionView | None:
+        metadata = _read_session_metadata(path)
+        session_id = metadata.get("id") or metadata.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None
+        created_at = str(
+            metadata.get("timestamp")
+            or metadata.get("created_at")
+            or utc_now_iso()
+        )
+        home_root = self.runtime_root / "homes" / "codex" / home_id
+        return AgentSessionView(
+            locator=ProviderSessionLocator(
+                provider_type="codex",
+                session_id=session_id,
+                home_id=home_id,
+                created_at=created_at,
+                native_locator={
+                    "rollout_relpath": str(path.relative_to(home_root / ".codex")),
+                },
+            )
+        )
 
     def read_session(self, query: ProviderSessionQuery) -> AgentSessionView:
         reader = self._reader(query.locator)
@@ -161,7 +192,10 @@ class CodexQueryAdapter:
             turns = [turn for turn in turns if turn.turn_id == query.turn.turn_id]
         elif query.latest:
             turns = turns[-1:]
-        usages = tuple(_turn_usage(turn.usage) for turn in turns)
+        usages = tuple(
+            _turn_usage(turn.usage, model_identity=query.session.backend_identity)
+            for turn in turns
+        )
         if query.include_session_aggregate:
             tokens = TokenUsage.aggregate_complete(tuple(item.token_usage for item in usages))
             return AgentSessionUsage(
@@ -209,7 +243,7 @@ class CodexQueryAdapter:
 
     def _turn_view(self, session, summary) -> AgentTurnView:  # noqa: ANN001
         locator = ProviderTurnLocator(session=session, turn_id=summary.turn_id)
-        usage = _turn_usage(summary.usage)
+        usage = _turn_usage(summary.usage, model_identity=session.backend_identity)
         status = _run_state(summary.status)
         if status is ProviderRunState.RUNNING:
             return AgentTurnView(locator=locator, result=None, usage=usage)
@@ -246,6 +280,30 @@ class CodexQueryAdapter:
         return AgentTurnView(locator=locator, result=result, usage=usage)
 
 
+def _read_session_metadata(path: Path) -> dict[str, object]:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for index, line in enumerate(stream):
+                if index >= 100:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "session_meta":
+                    continue
+                payload = event.get("payload")
+                if isinstance(payload, dict):
+                    return payload
+    except OSError:
+        pass
+    try:
+        modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+    except OSError:
+        modified_at = utc_now_iso()
+    return {"timestamp": modified_at}
+
+
 def _page_bounds(cursor: str | None, limit: int, length: int) -> tuple[int, int]:
     if limit <= 0:
         raise ValueError("page limit must be positive")
@@ -265,7 +323,7 @@ def _run_state(value: object) -> ProviderRunState:
     }.get(status, ProviderRunState.COMPLETED)
 
 
-def _turn_usage(raw: object) -> AgentTurnUsage:
+def _turn_usage(raw: object, *, model_identity) -> AgentTurnUsage:  # noqa: ANN001
     payload = raw if isinstance(raw, dict) else {}
     total = payload.get("total") if isinstance(payload.get("total"), dict) else payload
     token_usage = TokenUsage(
@@ -287,7 +345,7 @@ def _turn_usage(raw: object) -> AgentTurnUsage:
         request_count=None,
         requests=(),
         token_usage=token_usage,
-        models_used=(ModelBackendIdentity(api_provider="openai", api_mode="responses"),),
+        models_used=(model_identity,) if model_identity is not None else (),
         aggregate_complete=all(
             getattr(token_usage, name) is not None
             for name in ("input_tokens", "output_tokens", "total_tokens")

@@ -56,32 +56,77 @@ def build_codex_provider_bundle(
         CapabilityKey.SESSION_RESUME,
         CapabilityKey.SESSION_READ,
         CapabilityKey.RUN_STREAM,
-        CapabilityKey.RUN_WAIT_TERMINAL,
-        CapabilityKey.RUN_INTERRUPT,
         CapabilityKey.CONTROL_FORK,
-        CapabilityKey.QUERY_TURNS,
-        CapabilityKey.QUERY_EVENTS,
-        CapabilityKey.QUERY_CONTENT,
-        CapabilityKey.QUERY_TOOL_CALLS,
-        CapabilityKey.QUERY_REQUEST_USAGE,
-        CapabilityKey.QUERY_SESSION_USAGE,
-        CapabilityKey.ARTIFACT_OFFLINE_QUERY,
-        CapabilityKey.ARTIFACT_SNAPSHOT,
-        CapabilityKey.QUERY_CONTEXT_USAGE,
-        CapabilityKey.CONTROL_COMPACT,
         CapabilityKey.MODEL_RESPONSES,
     }
-    capabilities = ProviderCapabilities(
-        provider_type="codex",
-        supports={
+    adaptable: dict[CapabilityKey, tuple[str, ...]] = {
+        CapabilityKey.SESSION_LIST: (
+            "projected from idle Codex rollout files under one isolated Home",
+        ),
+        CapabilityKey.RUN_WAIT_TERMINAL: (
+            "ARK waits for a terminal SDK event before reporting completion",
+        ),
+        CapabilityKey.RUN_INTERRUPT: (
+            "ARK resolves the active-turn race and confirms terminal interruption",
+        ),
+        CapabilityKey.QUERY_TURNS: ("projected from Codex rollout JSONL",),
+        CapabilityKey.QUERY_EVENTS: ("projected from Codex rollout JSONL",),
+        CapabilityKey.QUERY_CONTENT: ("projected from Codex rollout JSONL",),
+        CapabilityKey.QUERY_TOOL_CALLS: ("projected from Codex rollout JSONL",),
+        CapabilityKey.QUERY_SESSION_USAGE: (
+            "aggregated only from complete turn-level usage available in rollout JSONL",
+        ),
+        CapabilityKey.QUERY_CONTEXT_USAGE: (
+            "ARK reconciles Codex token events into latest non-cumulative context usage",
+        ),
+        CapabilityKey.CONTROL_COMPACT: (
+            "ARK adds an idle/terminal barrier and maintenance reconciliation",
+        ),
+        CapabilityKey.ARTIFACT_OFFLINE_QUERY: ("ARK parses Codex rollout JSONL",),
+        CapabilityKey.ARTIFACT_SNAPSHOT: (
+            "ARK copies the stable single-session rollout selected by the Codex adapter",
+        ),
+        CapabilityKey.ARTIFACT_RESTORE: (
+            "ARK restores the selected rollout and invalidates rebuildable Codex caches",
+        ),
+        CapabilityKey.ARTIFACT_CACHE_REBUILD: (
+            "Codex rebuilds discarded state indexes from restored rollout data",
+        ),
+    }
+    supports = {
+        key: CapabilitySupport(
+            capability=key,
+            status=CapabilityStatus.NATIVE,
+            available=True,
+            evidence_version="codex-sdk-turn-handle-v1",
+        )
+        for key in native
+    }
+    supports.update(
+        {
             key: CapabilitySupport(
                 capability=key,
-                status=CapabilityStatus.NATIVE,
+                status=CapabilityStatus.ADAPTABLE,
                 available=True,
-                evidence_version="codex-sdk-turn-handle-v1",
+                limitations=limitations,
+                evidence_version="codex-adapter-v1",
             )
-            for key in native
-        },
+            for key, limitations in adaptable.items()
+        }
+    )
+    supports[CapabilityKey.QUERY_REQUEST_USAGE] = CapabilitySupport(
+        capability=CapabilityKey.QUERY_REQUEST_USAGE,
+        status=CapabilityStatus.UNSUPPORTED,
+        available=False,
+        reason=(
+            "current Codex rollout evidence exposes turn/session aggregates but no "
+            "authoritative per-request usage entries"
+        ),
+        evidence_version="codex-adapter-v1",
+    )
+    capabilities = ProviderCapabilities(
+        provider_type="codex",
+        supports=supports,
     )
     return AgentProviderBundle(
         descriptor=ProviderDescriptor(

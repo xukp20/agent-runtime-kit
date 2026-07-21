@@ -338,6 +338,34 @@ def test_codex_home_records_versioned_materialization_manifest(tmp_path: Path) -
     }
 
 
+def test_codex_home_resolves_custom_model_provider_and_wire_api(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+model = "deepseek-chat"
+model_provider = "deepseek"
+
+[model_providers.deepseek]
+base_url = "https://api.deepseek.com"
+wire_api = "chat"
+""".lstrip(),
+        encoding="utf-8",
+    )
+    service = HomeService(tmp_path / ".agent_runtime")
+
+    record = service.create_home(
+        HomeCreateSpec(
+            cli_type="codex",
+            home_id="planner",
+            base_config_path=config_path,
+        )
+    )
+
+    assert record.resolved_defaults["api_provider"] == "deepseek"
+    assert record.resolved_defaults["api_mode"] == "chat_completions"
+    assert record.resolved_defaults["requested_model"] == "deepseek-chat"
+
+
 def test_provider_home_spec_uses_registered_renderer_without_service_type_branch(tmp_path: Path) -> None:
     class DemoRenderer:
         provider_type = "demo"

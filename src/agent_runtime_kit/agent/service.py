@@ -57,6 +57,7 @@ from .provider_contracts import (
     ProviderRegistry,
     ProviderRunHandle,
     ProviderRunRequest,
+    ProviderSessionListQuery,
     ProviderSessionLocator,
     ProviderToolQuery,
     ProviderTurnLocator,
@@ -551,6 +552,7 @@ class AgentService:
             replace_developer_instructions=overwrite_developer_instructions,
             workdir=workdir,
             environment=execution_context.process_environment,
+            model_overrides=execution_context.resolved_defaults,
             metadata={"agent_created_at": agent.created_at},
             event_sink=lambda event: self._on_provider_event(agent.agent_id, event),
             execution_context=execution_context,
@@ -1550,6 +1552,22 @@ class AgentService:
         provider_env = build_provider_env(home=home, home_root=home_root)
         return provider.read_latest_turn_result(agent, home_root=home_root, env=provider_env)
 
+    def query_sessions(
+        self,
+        *,
+        provider_type: str,
+        home_id: str,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Page:
+        self.home_service.get_home(provider_type, home_id)
+        bundle = self._provider_bundle(provider_type)
+        if bundle is None or bundle.query is None:
+            raise RuntimeError(f"provider does not support standard query: {provider_type}")
+        return bundle.query.list_sessions(
+            ProviderSessionListQuery(home_id=home_id, cursor=cursor, limit=limit)
+        )
+
     def query_turns(
         self,
         agent_id: str,
@@ -1651,6 +1669,8 @@ class AgentService:
     def _provider_session_locator(self, agent: Agent) -> ProviderSessionLocator:
         if not agent.thread_id:
             raise AgentHasNoCompletedTurn(agent.agent_id)
+        if agent.session_locator is not None:
+            return agent.session_locator
         return ProviderSessionLocator(
             provider_type=agent.cli_type,
             session_id=agent.thread_id,

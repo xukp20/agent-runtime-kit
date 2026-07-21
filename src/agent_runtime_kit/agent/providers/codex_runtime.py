@@ -13,7 +13,6 @@ from ..provider_contracts import (
     AgentEvent,
     AgentToolCall,
     AgentTurnUsage,
-    ModelBackendIdentity,
     ProviderControlAction,
     ProviderControlRequest,
     ProviderControlResult,
@@ -167,7 +166,6 @@ class CodexProviderRunHandle:
                 started_at=self._started_at,
                 duration_ms=(monotonic() - self._started_monotonic) * 1000,
                 adapter_version="1",
-                model=self.provider.model,
             )
             with self._lock:
                 self._state = self._result.status
@@ -188,6 +186,7 @@ class CodexProviderRunHandle:
                     session_id=thread_id,
                     home_id=self.request.home_id,
                     created_at=utc_now_iso(),
+                    backend_identity=self.request.model_overrides,
                 )
                 self._append_event("session.started", data={"session_id": thread_id})
 
@@ -328,7 +327,6 @@ def _normalize_codex_turn_result(
     started_at: str,
     duration_ms: float,
     adapter_version: str,
-    model: str | None,
 ) -> ProviderTurnResult:
     session = session or ProviderSessionLocator(
         provider_type="codex",
@@ -341,7 +339,7 @@ def _normalize_codex_turn_result(
     turn = turn or ProviderTurnLocator(session=session, turn_id=turn_id)
     status = _run_state(getattr(raw_turn, "status", "completed"))
     raw_usage = getattr(raw_turn, "usage", None)
-    turn_usage, context_after = _normalize_usage(raw_usage, request, native.thread_id, model)
+    turn_usage, context_after = _normalize_usage(raw_usage, request, native.thread_id)
     raw_items = list(getattr(raw_turn, "items", None) or [])
     content_blocks, tool_calls = _normalize_items(
         raw_items,
@@ -567,25 +565,18 @@ def _normalize_usage(
     raw_usage: object,
     request: ProviderRunRequest,
     session_id: str,
-    model: str | None,
 ):
     if raw_usage is None:
         return None, None
     total = getattr(raw_usage, "total", None)
     last = getattr(raw_usage, "last", None)
     total_tokens = _token_usage(total)
+    model_identity = request.model_overrides
     turn_usage = AgentTurnUsage(
         request_count=None,
         requests=(),
         token_usage=total_tokens,
-        models_used=(
-            request.model_overrides
-            or ModelBackendIdentity(
-                api_provider="openai",
-                api_mode="responses",
-                requested_model=model,
-            ),
-        ),
+        models_used=(model_identity,) if model_identity is not None else (),
         aggregate_complete=all(
             getattr(total_tokens, name) is not None
             for name in ("input_tokens", "output_tokens", "total_tokens")
@@ -605,7 +596,7 @@ def _normalize_usage(
         measurement="request_usage",
         available=available,
         reason=None if available else "Codex turn usage omitted context evidence",
-        model_identity=turn_usage.models_used[0],
+        model_identity=model_identity,
     )
     return turn_usage, context_after
 

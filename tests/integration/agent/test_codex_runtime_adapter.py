@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agent_runtime_kit.agent.provider_contracts import (
+    ModelBackendIdentity,
     ProviderExecutionContext,
     ProviderForkRequest,
     ProviderRunRequest,
@@ -118,6 +119,11 @@ def _request(tmp_path: Path) -> ProviderRunRequest:
         provider_type="codex",
         home_id="worker",
         prompt="work",
+        model_overrides=ModelBackendIdentity(
+            api_provider="deepseek",
+            api_mode="chat_completions",
+            requested_model="deepseek-chat",
+        ),
         execution_context=ProviderExecutionContext(
             provider_type="codex",
             home_id="worker",
@@ -143,6 +149,9 @@ def test_codex_runtime_adapter_normalizes_result_usage_and_context(tmp_path: Pat
     assert result.tool_calls[0].server_name == "lean"
     assert result.tool_calls[0].tool_name == "diagnostics"
     assert result.turn_usage is not None
+    assert result.session_locator.backend_identity == result.turn_usage.models_used[0]
+    assert result.turn_usage.models_used[0].api_provider == "deepseek"
+    assert result.turn_usage.models_used[0].api_mode == "chat_completions"
     assert result.turn_usage.request_count is None
     assert result.turn_usage.token_usage == TokenUsage(
         input_tokens=120,

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, TYPE_CHECKING
@@ -330,24 +331,32 @@ def _sha256(path: Path) -> str:
 
 
 def _resolve_model_defaults(text: str) -> ModelBackendIdentity | None:
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("["):
-            break
-        if "=" not in stripped or stripped.startswith("#"):
-            continue
-        key, raw_value = stripped.split("=", 1)
-        key = key.strip()
-        if key in {"model", "model_reasoning_effort"}:
-            values[key] = raw_value.strip().strip("\"'")
-    if not values:
+    try:
+        values = tomllib.loads(text) if text.strip() else {}
+    except tomllib.TOMLDecodeError:
+        return None
+    api_provider = str(values.get("model_provider") or "openai")
+    provider_configs = values.get("model_providers")
+    provider_config = (
+        provider_configs.get(api_provider)
+        if isinstance(provider_configs, Mapping)
+        else None
+    )
+    wire_api = provider_config.get("wire_api") if isinstance(provider_config, Mapping) else None
+    api_mode = {
+        "chat": "chat_completions",
+        "chat_completions": "chat_completions",
+        "responses": "responses",
+    }.get(str(wire_api or "responses"), str(wire_api or "responses"))
+    requested_model = values.get("model")
+    reasoning_effort = values.get("model_reasoning_effort")
+    if requested_model is None and reasoning_effort is None and "model_provider" not in values:
         return None
     return ModelBackendIdentity(
-        api_provider="openai",
-        api_mode="responses",
-        requested_model=values.get("model"),
-        reasoning_effort=values.get("model_reasoning_effort"),
+        api_provider=api_provider,
+        api_mode=api_mode,
+        requested_model=str(requested_model) if requested_model is not None else None,
+        reasoning_effort=str(reasoning_effort) if reasoning_effort is not None else None,
     )
 
 
