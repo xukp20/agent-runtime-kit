@@ -6,6 +6,7 @@ from .capabilities import ProviderCapabilityUnavailable, ProviderCapabilities, P
 from .protocols import (
     ProviderArtifactAdapter,
     ProviderCapabilityResolver,
+    ProviderCompatibilityAdapter,
     ProviderContextAdapter,
     ProviderHomeRenderer,
     ProviderQueryAdapter,
@@ -22,6 +23,7 @@ class AgentProviderBundle:
     query: ProviderQueryAdapter | None = None
     context: ProviderContextAdapter | None = None
     artifacts: ProviderArtifactAdapter | None = None
+    compatibility: ProviderCompatibilityAdapter | None = None
 
     @property
     def provider_type(self) -> str:
@@ -63,6 +65,9 @@ class ProviderRegistry:
         except KeyError as exc:
             raise KeyError(f"unknown provider_type: {key}") from exc
 
+    def unregister(self, provider_type: str) -> AgentProviderBundle | None:
+        return self._bundles.pop(provider_type.strip(), None)
+
     def list(self) -> tuple[AgentProviderBundle, ...]:
         return tuple(self._bundles[key] for key in sorted(self._bundles))
 
@@ -78,6 +83,7 @@ class ProviderRegistry:
             ("query", bundle.query),
             ("context", bundle.context),
             ("artifacts", bundle.artifacts),
+            ("compatibility", bundle.compatibility),
         ):
             if adapter is None:
                 continue

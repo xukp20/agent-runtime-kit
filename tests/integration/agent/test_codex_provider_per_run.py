@@ -9,6 +9,7 @@ import pytest
 
 from agent_runtime_kit.agent.homes import HomeCreateSpec
 from agent_runtime_kit.agent.models import AgentContextCompactionEvidenceError
+from agent_runtime_kit.agent.provider_contracts import ProviderRunState
 from agent_runtime_kit.agent.providers.codex import CodexProvider
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 
@@ -64,6 +65,7 @@ class FakeHighLevelThread:
     run_release: threading.Event | None = None
     compact_callback = None
     status_type = "idle"
+    last_turn_handle = None
 
     def __init__(self, thread_id: str) -> None:
         self.id = thread_id
@@ -74,6 +76,11 @@ class FakeHighLevelThread:
         if self.run_release is not None:
             assert self.run_release.wait(timeout=5)
         return SimpleNamespace(id=f"turn-{prompt}", prompt=prompt, run_kwargs=kwargs)
+
+    def turn(self, prompt: str, **kwargs):
+        handle = FakeHighLevelTurnHandle(self.id, prompt, kwargs)
+        type(self).last_turn_handle = handle
+        return handle
 
     def read(self, include_turns: bool = True):
         turns = [SimpleNamespace(id="turn-read", status="completed", items=[])] if include_turns else []
@@ -90,6 +97,28 @@ class FakeHighLevelThread:
         if callback is not None:
             callback()
         return SimpleNamespace()
+
+
+class FakeHighLevelTurnHandle:
+    def __init__(self, thread_id: str, prompt: str, run_kwargs: dict[str, object]) -> None:
+        self.thread_id = thread_id
+        self.prompt = prompt
+        self.run_kwargs = run_kwargs
+        self.id = f"turn-{prompt}"
+        self.interrupted = False
+
+    def run(self):
+        if FakeHighLevelThread.run_started is not None:
+            FakeHighLevelThread.run_started.set()
+        if FakeHighLevelThread.run_release is not None:
+            assert FakeHighLevelThread.run_release.wait(timeout=5)
+        return SimpleNamespace(id=self.id, prompt=self.prompt, run_kwargs=self.run_kwargs)
+
+    def interrupt(self):
+        self.interrupted = True
+        if FakeHighLevelThread.run_release is not None:
+            FakeHighLevelThread.run_release.set()
+        return SimpleNamespace(accepted=True)
 
 
 class FakeClient:
@@ -230,6 +259,43 @@ def test_codex_provider_tracks_active_agents_without_home_cache(tmp_path: Path) 
     assert provider.list_active_agents("worker") == ["agent-a"]
 
 
+def test_codex_provider_interrupts_the_live_turn_handle(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    started = threading.Event()
+    release = threading.Event()
+    FakeHighLevelThread.run_started = started
+    FakeHighLevelThread.run_release = release
+    provider = _provider()
+    home_root = tmp_path / "home"
+    error: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            provider.start_thread(
+                home_id="worker",
+                home_root=home_root,
+                env={"CODEX_HOME": str(home_root / ".codex")},
+                workdir=str(tmp_path),
+                prompt="interruptible",
+                developer_instructions=None,
+                agent_id="agent-a",
+            )
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            error.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert started.wait(timeout=5)
+
+    assert provider.interrupt_agent("agent-a") is True
+    worker.join(timeout=5)
+
+    assert not error
+    assert not worker.is_alive()
+    assert FakeHighLevelThread.last_turn_handle.interrupted is True
+    assert provider.list_active_agents() == []
+
+
 def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
     tmp_path: Path,
 ) -> None:
@@ -258,8 +324,43 @@ def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
     assert provider.list_active_agents("live-locator") == [agent.agent_id]
 
     release.set()
-    service.wait_agent(agent.agent_id)
+    legacy_result = service.wait_agent(agent.agent_id)
+    standard_result = service.wait_agent_result(agent.agent_id)
+    assert legacy_result.id == "turn-Start state."
+    assert standard_result.status is ProviderRunState.COMPLETED
+    assert standard_result.session_locator.session_id == "thread-started"
+    assert standard_result.turn_locator is not None
+    assert standard_result.turn_locator.turn_id == "turn-Start state."
+    assert standard_result.completion is not None
+    assert standard_result.completion.status == "complete"
+    assert service.provider_registry.get("codex").provider_type == "codex"
     assert provider.list_active_agents("live-locator") == []
+
+
+def test_agent_service_interrupt_waits_until_codex_turn_is_terminal(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    started = threading.Event()
+    release = threading.Event()
+    FakeHighLevelThread.run_started = started
+    FakeHighLevelThread.run_release = release
+    provider = _provider()
+    registry = AgentTypeRegistry()
+    registry.register(LiveLocatorAgentType())
+    service = AgentService(
+        tmp_path / "runtime",
+        agent_types=registry,
+        providers={"codex": provider},
+    )
+    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="live-locator"))
+    agent = service.create_agent("scope", "live-locator")
+    service.start_agent(agent.agent_id, variables={"item": "state"})
+    assert started.wait(timeout=5)
+
+    assert service.interrupt_agent(agent.agent_id, timeout_s=5) is True
+
+    assert service.get_agent(agent.agent_id).status == "idle"
+    assert provider.list_active_agents() == []
+    assert FakeHighLevelThread.last_turn_handle.interrupted is True
 
 
 def test_codex_provider_resume_instruction_overwrite_uses_fresh_run_codex(
@@ -413,6 +514,7 @@ def _reset_fake_codex() -> None:
     FakeHighLevelThread.run_release = None
     FakeHighLevelThread.compact_callback = None
     FakeHighLevelThread.status_type = "idle"
+    FakeHighLevelThread.last_turn_handle = None
 
 
 def _append_rollout(path: Path, payload: dict[str, object]) -> None:

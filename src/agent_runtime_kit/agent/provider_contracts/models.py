@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Callable, Mapping
 
 from .capabilities import CapabilitySupport
+from .homes import ProviderExecutionContext
 from .identities import ModelBackendIdentity, ProviderPayload
 from .locators import AgentArtifactLocator, ProviderSessionLocator, ProviderTurnLocator
 from .usage import AgentTurnUsage, ModelRequestUsage
@@ -67,6 +68,7 @@ class ProviderRunRequest:
     session_locator: ProviderSessionLocator | None = None
     developer_instructions: str | None = None
     system_instructions: str | None = None
+    replace_developer_instructions: bool = False
     workdir: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict, repr=False)
     model_overrides: ModelBackendIdentity | None = None
@@ -74,6 +76,7 @@ class ProviderRunRequest:
     provider_options: object | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     event_sink: Callable[["AgentEvent"], None] | None = field(default=None, repr=False, compare=False)
+    execution_context: ProviderExecutionContext | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("agent_id", "scope_id", "agent_type", "provider_type", "home_id"):

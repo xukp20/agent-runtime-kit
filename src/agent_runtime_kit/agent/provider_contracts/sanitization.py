@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 
 from .identities import ProviderPayload
 
@@ -32,6 +34,13 @@ def sanitize_provider_data(value: object, *, max_string_chars: int = 4096) -> tu
 
     def visit(item: object) -> object:
         nonlocal truncated
+        if isinstance(item, Enum):
+            return visit(item.value)
+        if is_dataclass(item) and not isinstance(item, type):
+            return visit(asdict(item))
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            return visit(model_dump(mode="json", by_alias=False))
         if isinstance(item, Mapping):
             result: dict[str, object] = {}
             for raw_key, raw_value in item.items():

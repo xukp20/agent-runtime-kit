@@ -43,8 +43,9 @@ class CodexHomeRenderer:
     provider_type = "codex"
     renderer_version = "codex-home-v1"
 
-    def __init__(self, *, runtime_root: Path) -> None:
+    def __init__(self, *, runtime_root: Path, provider: object | None = None) -> None:
         self.runtime_root = Path(runtime_root)
+        self.provider = provider
 
     def validate(self, spec: ProviderHomeSpec) -> HomeValidationResult:
         errors: list[str] = []
@@ -115,6 +116,20 @@ class CodexHomeRenderer:
         home: "HomeRecord",
         ctx: ProviderExecutionContext,
     ) -> HomeInitializationResult:
+        if self.provider is not None:
+            initialize = getattr(self.provider, "ensure_home_initialized", None)
+            if not callable(initialize):
+                raise TypeError("Codex Home renderer provider lacks ensure_home_initialized")
+            record = initialize(
+                home_id=home.home_id,
+                home_root=ctx.home_root,
+                env=ctx.process_environment,
+                workdir=ctx.workdir,
+            )
+            return HomeInitializationResult(
+                initialized=True,
+                marker_ref=str(getattr(record, "marker_path", "")) or None,
+            )
         marker = ctx.home_root / ".ark" / "codex_home_initialized.json"
         return HomeInitializationResult(
             initialized=marker.exists(),
@@ -152,6 +167,42 @@ class CodexHomeRenderer:
                 path = home_root / str(item["relpath"])
                 if not path.is_file() or _sha256(path) != str(item["sha256"]):
                     raise RuntimeError(f"home materialized file hash mismatch: {item['relpath']}")
+            defaults_payload = payload.get("resolved_defaults")
+            resolved_defaults = None
+            if isinstance(defaults_payload, Mapping):
+                resolved_defaults = ModelBackendIdentity(
+                    api_provider=str(defaults_payload["api_provider"]),
+                    api_mode=str(defaults_payload["api_mode"]),
+                    endpoint_id=defaults_payload.get("endpoint_id"),
+                    requested_model=defaults_payload.get("requested_model"),
+                    resolved_model=defaults_payload.get("resolved_model"),
+                    model_version=defaults_payload.get("model_version"),
+                    service_tier=defaults_payload.get("service_tier"),
+                    reasoning_effort=defaults_payload.get("reasoning_effort"),
+                    tokenizer_id=defaults_payload.get("tokenizer_id"),
+                    model_config_hash=defaults_payload.get("model_config_hash"),
+                )
+            manifest = HomeMaterializationResult(
+                provider_type=str(payload["provider_type"]),
+                home_id=str(payload["home_id"]),
+                renderer_version=str(payload["renderer_version"]),
+                manifest_schema_version=int(payload["manifest_schema_version"]),
+                manifest_hash=declared_hash,
+                generated_files=tuple(
+                    HomeMaterializedFile(
+                        relpath=str(item["relpath"]),
+                        sha256=str(item["sha256"]),
+                        source_fingerprint=item.get("source_fingerprint"),
+                        secret=bool(item.get("secret", False)),
+                    )
+                    for item in payload.get("generated_files", [])
+                ),
+                source_resource_hashes=dict(payload.get("source_resource_hashes") or {}),
+                required_env=tuple(payload.get("required_env") or ()),
+                auth_refs=tuple(payload.get("auth_refs") or ()),
+                resolved_defaults=resolved_defaults,
+                warnings=tuple(payload.get("warnings") or ()),
+            )
         return ProviderExecutionContext(
             provider_type=self.provider_type,
             home_id=home.home_id,

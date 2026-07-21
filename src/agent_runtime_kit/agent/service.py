@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
 
@@ -39,6 +39,16 @@ from .models import (
     AgentPausedError,
     CompletionDecision,
     WaitAgentsResult,
+)
+from .provider_contracts import (
+    AgentEvent,
+    AgentProviderBundle,
+    AgentTurnResult,
+    ProviderRegistry,
+    ProviderRunHandle,
+    ProviderRunRequest,
+    ProviderSessionLocator,
+    ProviderTurnResult,
 )
 from .providers.codex import CodexProvider
 from .report_policy import AgentTraceReportPolicy, TraceReportPersistence
@@ -131,6 +141,7 @@ class AgentCompletionContext(RuntimeContext):
     turn_result: object
     auto_continue_count: int
     variables: dict[str, object]
+    standard_turn_result: AgentTurnResult | None = None
 
 
 AgentRunPauseController = RuntimePauseController
@@ -141,7 +152,10 @@ class _ActiveAgentRun:
     agent_id: str
     worker: threading.Thread
     done_event: threading.Event
+    handle_ready: threading.Event = field(default_factory=threading.Event)
+    provider_handle: ProviderRunHandle | None = None
     latest_result: object | None = None
+    latest_standard_result: AgentTurnResult | None = None
     latest_completion: AgentCompletionRecord | None = None
     error: BaseException | None = None
 
@@ -155,6 +169,7 @@ class AgentService:
         store: AgentStoreService | None = None,
         home_service: HomeService | None = None,
         providers: dict[str, object] | None = None,
+        provider_registry: ProviderRegistry | None = None,
         ark_services: ARKServices | None = None,
         app_services: AppServices | None = None,
         start_paused: bool = False,
@@ -163,8 +178,26 @@ class AgentService:
         self.runtime_root = Path(runtime_root)
         self.agent_types = agent_types or AgentTypeRegistry()
         self.providers = providers or {"codex": CodexProvider(runtime_root=self.runtime_root)}
+        self.provider_registry = provider_registry or ProviderRegistry()
+        self._provider_bundle_sources: dict[str, object] = {}
+        if provider_registry is None:
+            for provider_type, provider in self.providers.items():
+                bundle = _build_provider_bundle(provider, runtime_root=self.runtime_root)
+                if bundle is not None:
+                    if bundle.provider_type != provider_type:
+                        raise ValueError(
+                            f"provider bundle key mismatch: {provider_type} != {bundle.provider_type}"
+                        )
+                    self.provider_registry.register(bundle)
+                    self._provider_bundle_sources[provider_type] = provider
         self.store = store or AgentStoreService(self.runtime_root, providers=self.providers)
-        self.home_service = home_service or HomeService(self.runtime_root)
+        if home_service is None:
+            renderers = {
+                bundle.provider_type: bundle.home_renderer for bundle in self.provider_registry.list()
+            }
+            self.home_service = HomeService(self.runtime_root, renderers=renderers or None)
+        else:
+            self.home_service = home_service
         self.ark_services = ark_services or ARKServices()
         self.ark_services.agent_service = self
         self.app_services = app_services or AppServices()
@@ -178,6 +211,7 @@ class AgentService:
                 self.pause_controller.pause(None)
         self._lock = threading.RLock()
         self._active: dict[str, _ActiveAgentRun] = {}
+        self._latest_standard_results: dict[str, AgentTurnResult] = {}
         self.trace_report_errors: list[dict[str, str]] = []
 
     def create_agent(
@@ -225,6 +259,16 @@ class AgentService:
         env: dict[str, str] | None = None,
         workdir: str | None = None,
     ) -> object | None:
+        bundle = self._provider_bundle(cli_type)
+        if bundle is not None:
+            home = self.home_service.get_home(cli_type, home_id)
+            context = self.home_service.build_execution_context(
+                cli_type,
+                home_id,
+                run_env=env,
+                workdir=workdir,
+            )
+            return bundle.home_renderer.initialize(home, context)
         provider = self.providers.get(cli_type)
         if provider is None:
             raise RuntimeError(f"no provider registered for {cli_type}")
@@ -344,61 +388,38 @@ class AgentService:
             while True:
                 agent = self.store.get_agent(agent_id)
                 agent_type = self.agent_types.get(agent.agent_type)
-                home = self.home_service.get_home(agent.cli_type, agent.home_id)
-                home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
-                provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
-                provider = self.providers[agent.cli_type]
-                if agent.thread_id is None:
-                    start_kwargs = {
-                        "home_id": agent.home_id,
-                        "home_root": home_root,
-                        "env": provider_env,
-                        "workdir": workdir,
-                        "prompt": current_prompt,
-                        "developer_instructions": developer_instructions,
-                        "overwrite_developer_instructions": overwrite_developer_instructions,
-                        "agent_id": agent_id,
-                    }
-                    if isinstance(provider, CodexProvider):
-                        start_kwargs["on_thread_started"] = lambda thread_id: self.store.update_thread_locator(
-                            agent_id,
-                            thread_id=thread_id,
-                            rollout_relpath=None,
-                        )
-                    result = provider.start_thread(
-                        **start_kwargs,
-                    )
-                else:
-                    result = provider.resume_thread(
-                        home_id=agent.home_id,
-                        home_root=home_root,
-                        env=provider_env,
-                        thread_id=agent.thread_id,
-                        workdir=workdir,
-                        prompt=current_prompt,
-                        developer_instructions=developer_instructions,
-                        overwrite_developer_instructions=overwrite_developer_instructions,
-                        agent_id=agent_id,
-                    )
-                active.latest_result = result.turn_result
+                turn_result, standard_result, thread_id, rollout_relpath = self._execute_provider_turn(
+                    active=active,
+                    agent=agent,
+                    prompt=current_prompt,
+                    developer_instructions=developer_instructions,
+                    overwrite_developer_instructions=overwrite_developer_instructions,
+                    env=env,
+                    workdir=workdir,
+                )
+                active.latest_result = turn_result
+                active.latest_standard_result = standard_result
+                if standard_result is not None:
+                    self._latest_standard_results[agent_id] = standard_result
                 self.store.update_thread_locator(
                     agent_id,
-                    thread_id=result.thread_id,
-                    rollout_relpath=result.rollout_relpath,
+                    thread_id=thread_id,
+                    rollout_relpath=rollout_relpath,
                 )
                 agent = self.store.get_agent(agent_id)
                 ctx = AgentCompletionContext(
                     ark=self.ark_services,
                     app=self.app_services,
                     agent=agent,
-                    turn_result=result.turn_result,
+                    turn_result=turn_result,
                     auto_continue_count=auto_continue_count,
                     variables=variables,
+                    standard_turn_result=standard_result,
                 )
                 try:
                     decision = agent_type.check_completion(ctx)
                     record = AgentCompletionRecord(
-                        turn_id=_turn_id(result.turn_result),
+                        turn_id=_standard_or_legacy_turn_id(standard_result, turn_result),
                         decision=decision,
                         status="complete" if decision.complete else "incomplete",
                         auto_continue_count=auto_continue_count,
@@ -406,7 +427,7 @@ class AgentService:
                     )
                 except BaseException as exc:
                     record = AgentCompletionRecord(
-                        turn_id=_turn_id(result.turn_result),
+                        turn_id=_standard_or_legacy_turn_id(standard_result, turn_result),
                         decision=CompletionDecision(complete=False, reason=str(exc)),
                         status="checker_failed",
                         auto_continue_count=auto_continue_count,
@@ -414,10 +435,18 @@ class AgentService:
                         error_message=str(exc),
                     )
                     self.store.update_completion(agent_id, record)
+                    if standard_result is not None:
+                        standard_result = replace(standard_result, completion=record)
+                        active.latest_standard_result = standard_result
+                        self._latest_standard_results[agent_id] = standard_result
                     self._export_trace_reports_best_effort(agent_id)
                     active.latest_completion = record
                     raise AgentCompletionCheckError(str(exc)) from exc
                 self.store.update_completion(agent_id, record)
+                if standard_result is not None:
+                    standard_result = replace(standard_result, completion=record)
+                    active.latest_standard_result = standard_result
+                    self._latest_standard_results[agent_id] = standard_result
                 self._export_trace_reports_best_effort(agent_id)
                 active.latest_completion = record
                 if decision.close_agent:
@@ -445,8 +474,166 @@ class AgentService:
                     if agent.status != "closed":
                         self.store.patch_agent(agent_id, status="idle")
                 finally:
+                    active.handle_ready.set()
                     self._active.pop(agent_id, None)
                     active.done_event.set()
+
+    def _execute_provider_turn(
+        self,
+        *,
+        active: _ActiveAgentRun,
+        agent: Agent,
+        prompt: str,
+        developer_instructions: str | None,
+        overwrite_developer_instructions: bool,
+        env: dict[str, str] | None,
+        workdir: str | None,
+    ) -> tuple[object, AgentTurnResult | None, str, str | None]:
+        bundle = self._provider_bundle(agent.cli_type)
+        if bundle is None:
+            return self._execute_legacy_provider_turn(
+                agent=agent,
+                prompt=prompt,
+                developer_instructions=developer_instructions,
+                overwrite_developer_instructions=overwrite_developer_instructions,
+                env=env,
+                workdir=workdir,
+            )
+        execution_context = self.home_service.build_execution_context(
+            agent.cli_type,
+            agent.home_id,
+            run_env=env,
+            workdir=workdir,
+        )
+        session_locator = None
+        if agent.thread_id is not None:
+            session_locator = ProviderSessionLocator(
+                provider_type=agent.cli_type,
+                session_id=agent.thread_id,
+                home_id=agent.home_id,
+                created_at=agent.created_at or utc_now_iso(),
+                native_locator={"rollout_relpath": agent.rollout_relpath},
+            )
+        request = ProviderRunRequest(
+            agent_id=agent.agent_id,
+            scope_id=agent.scope_id,
+            agent_type=agent.agent_type,
+            provider_type=agent.cli_type,
+            home_id=agent.home_id,
+            session_locator=session_locator,
+            prompt=prompt,
+            developer_instructions=developer_instructions,
+            replace_developer_instructions=overwrite_developer_instructions,
+            workdir=workdir,
+            environment=execution_context.process_environment,
+            metadata={"agent_created_at": agent.created_at},
+            event_sink=lambda event: self._on_provider_event(agent.agent_id, event),
+            execution_context=execution_context,
+        )
+        active.handle_ready.clear()
+        handle = bundle.runtime.resume(request) if session_locator is not None else bundle.runtime.start(request)
+        active.provider_handle = handle
+        active.handle_ready.set()
+        locator = handle.session_locator()
+        if locator is not None:
+            self.store.update_thread_locator(
+                agent.agent_id,
+                thread_id=locator.session_id,
+                rollout_relpath=agent.rollout_relpath,
+            )
+        provider_result = handle.wait_terminal()
+        standard_result = AgentTurnResult(
+            agent_id=agent.agent_id,
+            scope_id=agent.scope_id,
+            agent_type=agent.agent_type,
+            home_id=agent.home_id,
+            provider_result=provider_result,
+        )
+        compatibility_result: object = standard_result
+        if bundle.compatibility is not None:
+            compatibility_result = bundle.compatibility.completion_turn_result(handle, provider_result)
+        rollout_relpath = agent.rollout_relpath
+        if provider_result.artifact_locator is not None:
+            rollout_relpath = provider_result.artifact_locator.native_primary_ref or rollout_relpath
+        return (
+            compatibility_result,
+            standard_result,
+            provider_result.session_locator.session_id,
+            rollout_relpath,
+        )
+
+    def _execute_legacy_provider_turn(
+        self,
+        *,
+        agent: Agent,
+        prompt: str,
+        developer_instructions: str | None,
+        overwrite_developer_instructions: bool,
+        env: dict[str, str] | None,
+        workdir: str | None,
+    ) -> tuple[object, None, str, str | None]:
+        # COMPAT(legacy-provider-runtime): preserves injected providers that
+        # implement start_thread/resume_thread instead of ProviderRuntimeAdapter.
+        # Remove after LC runtime-matrix fakes register AgentProviderBundle.
+        home = self.home_service.get_home(agent.cli_type, agent.home_id)
+        home_root = self.home_service.resolve_home_root(agent.cli_type, agent.home_id)
+        provider_env = build_provider_env(home=home, home_root=home_root, run_env=env)
+        provider = self.providers[agent.cli_type]
+        common = {
+            "home_id": agent.home_id,
+            "home_root": home_root,
+            "env": provider_env,
+            "workdir": workdir,
+            "prompt": prompt,
+            "developer_instructions": developer_instructions,
+            "overwrite_developer_instructions": overwrite_developer_instructions,
+            "agent_id": agent.agent_id,
+        }
+        if agent.thread_id is None:
+            result = provider.start_thread(**common)
+        else:
+            result = provider.resume_thread(**common, thread_id=agent.thread_id)
+        return result.turn_result, None, result.thread_id, result.rollout_relpath
+
+    def _provider_bundle(self, provider_type: str) -> AgentProviderBundle | None:
+        current_provider = self.providers.get(provider_type)
+        source = self._provider_bundle_sources.get(provider_type)
+        if provider_type in self.provider_registry and (source is None or source is current_provider):
+            return self.provider_registry.get(provider_type)
+        if source is not None and source is not current_provider:
+            # COMPAT(mutable-providers-dict): LC tests replace providers directly.
+            # Rebuild a bundle when supported, otherwise deliberately fall back
+            # to the legacy provider path for that replacement.
+            replacement = _build_provider_bundle(current_provider, runtime_root=self.runtime_root)
+            if replacement is None:
+                self.provider_registry.unregister(provider_type)
+                self._provider_bundle_sources.pop(provider_type, None)
+                return None
+            self.provider_registry.replace(replacement)
+            self._provider_bundle_sources[provider_type] = current_provider
+            return replacement
+        if provider_type not in self.provider_registry:
+            replacement = _build_provider_bundle(current_provider, runtime_root=self.runtime_root)
+            if replacement is not None:
+                self.provider_registry.register(replacement)
+                self._provider_bundle_sources[provider_type] = current_provider
+                return replacement
+        return None
+
+    def _on_provider_event(self, agent_id: str, event: AgentEvent) -> None:
+        if event.session_id is None:
+            return
+        try:
+            agent = self.store.get_agent(agent_id)
+        except KeyError:
+            return
+        if agent.thread_id == event.session_id:
+            return
+        self.store.update_thread_locator(
+            agent_id,
+            thread_id=event.session_id,
+            rollout_relpath=agent.rollout_relpath,
+        )
 
     def wait_agent(self, agent_id: str, timeout_s: float | None = None) -> object:
         active = self._active.get(agent_id)
@@ -464,6 +651,24 @@ class AgentService:
             if agent.last_completion.status == "checker_failed":
                 raise AgentCompletionCheckError(agent.last_completion.error_message or agent_id)
         return self.read_latest_turn_result(agent_id)
+
+    def wait_agent_result(
+        self,
+        agent_id: str,
+        timeout_s: float | None = None,
+    ) -> AgentTurnResult:
+        """Wait for and return the Provider-neutral result for the latest turn."""
+
+        active = self._active.get(agent_id)
+        if active is not None:
+            if not active.done_event.wait(timeout_s):
+                raise TimeoutError(agent_id)
+            if active.error is not None:
+                raise active.error
+        result = self._latest_standard_results.get(agent_id)
+        if result is None:
+            raise AgentHasNoCompletedTurn(agent_id)
+        return result
 
     def wait_agents(
         self,
@@ -1030,11 +1235,40 @@ class AgentService:
             repaired=repaired,
         )
 
-    def interrupt_agent(self, agent_id: str) -> bool:
-        provider = self.providers.get(self.store.get_agent(agent_id).cli_type)
+    def interrupt_agent(self, agent_id: str, timeout_s: float | None = None) -> bool:
+        agent = self.store.get_agent(agent_id)
+        bundle = self._provider_bundle(agent.cli_type)
+        active = self._active.get(agent_id)
+        if bundle is not None and active is not None:
+            deadline = None if timeout_s is None else monotonic() + timeout_s
+            if active.provider_handle is None:
+                remaining = None if deadline is None else max(0.0, deadline - monotonic())
+                if not active.handle_ready.wait(remaining):
+                    return False
+            handle = active.provider_handle
+            if handle is None:
+                return False
+            remaining = None if deadline is None else max(0.0, deadline - monotonic())
+            result = handle.interrupt(remaining)
+            if not (result.accepted and result.terminal_confirmed):
+                return False
+            remaining = None if deadline is None else max(0.0, deadline - monotonic())
+            return active.done_event.wait(remaining)
+        provider = self.providers.get(agent.cli_type)
+        # COMPAT(legacy-provider-interrupt): providers registered through the
+        # old dictionary expose interrupt_agent(agent_id). Provider bundles use
+        # the active ProviderRunHandle directly. Remove with the providers dict.
         if provider is None or not hasattr(provider, "interrupt_agent"):
             return False
-        return bool(provider.interrupt_agent(agent_id))
+        accepted = bool(provider.interrupt_agent(agent_id))
+        if not accepted:
+            return False
+        active = self._active.get(agent_id)
+        if active is None:
+            return True
+        if not active.done_event.wait(timeout_s):
+            return False
+        return True
 
     def pause_runs(self, scope_id: str | None = None) -> None:
         with self._lock:
@@ -1299,7 +1533,15 @@ class AgentService:
         return self.store.read_default_trace_report(agent_id, format=format)
 
     def close(self) -> None:
+        closed_provider_ids: set[int] = set()
+        for bundle in self.provider_registry.list():
+            bundle.runtime.close()
+            source = self._provider_bundle_sources.get(bundle.provider_type)
+            if source is not None:
+                closed_provider_ids.add(id(source))
         for provider in self.providers.values():
+            if id(provider) in closed_provider_ids:
+                continue
             close = getattr(provider, "close", None)
             if callable(close):
                 close()
@@ -1333,6 +1575,34 @@ class AgentService:
 def _turn_id(turn_result: object) -> str:
     value = getattr(turn_result, "id", None)
     return str(value or f"turn_{uuid.uuid4().hex}")
+
+
+def _standard_or_legacy_turn_id(
+    standard_result: AgentTurnResult | None,
+    legacy_result: object,
+) -> str:
+    if standard_result is not None and standard_result.turn_locator is not None:
+        return standard_result.turn_locator.turn_id
+    return _turn_id(legacy_result)
+
+
+def _build_provider_bundle(
+    provider: object | None,
+    *,
+    runtime_root: Path,
+) -> AgentProviderBundle | None:
+    if provider is None:
+        return None
+    # COMPAT(provider-self-bundle-bootstrap): lets existing constructor callers
+    # pass a CodexProvider while AgentService migrates to ProviderRegistry.
+    # Future providers should pass ProviderRegistry explicitly.
+    builder = getattr(provider, "build_provider_bundle", None)
+    if not callable(builder):
+        return None
+    bundle = builder(runtime_root=runtime_root)
+    if not isinstance(bundle, AgentProviderBundle):
+        raise TypeError("build_provider_bundle() must return AgentProviderBundle")
+    return bundle
 
 
 def _render_developer_instructions(

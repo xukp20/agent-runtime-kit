@@ -160,7 +160,7 @@ class ModelRequestUsage:
 
 @dataclass(frozen=True)
 class AgentTurnUsage:
-    request_count: int
+    request_count: int | None
     requests: tuple[ModelRequestUsage, ...]
     token_usage: TokenUsage
     models_used: tuple[ModelBackendIdentity, ...] = ()

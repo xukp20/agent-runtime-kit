@@ -81,10 +81,13 @@ class _CodexAgentRun:
     home_id: str
     thread_id: str | None = None
     turn_id: str | None = None
+    turn_handle: object | None = None
 
 
 class CodexProvider:
     """Synchronous wrapper around the OpenAI Codex Python SDK."""
+
+    provider_type = "codex"
 
     REQUIRED_STATE_DATABASES = (
         "state_5.sqlite",
@@ -113,6 +116,11 @@ class CodexProvider:
         self._home_init_locks: dict[tuple[str, str], threading.Lock] = {}
         self._lock = threading.RLock()
 
+    def build_provider_bundle(self, *, runtime_root: Path):
+        from .codex_bundle import build_codex_provider_bundle
+
+        return build_codex_provider_bundle(self, runtime_root=runtime_root)
+
     def start_thread(
         self,
         *,
@@ -125,6 +133,7 @@ class CodexProvider:
         agent_id: str,
         overwrite_developer_instructions: bool = False,
         on_thread_started: Callable[[str], None] | None = None,
+        on_turn_started: Callable[[str, str], None] | None = None,
     ) -> CodexTurnResult:
         self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
         self._begin_agent_run(home_id=home_id, agent_id=agent_id)
@@ -141,7 +150,13 @@ class CodexProvider:
                 self._update_agent_run_locator(agent_id, thread_id=thread.id)
                 if on_thread_started is not None:
                     on_thread_started(thread.id)
-                turn_result = thread.run(prompt, cwd=workdir, model=self.model)
+                turn_result = self._run_turn_with_control_handle(
+                    thread,
+                    prompt=prompt,
+                    workdir=workdir,
+                    agent_id=agent_id,
+                    on_turn_started=on_turn_started,
+                )
                 rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
                 return CodexTurnResult(
                     thread_id=thread.id,
@@ -164,6 +179,7 @@ class CodexProvider:
         developer_instructions: str | None,
         agent_id: str,
         overwrite_developer_instructions: bool = False,
+        on_turn_started: Callable[[str, str], None] | None = None,
     ) -> CodexTurnResult:
         self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
         self._begin_agent_run(home_id=home_id, agent_id=agent_id, thread_id=thread_id)
@@ -178,6 +194,8 @@ class CodexProvider:
                         workdir=workdir,
                         prompt=prompt,
                         developer_instructions=developer_instructions,
+                        agent_id=agent_id,
+                        on_turn_started=on_turn_started,
                     )
                     rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
                     return CodexTurnResult(
@@ -193,7 +211,13 @@ class CodexProvider:
                     model=self.model,
                     config=self.thread_config or None,
                 )
-                turn_result = thread.run(prompt, cwd=workdir, model=self.model)
+                turn_result = self._run_turn_with_control_handle(
+                    thread,
+                    prompt=prompt,
+                    workdir=workdir,
+                    agent_id=agent_id,
+                    on_turn_started=on_turn_started,
+                )
                 rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
                 return CodexTurnResult(
                     thread_id=thread.id,
@@ -213,6 +237,8 @@ class CodexProvider:
         workdir: str | None,
         prompt: str,
         developer_instructions: str | None,
+        agent_id: str,
+        on_turn_started: Callable[[str, str], None] | None,
     ) -> tuple[object, object]:
         client = getattr(codex, "_client", None)
         if client is None:
@@ -257,8 +283,43 @@ class CodexProvider:
         thread = thread_type(client, resumed_thread_id)
         turn = getattr(started, "turn", None)
         turn_id = str(getattr(turn, "id"))
-        turn_result = turn_handle_type(client, resumed_thread_id, turn_id).run()
+        turn_handle = turn_handle_type(client, resumed_thread_id, turn_id)
+        self._update_agent_run_locator(
+            agent_id,
+            thread_id=resumed_thread_id,
+            turn_id=turn_id,
+            turn_handle=turn_handle,
+        )
+        if on_turn_started is not None:
+            on_turn_started(resumed_thread_id, turn_id)
+        turn_result = turn_handle.run()
         return thread, turn_result
+
+    def _run_turn_with_control_handle(
+        self,
+        thread: object,
+        *,
+        prompt: str,
+        workdir: str | None,
+        agent_id: str,
+        on_turn_started: Callable[[str, str], None] | None,
+    ) -> object:
+        start_turn = getattr(thread, "turn", None)
+        if not callable(start_turn):
+            # COMPAT(codex-sdk-pre-turn-handle): older test doubles and SDKs
+            # expose only Thread.run(). Remove after the minimum supported SDK
+            # guarantees Thread.turn(). Covered by Codex per-run compatibility.
+            return thread.run(prompt, cwd=workdir, model=self.model)
+        turn_handle = start_turn(prompt, cwd=workdir, model=self.model)
+        self._update_agent_run_locator(
+            agent_id,
+            thread_id=str(getattr(thread, "id")),
+            turn_id=str(getattr(turn_handle, "id")),
+            turn_handle=turn_handle,
+        )
+        if on_turn_started is not None:
+            on_turn_started(str(getattr(thread, "id")), str(getattr(turn_handle, "id")))
+        return turn_handle.run()
 
     def fork_thread(
         self,
@@ -480,7 +541,12 @@ class CodexProvider:
         )
 
     def interrupt_agent(self, agent_id: str) -> bool:
-        return agent_id in self._agent_runs and False
+        with self._lock:
+            run = self._agent_runs.get(agent_id)
+            handle = run.turn_handle if run is not None else None
+        if handle is None:
+            return False
+        return self.interrupt(handle)
 
     def interrupt(self, handle: object) -> bool:
         if hasattr(handle, "interrupt"):
@@ -585,6 +651,7 @@ class CodexProvider:
         *,
         thread_id: str | None = None,
         turn_id: str | None = None,
+        turn_handle: object | None = None,
     ) -> None:
         with self._lock:
             run = self._agent_runs.get(agent_id)
@@ -594,6 +661,8 @@ class CodexProvider:
                 run.thread_id = thread_id
             if turn_id is not None:
                 run.turn_id = turn_id
+            if turn_handle is not None:
+                run.turn_handle = turn_handle
 
     def _home_init_lock(self, home_id: str, home_root: Path) -> threading.Lock:
         key = (home_id, str(home_root.resolve()))
