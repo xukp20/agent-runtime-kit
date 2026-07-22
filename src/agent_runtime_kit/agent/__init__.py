@@ -6,9 +6,6 @@ from .context import (
     AgentContextMaintenanceJournal,
     AgentContextMaintenanceJournalStatus,
     AgentContextMaintenancePolicy,
-    AgentContextUsage,
-    ProviderContextCompactionResult,
-    ProviderContextUsage,
 )
 from .instructions import InstructionService, TextFragment
 from .models import (
@@ -32,16 +29,8 @@ from .service import AgentCompletionContext
 from .skills import SkillService, SkillSpec, write_skill_spec
 from .snapshots import AgentSnapshotService
 from .templates import TemplateVariableError, render_template
-from .trace import (
-    AgentArtifactView,
-    AgentResponseTextView,
-    AgentRolloutInfo,
-    AgentToolCallView,
-    AgentTraceEventView,
-    AgentTraceReader,
-    AgentTraceReport,
-    AgentTurnSummary,
-)
+from .provider_contracts import AgentContextUsage, ProviderContextCompactionResult, ProviderContextUsage
+from .trace import AgentTraceReport, AgentTraceReportPaths
 
 __all__ = [
     "Agent",
@@ -61,18 +50,12 @@ __all__ = [
     "AgentContextMaintenanceUnsupported",
     "AgentContextUsage",
     "AgentContextUsageUnavailable",
-    "AgentArtifactView",
-    "AgentResponseTextView",
     "AgentRuntimeKitError",
     "AgentStatusWaitResult",
     "AgentTraceReportPolicy",
     "AgentSnapshotService",
-    "AgentRolloutInfo",
-    "AgentToolCallView",
-    "AgentTraceEventView",
-    "AgentTraceReader",
     "AgentTraceReport",
-    "AgentTurnSummary",
+    "AgentTraceReportPaths",
     "CompletionDecision",
     "InstructionService",
     "ProviderContextCompactionResult",

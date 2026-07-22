@@ -61,7 +61,7 @@ def test_provider_turn_result_is_json_serializable_without_native_sdk_objects() 
     assert payload["session_locator"]["session_id"] == "thread-1"
 
 
-def test_context_usage_exposes_legacy_aliases_without_inventing_values() -> None:
+def test_context_usage_exposes_standard_measurements() -> None:
     usage = AgentContextUsage(
         agent_id="a1",
         provider_type="codex",
@@ -75,8 +75,8 @@ def test_context_usage_exposes_legacy_aliases_without_inventing_values() -> None
         available=True,
     )
 
-    assert usage.total_tokens == 80
-    assert usage.context_window == 100
+    assert usage.used_tokens == 80
+    assert usage.effective_context_window_tokens == 100
     assert usage.usage_ratio == pytest.approx(0.8)
 
 

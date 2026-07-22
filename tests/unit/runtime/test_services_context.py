@@ -60,7 +60,7 @@ def test_services_register_into_shared_ark_object(tmp_path: Path) -> None:
     step_registry = StepTypeRegistry()
     flow_registry.register(RuntimeCtxFlow)
 
-    agent_service = AgentService(runtime_root, providers={"codex": object()}, ark_services=ark, app_services=app)
+    agent_service = AgentService(runtime_root, ark_services=ark, app_services=app)
     flow_service = FlowService(
         runtime_root,
         flow_registry=flow_registry,

@@ -28,7 +28,7 @@ from ..skills import SkillSpec, validate_skill_name, write_skill_spec
 from ..store_utils import read_json, write_json_atomic
 
 if TYPE_CHECKING:
-    from ..homes import HomeRecord, McpServerSpec, ModelConfigOverrides
+    from ..homes import HomeRecord, McpServerSpec
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,6 @@ class CodexHomeOptions:
     skill_paths: Mapping[str, Path] = field(default_factory=dict)
     skill_specs: Mapping[str, SkillSpec] = field(default_factory=dict)
     mcp_servers: tuple["McpServerSpec", ...] = ()
-    model_config_overrides: "ModelConfigOverrides | None" = None
 
 
 class CodexHomeRenderer:
@@ -78,8 +77,6 @@ class CodexHomeRenderer:
         config_text = _read_base_config(spec)
         if spec.config_overrides:
             config_text = _apply_top_level_overrides(config_text, spec.config_overrides)
-        if options.model_config_overrides is not None:
-            config_text = _apply_codex_model_config_overrides(config_text, options.model_config_overrides)
         mcp_servers = options.mcp_servers or tuple(spec.mcp_servers)
         if mcp_servers:
             config_text = config_text.rstrip() + "\n\n" + _render_mcp_servers_toml(mcp_servers)
@@ -453,20 +450,6 @@ def _apply_top_level_overrides(text: str, overrides: Mapping[str, object]) -> st
             additions.append("")
         rendered[insert_at:insert_at] = additions
     return "\n".join(rendered).rstrip() + "\n"
-
-
-def _apply_codex_model_config_overrides(text: str, overrides: "ModelConfigOverrides") -> str:
-    return _apply_top_level_overrides(
-        text,
-        {
-            key: value
-            for key, value in {
-                "model": overrides.model,
-                "model_reasoning_effort": overrides.reasoning_effort,
-            }.items()
-            if value is not None
-        },
-    )
 
 
 def _render_mcp_servers_toml(servers: tuple["McpServerSpec", ...]) -> str:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..context import ProviderContextUsage
+from ..provider_contracts import ProviderContextUsage
 from ..store_utils import utc_now_iso
 
 
@@ -201,11 +201,14 @@ def _usage_from_token_count(payload: dict[str, Any], *, session_id: str | None) 
         return _unavailable_usage(session_id, "context_window_missing", total_tokens=total_tokens)
     return ProviderContextUsage(
         session_id=session_id,
-        total_tokens=total_tokens,
-        context_window=context_window,
         observed_at=utc_now_iso(),
         source="artifact",
         available=True,
+        used_tokens=total_tokens,
+        context_window_tokens=context_window,
+        effective_context_window_tokens=context_window,
+        remaining_tokens=max(context_window - total_tokens, 0),
+        measurement="provider_artifact",
     )
 
 
@@ -218,11 +221,13 @@ def _unavailable_usage(
 ) -> ProviderContextUsage:
     return ProviderContextUsage(
         session_id=session_id,
-        total_tokens=total_tokens,
-        context_window=context_window,
         observed_at=utc_now_iso(),
         source="artifact",
         available=False,
+        used_tokens=total_tokens,
+        context_window_tokens=context_window,
+        effective_context_window_tokens=context_window,
+        measurement="provider_artifact" if total_tokens is not None else "unavailable",
         reason=reason,
     )
 

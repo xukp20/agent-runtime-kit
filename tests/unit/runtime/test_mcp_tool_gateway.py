@@ -110,14 +110,14 @@ def make_services(
             agent_id="agent-1",
             scope_id="scope",
             agent_type="gateway_agent",
-            cli_type="codex",
+            provider_type="codex",
             home_id="gateway_agent",
         ),
         "agent-2": Agent(
             agent_id="agent-2",
             scope_id="scope",
             agent_type="gateway_agent",
-            cli_type="codex",
+            provider_type="codex",
             home_id="gateway_agent",
         ),
     }
@@ -225,7 +225,7 @@ def test_resolve_rejects_missing_objects_and_relation_mismatches(tmp_path: Path)
         agent_id="agent-1",
         scope_id="scope-a",
         agent_type="gateway_agent",
-        cli_type="codex",
+        provider_type="codex",
         home_id="gateway_agent",
     )
     malformed_step = GatewayStep(

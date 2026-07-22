@@ -11,15 +11,6 @@ from .openai_agents import (
     OpenAIAgentsResourceRegistry,
     OpenAIAgentsRunOptions,
 )
-from .external_takeover import (
-    ExternalTakeoverCancelled,
-    ExternalTakeoverForkResult,
-    ExternalTakeoverHomeInitializationRecord,
-    ExternalTakeoverProvider,
-    ExternalTakeoverProviderResult,
-    ExternalTakeoverThreadSnapshot,
-    ExternalTakeoverTurnResult,
-)
 from .pi_bundle import build_pi_provider_bundle
 from .pi_home import PiHomeOptions, PiHomeRenderer
 from .pi_runtime import PiProviderRunHandle, PiRuntimeAdapter
@@ -40,13 +31,6 @@ __all__ = [
     "OpenAIAgentsProvider",
     "OpenAIAgentsResourceRegistry",
     "OpenAIAgentsRunOptions",
-    "ExternalTakeoverCancelled",
-    "ExternalTakeoverForkResult",
-    "ExternalTakeoverHomeInitializationRecord",
-    "ExternalTakeoverProvider",
-    "ExternalTakeoverProviderResult",
-    "ExternalTakeoverThreadSnapshot",
-    "ExternalTakeoverTurnResult",
     "PiHomeOptions",
     "PiHomeRenderer",
     "PiProviderRunHandle",

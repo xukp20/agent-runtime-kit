@@ -130,18 +130,6 @@ class ProviderRunHandle(Protocol):
     def close(self) -> None: ...
 
 
-class ProviderCompatibilityAdapter(Protocol):
-    """Temporary bridge for legacy completion checkers and raw query APIs."""
-
-    provider_type: str
-
-    def completion_turn_result(
-        self,
-        handle: ProviderRunHandle,
-        result: ProviderTurnResult,
-    ) -> object: ...
-
-
 class ProviderRuntimeAdapter(Protocol):
     provider_type: str
 

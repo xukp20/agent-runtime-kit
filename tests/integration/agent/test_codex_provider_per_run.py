@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.homes import ProviderHomeSpec
 from agent_runtime_kit.agent.models import AgentContextCompactionEvidenceError
-from agent_runtime_kit.agent.provider_contracts import ProviderRunState
+from agent_runtime_kit.agent.provider_contracts import ProviderRegistry, ProviderRunState
 from agent_runtime_kit.agent.providers.codex import CodexProvider
+from agent_runtime_kit.agent.providers.codex_bundle import build_codex_provider_bundle
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 
 
@@ -310,9 +311,11 @@ def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
     service = AgentService(
         tmp_path / "runtime",
         agent_types=registry,
-        providers={"codex": provider},
+        provider_registry=ProviderRegistry(
+            (build_codex_provider_bundle(provider, runtime_root=tmp_path / "runtime"),)
+        ),
     )
-    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="live-locator"))
+    service.home_service.create_home(ProviderHomeSpec(provider_type="codex", home_id="live-locator"))
     agent = service.create_agent("scope", "live-locator")
 
     service.start_agent(agent.agent_id, variables={"item": "state"})
@@ -320,28 +323,122 @@ def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
 
     running = service.get_agent(agent.agent_id)
     assert running.status == "running"
-    assert running.thread_id == "thread-started"
+    assert running.session_locator is not None
+    assert running.session_locator.session_id == "thread-started"
     assert provider.list_active_agents("live-locator") == [agent.agent_id]
 
     release.set()
-    legacy_result = service.wait_agent(agent.agent_id)
-    standard_result = service.wait_agent_result(agent.agent_id)
-    assert legacy_result.id == "turn-Start state."
-    assert standard_result.status is ProviderRunState.COMPLETED
-    assert standard_result.session_locator.session_id == "thread-started"
-    assert standard_result.turn_locator is not None
-    assert standard_result.turn_locator.turn_id == "turn-Start state."
-    assert standard_result.completion is not None
-    assert standard_result.completion.status == "complete"
+    result = service.wait_agent(agent.agent_id)
+    assert result.status is ProviderRunState.COMPLETED
+    assert result.session_locator.session_id == "thread-started"
+    assert result.turn_locator is not None
+    assert result.turn_locator.turn_id == "turn-Start state."
+    assert result.completion is not None
+    assert result.completion.status == "complete"
     persisted = service.get_agent(agent.agent_id)
-    assert persisted.schema_version == 2
+    assert persisted.schema_version == 3
     assert persisted.provider_type == "codex"
-    assert persisted.session_locator == standard_result.session_locator
-    assert persisted.latest_turn_locator == standard_result.turn_locator
-    assert persisted.artifact_locator == standard_result.provider_result.artifact_locator
-    assert persisted.thread_id == standard_result.session_locator.session_id
+    assert persisted.session_locator == result.session_locator
+    assert persisted.latest_turn_locator == result.turn_locator
+    assert persisted.artifact_locator == result.provider_result.artifact_locator
     assert service.provider_registry.get("codex").provider_type == "codex"
     assert provider.list_active_agents("live-locator") == []
+
+
+def test_agent_service_reseals_provider_declared_home_initialization_changes(
+    tmp_path: Path,
+) -> None:
+    _reset_fake_codex()
+    runtime_root = tmp_path / "runtime"
+    provider = _provider()
+    registry = AgentTypeRegistry()
+    registry.register(LiveLocatorAgentType())
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        provider_registry=ProviderRegistry(
+            (build_codex_provider_bundle(provider, runtime_root=runtime_root),)
+        ),
+    )
+    home = service.home_service.create_home(
+        ProviderHomeSpec(
+            provider_type="codex",
+            home_id="live-locator",
+            config_overrides={"model": "gpt-before-initialization"},
+        )
+    )
+    home_root = service.home_service.resolve_home_root("codex", "live-locator")
+    config_path = home_root / ".codex" / "config.toml"
+    initial_manifest_hash = home.materialization_manifest_hash
+    initialize_home = provider.ensure_home_initialized
+
+    def initialize_with_managed_change(**kwargs):  # noqa: ANN003, ANN202
+        marker_path = Path(kwargs["home_root"]) / ".ark" / "codex_home_initialized.json"
+        if not marker_path.exists():
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8")
+                + "\n# provider initialization mutation\n",
+                encoding="utf-8",
+            )
+        return initialize_home(**kwargs)
+
+    provider.ensure_home_initialized = initialize_with_managed_change  # type: ignore[method-assign]
+    agent = service.create_agent("scope", "live-locator")
+
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "second"}).agent_id)
+
+    context = service.home_service.build_execution_context("codex", "live-locator")
+    refreshed = service.home_service.get_home("codex", "live-locator")
+    assert refreshed.materialization_manifest_hash != initial_manifest_hash
+    assert context.materialization_manifest is not None
+    assert context.materialization_manifest.manifest_hash == refreshed.materialization_manifest_hash
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "# unsealed tampering\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="materialized file hash mismatch"):
+        service.home_service.build_execution_context("codex", "live-locator")
+
+
+def test_agent_service_commits_session_start_home_only_for_new_session(
+    tmp_path: Path,
+) -> None:
+    _reset_fake_codex()
+    runtime_root = tmp_path / "runtime"
+    provider = _provider()
+    registry = AgentTypeRegistry()
+    registry.register(LiveLocatorAgentType())
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        provider_registry=ProviderRegistry(
+            (build_codex_provider_bundle(provider, runtime_root=runtime_root),)
+        ),
+    )
+    service.home_service.create_home(
+        ProviderHomeSpec(provider_type="codex", home_id="live-locator")
+    )
+    commits: list[tuple[str, str, str]] = []
+    commit = service.home_service.commit_provider_lifecycle_materialization
+
+    def record_commit(
+        provider_type: str,
+        home_id: str,
+        *,
+        lifecycle: str,
+    ):
+        commits.append((provider_type, home_id, lifecycle))
+        return commit(provider_type, home_id, lifecycle=lifecycle)
+
+    service.home_service.commit_provider_lifecycle_materialization = record_commit  # type: ignore[method-assign]
+    agent = service.create_agent("scope", "live-locator")
+
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id)
+    service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "second"}).agent_id)
+
+    assert commits == [("codex", "live-locator", "session_start")]
 
 
 def test_agent_service_interrupt_waits_until_codex_turn_is_terminal(tmp_path: Path) -> None:
@@ -356,9 +453,11 @@ def test_agent_service_interrupt_waits_until_codex_turn_is_terminal(tmp_path: Pa
     service = AgentService(
         tmp_path / "runtime",
         agent_types=registry,
-        providers={"codex": provider},
+        provider_registry=ProviderRegistry(
+            (build_codex_provider_bundle(provider, runtime_root=tmp_path / "runtime"),)
+        ),
     )
-    service.home_service.create_home(HomeCreateSpec(cli_type="codex", home_id="live-locator"))
+    service.home_service.create_home(ProviderHomeSpec(provider_type="codex", home_id="live-locator"))
     agent = service.create_agent("scope", "live-locator")
     service.start_agent(agent.agent_id, variables={"item": "state"})
     assert started.wait(timeout=5)
@@ -481,7 +580,7 @@ def test_codex_provider_compact_waits_for_rollout_evidence_and_idle(tmp_path: Pa
     )
 
     assert result.usage_after is not None
-    assert result.usage_after.total_tokens == 20
+    assert result.usage_after.used_tokens == 20
     assert len(started) == 1
     assert started[0][0]["token_count_count"] == 1
     assert provider.list_active_agents() == []

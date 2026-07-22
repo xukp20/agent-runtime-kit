@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 from ..provider_contracts import (
     AgentError,
@@ -213,20 +212,13 @@ class CodexQueryAdapter:
         )
 
     def _reader(self, locator) -> AgentTraceReader:  # noqa: ANN001
-        rollout_path, rollout_relpath = self._rollout_path(locator)
+        rollout_path, _ = self._rollout_path(locator)
         events: list[dict] = []
         if rollout_path is not None and rollout_path.exists():
             for line in rollout_path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     events.append(json.loads(line))
-        agent = SimpleNamespace(
-            agent_id="",
-            agent_type="",
-            home_id=locator.home_id,
-            thread_id=locator.session_id,
-            rollout_relpath=rollout_relpath,
-        )
-        return AgentTraceReader(agent=agent, rollout_path=rollout_path, events=events)
+        return AgentTraceReader(events=events)
 
     def _rollout_path(self, locator) -> tuple[Path | None, str | None]:  # noqa: ANN001
         native = locator.native_locator if isinstance(locator.native_locator, dict) else {}

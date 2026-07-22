@@ -8,9 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeCreateSpec
+from agent_runtime_kit.agent.homes import ProviderHomeSpec
 from agent_runtime_kit.agent.models import CompletionDecision
+from agent_runtime_kit.agent.provider_contracts import BaseConfigSource, ProviderRegistry
 from agent_runtime_kit.agent.providers.codex import CodexProvider
+from agent_runtime_kit.agent.providers.codex_home import CodexHomeOptions
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.skills import SkillSpec
 
@@ -29,8 +31,8 @@ class RealCodexSkillAgentType(AgentType):
     continue_prompt_template = "{{prompt}}"
 
     def check_completion(self, ctx: AgentCompletionContext) -> CompletionDecision:
-        if not getattr(ctx.turn_result, "id", None):
-            return CompletionDecision(complete=False, reason="turn result has no id")
+        if not ctx.turn_result.run_id:
+            return CompletionDecision(complete=False, reason="turn result has no run id")
         return CompletionDecision(complete=True)
 
 
@@ -68,8 +70,8 @@ def _run_and_assert_latest_text(service: AgentService, agent_id: str, *, prompt:
         service.start_agent(agent_id, variables={"prompt": prompt}).agent_id,
         timeout_s=600,
     )
-    latest = service.read_latest_turn_result(agent_id)
-    text = getattr(latest, "final_response", None)
+    latest = service.query_turn(agent_id, latest=True)
+    text = latest.result.final_text if latest is not None and latest.result is not None else None
     assert isinstance(text, str), f"latest turn has no final response: {latest!r}"
     assert expected in text
 
@@ -84,7 +86,11 @@ def _service(runtime_root: Path) -> AgentService:
         sdk_python_root=_sdk_python_root(),
         model=os.environ.get("ARK_REAL_CODEX_MODEL"),
     )
-    return AgentService(runtime_root, agent_types=registry, providers={"codex": provider})
+    return AgentService(
+        runtime_root,
+        agent_types=registry,
+        provider_registry=ProviderRegistry((provider.build_provider_bundle(runtime_root=runtime_root),)),
+    )
 
 
 def _create_codex_home_with_skills(service: AgentService, tmp_path: Path, home_id: str) -> None:
@@ -103,19 +109,21 @@ The sentinel is ARK_PATH_SKILL_SEEN.
     )
 
     service.home_service.create_home(
-        HomeCreateSpec(
-            cli_type="codex",
+        ProviderHomeSpec(
+            provider_type="codex",
             home_id=home_id,
-            base_config_path=config_dir / "config.toml",
-            auth_json_path=config_dir / "auth.json",
-            skill_paths={"ark-path-skill": path_skill},
-            skill_specs={
-                "ark-spec-skill": SkillSpec(
-                    name="ark-spec-skill",
-                    description="Use this skill when asked for the ARK spec skill sentinel.",
-                    body="The sentinel is ARK_SPEC_SKILL_SEEN.",
-                )
-            },
+            base_config=BaseConfigSource(path=str(config_dir / "config.toml")),
+            provider_options=CodexHomeOptions(
+                auth_json_path=config_dir / "auth.json",
+                skill_paths={"ark-path-skill": path_skill},
+                skill_specs={
+                    "ark-spec-skill": SkillSpec(
+                        name="ark-spec-skill",
+                        description="Use this skill when asked for the ARK spec skill sentinel.",
+                        body="The sentinel is ARK_SPEC_SKILL_SEEN.",
+                    )
+                },
+            ),
         )
     )
 

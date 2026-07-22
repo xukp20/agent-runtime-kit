@@ -171,8 +171,8 @@ def test_codex_runtime_adapter_normalizes_result_usage_and_context(tmp_path: Pat
     )
     assert result.context_after is not None
     assert result.context_after.used_tokens == 100
-    assert result.context_after.context_window == 200
-    assert handle.legacy_turn_result.final_response == "done"
+    assert result.context_after.context_window_tokens == 200
+    assert result.final_text == "done"
 
 
 def test_codex_runtime_commits_new_session_home_before_first_turn(tmp_path: Path) -> None:

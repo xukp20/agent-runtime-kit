@@ -66,15 +66,15 @@ class FakeAgentService:
         self,
         scope_id: str,
         agent_type: str,
-        cli_type: str = "",
+        provider_type: str = "",
         home_id: str | None = None,
     ) -> Agent:
-        resolved_cli_type = cli_type or "codex"
+        resolved_provider_type = provider_type or "codex"
         agent = Agent(
             agent_id=f"agent-{self.next_agent}",
             scope_id=scope_id,
             agent_type=agent_type,
-            cli_type=resolved_cli_type,
+            provider_type=resolved_provider_type,
             home_id=home_id or agent_type,
         )
         self.next_agent += 1
@@ -82,7 +82,7 @@ class FakeAgentService:
             {
                 "scope_id": scope_id,
                 "agent_type": agent_type,
-                "cli_type": cli_type,
+                "provider_type": provider_type,
                 "home_id": home_id,
                 "agent_id": agent.agent_id,
             }
@@ -112,7 +112,7 @@ class FakeAgentService:
         self.start_calls.append(call)
         if self.submit_on_start:
             self._accept_submission(call)
-        return Agent(agent_id=agent_id, scope_id="scope", agent_type="worker", cli_type="codex", home_id="worker")
+        return Agent(agent_id=agent_id, scope_id="scope", agent_type="worker", provider_type="codex", home_id="worker")
 
     def wait_agent(self, agent_id: str, timeout_s: float | None = None) -> object:
         self.wait_calls.append({"agent_id": agent_id, "timeout_s": timeout_s})

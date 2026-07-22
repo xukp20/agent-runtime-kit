@@ -16,6 +16,7 @@ from agent_runtime_kit.agent.providers.claude_code_home import (
     ClaudeCodeHomeRenderer,
 )
 from agent_runtime_kit.agent.providers.claude_code import ClaudeCodeProvider
+from agent_runtime_kit.agent.providers.claude_code_bundle import build_claude_code_provider_bundle
 from agent_runtime_kit.agent.skills import SkillSpec
 
 
@@ -123,7 +124,7 @@ def test_claude_home_detects_unsealed_file_mutation(tmp_path: Path) -> None:
 
 def test_claude_capabilities_require_verified_cli_for_context_control(tmp_path: Path) -> None:
     provider = ClaudeCodeProvider(runtime_root=tmp_path, sdk_loader=lambda: object())
-    bundle = provider.build_provider_bundle(runtime_root=tmp_path)
+    bundle = build_claude_code_provider_bundle(provider, runtime_root=tmp_path)
     service = HomeService(tmp_path, renderers={"claude_code": bundle.home_renderer})
     home = service.create_home(
         ProviderHomeSpec(provider_type="claude_code", home_id="worker")

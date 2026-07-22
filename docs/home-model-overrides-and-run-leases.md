@@ -2,33 +2,43 @@
 
 ## Provider-neutral Home model settings
 
-`HomeCreateSpec.model_config_overrides` carries the two model settings that an
-embedding application commonly varies by Agent type:
+`ProviderHomeSpec` carries provider-neutral backend identity and explicit
+provider configuration overrides:
 
 ```python
-from agent_runtime_kit.agent.homes import HomeCreateSpec, ModelConfigOverrides
+from agent_runtime_kit.agent.provider_contracts import (
+    BaseConfigSource,
+    ModelBackendIdentity,
+    ProviderHomeSpec,
+)
+from agent_runtime_kit.agent.providers.codex_home import CodexHomeOptions
 
-spec = HomeCreateSpec(
-    cli_type="codex",
+spec = ProviderHomeSpec(
+    provider_type="codex",
     home_id="PlanningAgent",
-    base_config_path=base_config,
-    model_config_overrides=ModelConfigOverrides(
-        model="gpt-5.6-sol",
+    base_config=BaseConfigSource(path=str(base_config)),
+    config_overrides={
+        "model": "gpt-5.6-sol",
+        "model_reasoning_effort": "high",
+    },
+    model_config=ModelBackendIdentity(
+        api_provider="openai",
+        api_mode="responses",
+        requested_model="gpt-5.6-sol",
         reasoning_effort="high",
     ),
+    provider_options=CodexHomeOptions(auth_json_path=auth_json),
 )
 ```
 
-The fields are provider-neutral. A provider-specific Home renderer projects
-them into its own configuration. The Codex renderer writes the top-level TOML
-keys `model` and `model_reasoning_effort`, replaces an existing value exactly
-once, preserves an unspecified base value, and remains idempotent across Home
-refreshes. Providers without a renderer for these settings reject the override
-instead of silently ignoring it.
+`model_config` describes backend/API-mode/model identity without changing the
+Provider type. `config_overrides` is interpreted by the selected Home renderer;
+the Codex renderer projects these keys into top-level TOML. Typed credentials,
+skills, and other native resources live in `CodexHomeOptions` rather than in
+the common record.
 
-This surface intentionally does not accept an arbitrary provider configuration
-dictionary. Provider credentials, MCP servers, and other Home configuration
-continue to use their existing typed inputs.
+Every provider validates its supported overrides and fails rather than silently
+ignoring an unsupported resource.
 
 ## Process-local semantic scheduler leases
 

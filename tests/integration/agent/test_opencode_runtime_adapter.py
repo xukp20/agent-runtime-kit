@@ -61,7 +61,7 @@ def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Pat
         home_root,
     )
     record = HomeRecord(
-        cli_type="opencode",
+        provider_type="opencode",
         home_id="real",
         home_relpath="homes/opencode/real",
         materialization_manifest_hash=materialization.manifest_hash,
@@ -130,7 +130,7 @@ def test_real_opencode_deepseek_run_and_query(tmp_path: Path) -> None:
         home_root,
     )
     record = HomeRecord(
-        cli_type="opencode",
+        provider_type="opencode",
         home_id="deepseek",
         home_relpath="homes/opencode/deepseek",
         materialization_manifest_hash=materialization.manifest_hash,
@@ -285,7 +285,7 @@ def test_real_opencode_beeapi_responses_run(tmp_path: Path) -> None:
         home_root,
     )
     record = HomeRecord(
-        cli_type="opencode",
+        provider_type="opencode",
         home_id="beeapi",
         home_relpath="homes/opencode/beeapi",
         materialization_manifest_hash=materialization.manifest_hash,
@@ -349,7 +349,6 @@ def test_real_opencode_first_turn_through_agent_service(tmp_path: Path) -> None:
     service = AgentService(
         runtime_root,
         agent_types=agent_types,
-        providers={"opencode": object()},
         provider_registry=registry,
     )
     service.create_home(
@@ -375,7 +374,7 @@ def test_real_opencode_first_turn_through_agent_service(tmp_path: Path) -> None:
         )
     )
     agent = service.create_agent(
-        "scope-service", "OpenCodeRealAgent", cli_type="opencode", home_id="service-home"
+        "scope-service", "OpenCodeRealAgent", provider_type="opencode", home_id="service-home"
     )
     try:
         service.start_agent(
@@ -384,7 +383,7 @@ def test_real_opencode_first_turn_through_agent_service(tmp_path: Path) -> None:
             env={"DEEPSEEK_API_KEY": key},
             workdir=str(tmp_path),
         )
-        result = service.wait_agent_result(agent.agent_id, timeout_s=130)
+        result = service.wait_agent(agent.agent_id, timeout_s=130)
         assert result.provider_type == "opencode"
         assert "SERVICE_OK" in (result.final_text or "")
         stored = service.get_agent(agent.agent_id)

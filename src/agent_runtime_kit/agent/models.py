@@ -7,6 +7,7 @@ from typing import Any
 from .provider_contracts import (
     AgentArtifactLocator,
     ModelBackendIdentity,
+    ProviderPayload,
     ProviderSessionLocator,
     ProviderTurnLocator,
 )
@@ -115,70 +116,32 @@ class Agent:
     agent_id: str
     scope_id: str
     agent_type: str
-    cli_type: str
+    provider_type: str
     home_id: str
-    schema_version: int = 2
-    provider_type: str | None = None
+    schema_version: int = 3
     session_locator: ProviderSessionLocator | None = None
     latest_turn_locator: ProviderTurnLocator | None = None
     artifact_locator: AgentArtifactLocator | None = None
     fork_info: AgentForkInfo | None = None
-    thread_id: str | None = None
-    rollout_relpath: str | None = None
     status: str = "idle"
     last_completion: AgentCompletionRecord | None = None
-    fork_source_agent_id: str | None = None
-    fork_source_thread_id: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
     def __post_init__(self) -> None:
-        self.normalize_compat_fields()
-
-    def normalize_compat_fields(self) -> None:
-        provider_type = self.provider_type or self.cli_type
-        if provider_type != self.cli_type:
-            raise ValueError("provider_type and legacy cli_type conflict")
-        self.provider_type = provider_type
-        if self.schema_version not in {1, 2}:
+        if self.schema_version != 3:
             raise ValueError(f"unsupported Agent schema_version: {self.schema_version}")
-        if self.session_locator is None and self.thread_id:
-            # COMPAT(legacy-codex-agent-record): records written before schema
-            # v2 only have cli_type/thread_id/rollout_relpath. Remove after all
-            # supported snapshots and LC callers persist v2 locators.
-            self.session_locator = ProviderSessionLocator(
-                provider_type=provider_type,
-                session_id=str(self.thread_id),
-                home_id=self.home_id,
-                created_at=self.created_at,
-                native_locator={"rollout_relpath": self.rollout_relpath},
-            )
+        provider_type = self.provider_type
+        if not provider_type.strip():
+            raise ValueError("Agent provider_type must not be empty")
         if self.session_locator is not None:
             if self.session_locator.provider_type != provider_type:
                 raise ValueError("Agent and session locator provider_type conflict")
             if self.session_locator.home_id != self.home_id:
                 raise ValueError("Agent and session locator home_id conflict")
-            if self.thread_id is not None and self.thread_id != self.session_locator.session_id:
-                raise ValueError("session_locator and legacy thread_id conflict")
-            if provider_type == "codex":
-                self.thread_id = self.session_locator.session_id
-                native = self.session_locator.native_locator
-                native_rollout = native.get("rollout_relpath") if isinstance(native, dict) else None
-                if (
-                    native_rollout is not None
-                    and self.rollout_relpath is not None
-                    and str(native_rollout) != self.rollout_relpath
-                ):
-                    raise ValueError("session_locator and legacy rollout_relpath conflict")
-        if self.artifact_locator is None and provider_type == "codex" and self.thread_id and self.rollout_relpath:
-            self.artifact_locator = AgentArtifactLocator(
-                provider_type="codex",
-                home_id=self.home_id,
-                session_id=self.thread_id,
-                adapter_version="legacy-record-v1",
-                native_primary_ref=self.rollout_relpath,
-            )
         if self.artifact_locator is not None:
+            if self.session_locator is None:
+                raise ValueError("artifact locator requires a session locator")
             if self.artifact_locator.provider_type != provider_type:
                 raise ValueError("Agent and artifact locator provider_type conflict")
             if self.artifact_locator.home_id != self.home_id:
@@ -187,32 +150,11 @@ class Agent:
                 self.artifact_locator.session_id != self.session_locator.session_id
             ):
                 raise ValueError("session and artifact locator session_id conflict")
-            if (
-                provider_type == "codex"
-                and self.rollout_relpath is not None
-                and self.artifact_locator.native_primary_ref is not None
-                and self.rollout_relpath != self.artifact_locator.native_primary_ref
-            ):
-                raise ValueError("artifact_locator and legacy rollout_relpath conflict")
-            if provider_type == "codex" and self.rollout_relpath is None:
-                self.rollout_relpath = self.artifact_locator.native_primary_ref
-        if self.latest_turn_locator is not None and self.session_locator is not None:
+        if self.latest_turn_locator is not None:
+            if self.session_locator is None:
+                raise ValueError("latest turn locator requires a session locator")
             if self.latest_turn_locator.session != self.session_locator:
                 raise ValueError("latest turn and Agent session locator conflict")
-        if self.fork_info is None and self.fork_source_agent_id and self.fork_source_thread_id:
-            self.fork_info = AgentForkInfo(
-                source_agent_id=self.fork_source_agent_id,
-                source_session_id=self.fork_source_thread_id,
-                created_at=self.created_at,
-            )
-        if self.fork_info is not None:
-            if self.fork_source_agent_id not in {None, self.fork_info.source_agent_id}:
-                raise ValueError("fork_info and legacy fork_source_agent_id conflict")
-            if self.fork_source_thread_id not in {None, self.fork_info.source_session_id}:
-                raise ValueError("fork_info and legacy fork_source_thread_id conflict")
-            self.fork_source_agent_id = self.fork_info.source_agent_id
-            self.fork_source_thread_id = self.fork_info.source_session_id
-        self.schema_version = 2
 
 
 @dataclass(frozen=True)
@@ -313,26 +255,22 @@ def completion_record_from_dict(payload: dict[str, Any] | None) -> AgentCompleti
 
 
 def agent_from_dict(payload: dict[str, Any]) -> Agent:
-    provider_type = str(payload.get("provider_type") or payload.get("cli_type") or "")
-    cli_type = str(payload.get("cli_type") or provider_type)
+    schema_version = int(payload.get("schema_version", 0))
+    if schema_version != 3:
+        raise ValueError(f"unsupported Agent schema_version: {schema_version}; expected 3")
     return Agent(
         agent_id=str(payload["agent_id"]),
         scope_id=str(payload["scope_id"]),
         agent_type=str(payload["agent_type"]),
-        cli_type=cli_type,
+        provider_type=str(payload["provider_type"]),
         home_id=str(payload["home_id"]),
-        schema_version=int(payload.get("schema_version", 1)),
-        provider_type=provider_type,
+        schema_version=schema_version,
         session_locator=_session_locator_from_dict(payload.get("session_locator")),
         latest_turn_locator=_turn_locator_from_dict(payload.get("latest_turn_locator")),
         artifact_locator=_artifact_locator_from_dict(payload.get("artifact_locator")),
         fork_info=_fork_info_from_dict(payload.get("fork_info")),
-        thread_id=payload.get("thread_id"),
-        rollout_relpath=payload.get("rollout_relpath"),
         status=str(payload.get("status", "idle")),
         last_completion=completion_record_from_dict(payload.get("last_completion")),
-        fork_source_agent_id=payload.get("fork_source_agent_id"),
-        fork_source_thread_id=payload.get("fork_source_thread_id"),
         created_at=str(payload.get("created_at", "")),
         updated_at=str(payload.get("updated_at", "")),
     )
@@ -383,6 +321,27 @@ def _backend_identity_from_dict(payload: object) -> ModelBackendIdentity | None:
             if payload.get("model_config_hash") is not None
             else None
         ),
+        provider_payload=_provider_payload_from_dict(payload.get("provider_payload")),
+    )
+
+
+def _provider_payload_from_dict(payload: object) -> ProviderPayload | None:
+    if not isinstance(payload, dict):
+        return None
+    return ProviderPayload(
+        provider_type=str(payload["provider_type"]),
+        payload_type=str(payload["payload_type"]),
+        payload_schema_version=int(payload.get("payload_schema_version", 1)),
+        adapter_version=(
+            str(payload["adapter_version"]) if payload.get("adapter_version") is not None else None
+        ),
+        sdk_or_cli_version=(
+            str(payload["sdk_or_cli_version"])
+            if payload.get("sdk_or_cli_version") is not None
+            else None
+        ),
+        sanitized_data=payload.get("sanitized_data"),
+        truncated=bool(payload.get("truncated", False)),
     )
 
 

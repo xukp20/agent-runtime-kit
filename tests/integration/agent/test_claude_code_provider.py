@@ -14,9 +14,11 @@ import pytest
 from agent_runtime_kit.agent.provider_contracts import (
     ModelBackendIdentity,
     ProviderHomeSpec,
+    ProviderRegistry,
     ProviderRunState,
 )
 from agent_runtime_kit.agent.providers.claude_code import ClaudeCodeProvider
+from agent_runtime_kit.agent.providers.claude_code_bundle import build_claude_code_provider_bundle
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
 
@@ -158,7 +160,9 @@ def _service(tmp_path: Path, *, blocking: bool = False) -> tuple[AgentService, C
     service = AgentService(
         runtime_root,
         agent_types=registry,
-        providers={"claude_code": provider},
+        provider_registry=ProviderRegistry(
+            (build_claude_code_provider_bundle(provider, runtime_root=runtime_root),)
+        ),
     )
     service.create_home(
         ProviderHomeSpec(
@@ -179,7 +183,7 @@ def test_claude_provider_runs_resumes_queries_compacts_and_restores_snapshot(
     tmp_path: Path,
 ) -> None:
     service, _provider = _service(tmp_path)
-    agent = service.create_agent("scope-a", "claude-worker", cli_type="claude_code", home_id="worker")
+    agent = service.create_agent("scope-a", "claude-worker", provider_type="claude_code", home_id="worker")
 
     first = service.wait_agent(
         service.start_agent(agent.agent_id, variables={"item": "first"}).agent_id
@@ -194,12 +198,10 @@ def test_claude_provider_runs_resumes_queries_compacts_and_restores_snapshot(
     assert first.session_locator.session_id == second.session_locator.session_id
     assert second.session_locator.backend_identity is not None
     assert second.session_locator.backend_identity.api_provider == "deepseek"
-    assert restored_agent.thread_id == first.session_locator.session_id
     assert restored_agent.session_locator == second.session_locator
     assert len(service.query_turns(agent.agent_id).items) == 2
     assert service.query_turn(agent.agent_id, latest=True).result.final_text == "done"
     assert service.query_usage(agent.agent_id, latest=True).request_count == 1
-    assert service.read_latest_turn_result(agent.agent_id).final_text == "done"
 
     marker = (
         service.runtime_root
@@ -215,7 +217,7 @@ def test_claude_provider_runs_resumes_queries_compacts_and_restores_snapshot(
     )
     usage = service.inspect_agent_context(agent.agent_id)
     assert usage.available
-    assert usage.total_tokens == 7
+    assert usage.used_tokens == 7
     compacted = service.compact_agent(agent.agent_id)
     assert compacted.status.value == "compacted"
 
@@ -239,14 +241,14 @@ def test_claude_provider_runs_resumes_queries_compacts_and_restores_snapshot(
 
 def test_claude_provider_interrupt_reaches_terminal_result(tmp_path: Path) -> None:
     service, _provider = _service(tmp_path, blocking=True)
-    agent = service.create_agent("scope-a", "claude-worker", cli_type="claude_code", home_id="worker")
+    agent = service.create_agent("scope-a", "claude-worker", provider_type="claude_code", home_id="worker")
     service.start_agent(agent.agent_id, variables={"item": "interrupt"})
     deadline = time.monotonic() + 2
     while service.get_agent(agent.agent_id).status != "running" and time.monotonic() < deadline:
         time.sleep(0.01)
 
     assert service.interrupt_agent(agent.agent_id, timeout_s=2)
-    result = service.wait_agent_result(agent.agent_id, timeout_s=2).provider_result
+    result = service.wait_agent(agent.agent_id, timeout_s=2).provider_result
 
     assert result.status is ProviderRunState.INTERRUPTED
     assert service.get_agent(agent.agent_id).status == "idle"
@@ -254,7 +256,7 @@ def test_claude_provider_interrupt_reaches_terminal_result(tmp_path: Path) -> No
 
 def test_claude_snapshot_home_mismatch_does_not_remove_live_transcript(tmp_path: Path) -> None:
     service, _provider = _service(tmp_path)
-    agent = service.create_agent("scope-a", "claude-worker", cli_type="claude_code", home_id="worker")
+    agent = service.create_agent("scope-a", "claude-worker", provider_type="claude_code", home_id="worker")
     service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "snapshot"}).agent_id)
     snapshot_service = AgentSnapshotService(
         service.runtime_root,
@@ -283,7 +285,7 @@ def test_claude_snapshot_home_mismatch_does_not_remove_live_transcript(tmp_path:
 
 def test_claude_provider_fork_is_session_only(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
     service, _provider = _service(tmp_path)
-    agent = service.create_agent("scope-a", "claude-worker", cli_type="claude_code", home_id="worker")
+    agent = service.create_agent("scope-a", "claude-worker", provider_type="claude_code", home_id="worker")
     service.wait_agent(service.start_agent(agent.agent_id, variables={"item": "fork"}).agent_id)
     target_session_id = str(uuid.uuid4())
 
@@ -300,7 +302,7 @@ def test_claude_provider_fork_is_session_only(tmp_path: Path, monkeypatch) -> No
 
     forked = service.fork_agent(agent.agent_id, target_scope_id="scope-b")
 
-    assert forked.thread_id == target_session_id
+    assert forked.session_locator.session_id == target_session_id
     assert forked.fork_info.fork_mode == "session_only"
     assert not forked.fork_info.workspace_isolated
 

@@ -104,7 +104,7 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
         resolved_model="deepseek-chat",
     )
     record = HomeRecord(
-        cli_type="opencode",
+        provider_type="opencode",
         home_id="main",
         home_relpath="homes/opencode/main",
         materialization_manifest_hash=result.manifest_hash,
@@ -236,7 +236,7 @@ def test_opencode_bundle_resolves_backend_capabilities(tmp_path: Path) -> None:
     bundle = build_opencode_provider_bundle(runtime_root=tmp_path)
     assert bundle.descriptor.execution_kind.value == "subprocess_rpc"
     home = HomeRecord(
-        cli_type="opencode",
+        provider_type="opencode",
         home_id="main",
         home_relpath="homes/opencode/main",
         resolved_defaults={

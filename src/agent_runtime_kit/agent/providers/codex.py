@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 import shutil
 import sys
 import threading
@@ -12,7 +11,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from typing import Callable, Mapping
 
-from ..context import ProviderContextCompactionResult, ProviderContextUsage
+from ..provider_contracts import ProviderContextCompactionResult, ProviderContextUsage
 from ..models import (
     AgentContextCompactionEvidenceError,
     AgentContextCompactionRequestUnknown,
@@ -43,27 +42,6 @@ class CodexTurnResult:
 class CodexForkResult:
     thread_id: str
     rollout_relpath: str | None
-    thread: object | None = None
-
-
-@dataclass
-class CodexStoredTurnResult:
-    id: str
-    status: object | None
-    error: object | None = None
-    started_at: int | None = None
-    completed_at: int | None = None
-    duration_ms: int | None = None
-    final_response: str | None = None
-    items: list[object] | None = None
-    usage: object | None = None
-
-
-@dataclass
-class CodexThreadSnapshot:
-    id: str
-    turns: list[CodexStoredTurnResult]
-    raw_response: object | None = None
     thread: object | None = None
 
 
@@ -306,10 +284,7 @@ class CodexProvider:
     ) -> object:
         start_turn = getattr(thread, "turn", None)
         if not callable(start_turn):
-            # COMPAT(codex-sdk-pre-turn-handle): older test doubles and SDKs
-            # expose only Thread.run(). Remove after the minimum supported SDK
-            # guarantees Thread.turn(). Covered by Codex per-run compatibility.
-            return thread.run(prompt, cwd=workdir, model=self.model)
+            raise TypeError("supported Codex SDK must expose Thread.turn()")
         turn_handle = start_turn(prompt, cwd=workdir, model=self.model)
         self._update_agent_run_locator(
             agent_id,
@@ -345,52 +320,6 @@ class CodexProvider:
         finally:
             self._finish_agent_run(agent_id)
 
-    def read_thread(
-        self,
-        agent,
-        *,
-        home_root: Path,
-        env: Mapping[str, str],
-        include_turns: bool = True,
-    ) -> object:
-        if not getattr(agent, "thread_id", None):
-            raise RuntimeError("agent has no thread_id")
-        self.ensure_home_initialized(
-            home_id=str(agent.home_id),
-            home_root=home_root,
-            env=env,
-            workdir=None,
-        )
-        sdk = self._sdk()
-        with self._new_codex(sdk, env=env, workdir=None) as codex:
-            thread = codex.thread_resume(str(agent.thread_id), model=self.model)
-            raw_response = thread.read(include_turns=include_turns)
-        raw_thread = getattr(raw_response, "thread", raw_response)
-        raw_turns = list(getattr(raw_thread, "turns", []) or [])
-        turns = _coerce_turns(raw_turns)
-        if include_turns and not turns:
-            rollout = self._agent_rollout_path(agent, home_root=home_root)
-            turns = _turns_from_rollout(rollout) if rollout is not None else []
-        return CodexThreadSnapshot(
-            id=str(getattr(raw_thread, "id", agent.thread_id)),
-            turns=turns,
-            raw_response=raw_response,
-            thread=raw_thread,
-        )
-
-    def read_latest_turn_result(
-        self,
-        agent,
-        *,
-        home_root: Path,
-        env: Mapping[str, str],
-    ) -> CodexStoredTurnResult:
-        snapshot = self.read_thread(agent, home_root=home_root, env=env, include_turns=True)
-        turns = list(getattr(snapshot, "turns", []) or [])
-        if not turns:
-            raise RuntimeError("thread has no turns")
-        return turns[-1]
-
     def inspect_thread_context(
         self,
         *,
@@ -406,11 +335,10 @@ class CodexProvider:
         if rollout_path is None:
             return ProviderContextUsage(
                 session_id=thread_id,
-                total_tokens=None,
-                context_window=None,
                 observed_at=utc_now_iso(),
                 source="artifact",
                 available=False,
+                measurement="unavailable",
                 reason="rollout_missing",
             )
         return inspect_codex_rollout_context(rollout_path, session_id=thread_id)
@@ -476,6 +404,8 @@ class CodexProvider:
                         if status == "idle":
                             return ProviderContextCompactionResult(
                                 session_id=thread_id,
+                                status="compacted",
+                                reason="provider_confirmed",
                                 usage_after=evidence.usage,
                                 started_at=started_at,
                                 completed_at=utc_now_iso(),
@@ -535,6 +465,8 @@ class CodexProvider:
         now = utc_now_iso()
         return ProviderContextCompactionResult(
             session_id=thread_id,
+            status="compacted",
+            reason="provider_confirmed",
             usage_after=evidence.usage,
             started_at=now,
             completed_at=now,
@@ -749,23 +681,6 @@ class CodexProvider:
         except (TypeError, ValueError):
             return getattr(approval_mode_type, self.approval_mode)
 
-    def _agent_home_root(self, agent) -> Path:
-        if self.runtime_root is None:
-            raise RuntimeError("CodexProvider.runtime_root is required for thread reads")
-        return self.runtime_root / "homes" / str(agent.cli_type) / str(agent.home_id)
-
-    def _agent_rollout_path(self, agent, *, home_root: Path | None = None) -> Path | None:
-        rollout_relpath = getattr(agent, "rollout_relpath", None)
-        resolved_home_root = Path(home_root) if home_root is not None else self._agent_home_root(agent)
-        if not rollout_relpath and getattr(agent, "thread_id", None):
-            rollout_relpath = _find_rollout_relpath(
-                resolved_home_root / ".codex",
-                str(agent.thread_id),
-            )
-        if not rollout_relpath:
-            return None
-        return resolved_home_root / ".codex" / str(rollout_relpath)
-
     def _rollout_path_for_thread(self, *, home_root: Path, thread_id: str) -> Path | None:
         rollout_relpath = _find_rollout_relpath(
             Path(home_root) / ".codex",
@@ -827,93 +742,3 @@ def _file_contains(path: Path, needle: str) -> bool:
     except OSError:
         return False
     return False
-
-
-def _coerce_turns(turns: list[object]) -> list[CodexStoredTurnResult]:
-    return [
-        CodexStoredTurnResult(
-            id=str(getattr(turn, "id", "")),
-            status=getattr(turn, "status", None),
-            error=getattr(turn, "error", None),
-            started_at=getattr(turn, "started_at", None),
-            completed_at=getattr(turn, "completed_at", None),
-            duration_ms=getattr(turn, "duration_ms", None),
-            final_response=_final_response_from_turn_items(list(getattr(turn, "items", []) or [])),
-            items=list(getattr(turn, "items", []) or []),
-            usage=getattr(turn, "usage", None),
-        )
-        for turn in turns
-        if getattr(turn, "id", None)
-    ]
-
-
-def _turns_from_rollout(path: Path) -> list[CodexStoredTurnResult]:
-    if not path.exists():
-        return []
-    turns: dict[str, CodexStoredTurnResult] = {}
-    order: list[str] = []
-    current_turn_id: str | None = None
-    for line in path.open("r", encoding="utf-8", errors="ignore"):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        payload = event.get("payload") if isinstance(event, dict) else None
-        payload = payload if isinstance(payload, dict) else {}
-        event_type = event.get("type")
-        payload_type = payload.get("type")
-        turn_id = payload.get("turn_id")
-        if event_type == "turn_context" and turn_id:
-            current_turn_id = str(turn_id)
-            _ensure_rollout_turn(turns, order, current_turn_id, status="inProgress")
-            continue
-        if payload_type == "task_started" and turn_id:
-            current_turn_id = str(turn_id)
-            _ensure_rollout_turn(turns, order, current_turn_id, status="inProgress")
-            continue
-        if payload_type == "agent_message" and current_turn_id:
-            message = payload.get("message")
-            if isinstance(message, str):
-                _ensure_rollout_turn(turns, order, current_turn_id, status="inProgress").final_response = message
-            continue
-        if payload_type == "task_complete" and turn_id:
-            current_turn_id = str(turn_id)
-            turn = _ensure_rollout_turn(turns, order, current_turn_id, status="completed")
-            turn.status = "completed"
-            turn.completed_at = payload.get("completed_at")
-            turn.duration_ms = payload.get("duration_ms")
-            message = payload.get("last_agent_message")
-            if isinstance(message, str):
-                turn.final_response = message
-            continue
-        if payload_type == "turn_aborted" and turn_id:
-            current_turn_id = str(turn_id)
-            _ensure_rollout_turn(turns, order, current_turn_id, status="interrupted").status = "interrupted"
-    return [turns[turn_id] for turn_id in order]
-
-
-def _ensure_rollout_turn(
-    turns: dict[str, CodexStoredTurnResult],
-    order: list[str],
-    turn_id: str,
-    *,
-    status: str,
-) -> CodexStoredTurnResult:
-    if turn_id not in turns:
-        turns[turn_id] = CodexStoredTurnResult(id=turn_id, status=status, items=[])
-        order.append(turn_id)
-    return turns[turn_id]
-
-
-def _final_response_from_turn_items(items: list[object]) -> str | None:
-    for item in reversed(items):
-        root = getattr(item, "root", item)
-        item_type = getattr(root, "type", None)
-        phase = getattr(root, "phase", None)
-        if item_type == "agentMessage" and (phase is None or str(phase).endswith("final_answer")):
-            text = getattr(root, "text", None)
-            if isinstance(text, str):
-                return text
-    return None

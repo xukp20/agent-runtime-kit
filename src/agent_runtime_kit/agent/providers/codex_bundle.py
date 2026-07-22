@@ -14,32 +14,13 @@ from ..provider_contracts import (
     ProviderDescriptor,
     ProviderExecutionKind,
     ProviderHomeKind,
-    ProviderRunHandle,
-    ProviderTurnResult,
 )
 from .codex import CodexProvider
 from .codex_artifacts import CodexArtifactAdapter
 from .codex_context_adapter import CodexContextAdapter
 from .codex_home import CodexHomeRenderer
 from .codex_query import CodexQueryAdapter
-from .codex_runtime import CodexProviderRunHandle, CodexRuntimeAdapter
-
-
-class CodexCompatibilityBridge:
-    provider_type = "codex"
-
-    def completion_turn_result(
-        self,
-        handle: ProviderRunHandle,
-        result: ProviderTurnResult,
-    ) -> object:
-        del result
-        if not isinstance(handle, CodexProviderRunHandle):
-            raise TypeError("Codex compatibility bridge received a non-Codex run handle")
-        legacy = handle.legacy_turn_result
-        if legacy is None:
-            raise RuntimeError("Codex run completed without a legacy turn result")
-        return legacy
+from .codex_runtime import CodexRuntimeAdapter
 
 
 class CodexCapabilityResolver:
@@ -234,5 +215,4 @@ def build_codex_provider_bundle(
         query=CodexQueryAdapter(runtime_root=runtime_root, provider=provider),
         context=CodexContextAdapter(provider),
         artifacts=CodexArtifactAdapter(runtime_root=runtime_root, provider=provider),
-        compatibility=CodexCompatibilityBridge(),
     )

@@ -9,9 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeCreateSpec, McpServerSpec
+from agent_runtime_kit.agent.homes import ProviderHomeSpec, McpServerSpec
 from agent_runtime_kit.agent.models import CompletionDecision
+from agent_runtime_kit.agent.provider_contracts import BaseConfigSource, ProviderRegistry
 from agent_runtime_kit.agent.providers.codex import CodexProvider
+from agent_runtime_kit.agent.providers.codex_home import CodexHomeOptions
 from agent_runtime_kit.agent.service import AgentCompletionContext, AgentService, AgentType, AgentTypeRegistry
 
 
@@ -30,8 +32,8 @@ class RealCodexMcpEnvAgentType(AgentType):
     continue_prompt_template = start_prompt_template
 
     def check_completion(self, ctx: AgentCompletionContext) -> CompletionDecision:
-        if not getattr(ctx.turn_result, "id", None):
-            return CompletionDecision(complete=False, reason="turn result has no id")
+        if not ctx.turn_result.run_id:
+            return CompletionDecision(complete=False, reason="turn result has no run id")
         return CompletionDecision(complete=True)
 
 
@@ -43,20 +45,20 @@ def test_real_codex_same_home_per_run_env_reaches_stdio_mcp(tmp_path: Path) -> N
     service = _service(runtime_root)
     try:
         service.create_home(
-            HomeCreateSpec(
-                cli_type="codex",
+            ProviderHomeSpec(
+                provider_type="codex",
                 home_id="mcp_env_worker",
-                base_config_path=_config_dir() / "config.toml",
-                auth_json_path=_config_dir() / "auth.json",
-                mcp_servers=[
+                base_config=BaseConfigSource(path=str(_config_dir() / "config.toml")),
+                provider_options=CodexHomeOptions(auth_json_path=_config_dir() / "auth.json"),
+                mcp_servers=(
                     McpServerSpec(
                         name="ark_identity",
                         command=sys.executable,
                         args=[str(server_path), str(marker_path)],
                         env_vars=["ARK_STEP_ID", "ARK_RUN_TOKEN"],
                         required=True,
-                    )
-                ],
+                    ),
+                ),
             ),
             initialize_provider_home=True,
         )
@@ -126,7 +128,11 @@ def _service(runtime_root: Path) -> AgentService:
         sdk_python_root=_sdk_python_root(),
         model=os.environ.get("ARK_REAL_CODEX_MODEL"),
     )
-    return AgentService(runtime_root, agent_types=registry, providers={"codex": provider})
+    return AgentService(
+        runtime_root,
+        agent_types=registry,
+        provider_registry=ProviderRegistry((provider.build_provider_bundle(runtime_root=runtime_root),)),
+    )
 
 
 def _ensure_real_codex_enabled() -> None:

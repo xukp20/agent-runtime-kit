@@ -236,16 +236,8 @@ class ProviderContextUsage:
             raise ValueError("available context usage requires used_tokens")
 
     @property
-    def context_window(self) -> int | None:
-        return self.effective_context_window_tokens or self.context_window_tokens
-
-    @property
-    def total_tokens(self) -> int | None:
-        return self.used_tokens
-
-    @property
     def usage_ratio(self) -> float | None:
-        window = self.context_window
+        window = self.effective_context_window_tokens or self.context_window_tokens
         if not self.available or self.used_tokens is None or window is None:
             return None
         return self.used_tokens / window

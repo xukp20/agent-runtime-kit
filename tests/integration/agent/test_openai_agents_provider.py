@@ -422,7 +422,7 @@ def test_openai_agents_compact_is_backend_gated_and_records_normalized_type(
     assert chat_started == []
 
 
-def test_agent_service_runs_openai_agents_without_codex_compat_shape(
+def test_agent_service_runs_openai_agents_through_provider_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     provider = OpenAIAgentsProvider()
@@ -462,7 +462,7 @@ def test_agent_service_runs_openai_agents_without_codex_compat_shape(
     agent = service.create_agent(
         "scope-1",
         "openai-worker",
-        cli_type="openai_agents",
+        provider_type="openai_agents",
     )
     service.start_agent(
         agent.agent_id,
@@ -474,9 +474,8 @@ def test_agent_service_runs_openai_agents_without_codex_compat_shape(
     assert result.final_text == "ARK_SERVICE_OK"
     restored = service.get_agent(agent.agent_id)
     assert restored.provider_type == "openai_agents"
-    assert restored.thread_id == result.session_locator.session_id
+    assert restored.session_locator == result.session_locator
     assert restored.artifact_locator is not None
-    assert restored.rollout_relpath is None
 
     snapshots = AgentSnapshotService(tmp_path, store=service.store, agent_service=service)
     captured = snapshots.create_scope_snapshot("scope-1")
@@ -491,7 +490,7 @@ def test_agent_service_runs_openai_agents_without_codex_compat_shape(
         / "openai_agents"
         / "openai-worker"
         / "sessions"
-        / f"{restored.thread_id}.sqlite3"
+        / f"{restored.session_locator.session_id}.sqlite3"
     )
     with sqlite3.connect(db_path) as conn:
         conn.execute("delete from ark_turn")

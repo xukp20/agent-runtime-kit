@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import shutil
 import sqlite3
 import uuid
 from pathlib import Path
@@ -11,32 +9,20 @@ from .models import (
     Agent,
     AgentCompletionRecord,
     AgentForkInfo,
-    AgentHasNoCompletedTurn,
     agent_from_dict,
     to_jsonable,
 )
 from .provider_contracts import AgentArtifactLocator, ProviderSessionLocator, ProviderTurnLocator
 from .context import AgentContextMaintenanceJournal
 from .store_utils import encode_scope_id, read_json, utc_now_iso, write_json_atomic
-from .trace import (
-    AgentRolloutInfo,
-    AgentTraceEventView,
-    AgentTraceReader,
-    AgentTraceReport,
-    AgentTraceReportPaths,
-    AgentTurnSummary,
-    AgentResponseTextView,
-    AgentToolCallView,
-)
 
 
 class AgentStoreService:
-    def __init__(self, runtime_root: Path, providers: dict[str, object] | None = None) -> None:
+    def __init__(self, runtime_root: Path) -> None:
         self.runtime_root = Path(runtime_root)
         self.scopes_root = self.runtime_root / "scopes"
         self.index_root = self.runtime_root / "index"
         self.global_index_path = self.index_root / "global.sqlite"
-        self.providers = providers or {}
         self.scopes_root.mkdir(parents=True, exist_ok=True)
         self.index_root.mkdir(parents=True, exist_ok=True)
         self._ensure_global_schema()
@@ -46,14 +32,9 @@ class AgentStoreService:
         *,
         scope_id: str,
         agent_type: str,
-        cli_type: str = "codex",
+        provider_type: str,
         home_id: str | None = None,
-        thread_id: str | None = None,
-        rollout_relpath: str | None = None,
-        fork_source_agent_id: str | None = None,
-        fork_source_thread_id: str | None = None,
         agent_id: str | None = None,
-        provider_type: str | None = None,
         session_locator: ProviderSessionLocator | None = None,
         latest_turn_locator: ProviderTurnLocator | None = None,
         artifact_locator: AgentArtifactLocator | None = None,
@@ -64,18 +45,13 @@ class AgentStoreService:
             agent_id=agent_id or f"a_{uuid.uuid4().hex}",
             scope_id=scope_id,
             agent_type=agent_type,
-            cli_type=cli_type,
+            provider_type=provider_type,
             home_id=home_id or agent_type,
-            provider_type=provider_type or cli_type,
             session_locator=session_locator,
             latest_turn_locator=latest_turn_locator,
             artifact_locator=artifact_locator,
             fork_info=fork_info,
-            thread_id=thread_id,
-            rollout_relpath=rollout_relpath,
             status="idle",
-            fork_source_agent_id=fork_source_agent_id,
-            fork_source_thread_id=fork_source_thread_id,
             created_at=now,
             updated_at=now,
         )
@@ -143,47 +119,20 @@ class AgentStoreService:
     def close_agent(self, agent_id: str) -> Agent:
         return self.patch_agent(agent_id, status="closed")
 
-    def update_thread_locator(
+    def update_session_locators(
         self,
         agent_id: str,
         *,
-        thread_id: str,
-        rollout_relpath: str | None,
-        session_locator: ProviderSessionLocator | None = None,
+        session_locator: ProviderSessionLocator,
         latest_turn_locator: ProviderTurnLocator | None = None,
         artifact_locator: AgentArtifactLocator | None = None,
     ) -> Agent:
         agent = self.get_agent(agent_id)
-        if session_locator is not None:
-            resolved_session = session_locator
-        elif agent.session_locator is not None and agent.session_locator.session_id == thread_id:
-            # A live-start callback may repeat the current session before a new
-            # turn exists. Keep the exact locator referenced by latest_turn.
-            resolved_session = agent.session_locator
-        else:
-            resolved_session = ProviderSessionLocator(
-                provider_type=agent.provider_type or agent.cli_type,
-                session_id=thread_id,
-                home_id=agent.home_id,
-                created_at=utc_now_iso(),
-                native_locator={"rollout_relpath": rollout_relpath},
-            )
-        resolved_artifact = artifact_locator
-        if resolved_artifact is None and (agent.provider_type or agent.cli_type) == "codex" and rollout_relpath:
-            resolved_artifact = AgentArtifactLocator(
-                provider_type="codex",
-                home_id=agent.home_id,
-                session_id=thread_id,
-                adapter_version="codex-artifact-v1",
-                native_primary_ref=rollout_relpath,
-            )
         return self.patch_agent(
             agent_id,
-            thread_id=thread_id,
-            rollout_relpath=rollout_relpath,
-            session_locator=resolved_session,
+            session_locator=session_locator,
             latest_turn_locator=latest_turn_locator or agent.latest_turn_locator,
-            artifact_locator=resolved_artifact or agent.artifact_locator,
+            artifact_locator=artifact_locator or agent.artifact_locator,
         )
 
     def update_completion(self, agent_id: str, record: AgentCompletionRecord | None) -> Agent:
@@ -260,221 +209,6 @@ class AgentStoreService:
         if path.exists():
             path.unlink()
 
-    def locate_rollout(self, agent_id: str) -> Path | None:
-        agent = self.get_agent(agent_id)
-        if not agent.thread_id or not agent.rollout_relpath:
-            return None
-        if agent.cli_type == "codex":
-            return self.runtime_root / "homes" / "codex" / agent.home_id / ".codex" / agent.rollout_relpath
-        return None
-
-    def read_rollout_events(self, agent_id: str) -> list[dict]:
-        path = self.locate_rollout(agent_id)
-        if path is None or not path.exists():
-            return []
-        events = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                events.append(json.loads(line))
-        return events
-
-    def trace_reader(self, agent_id: str) -> AgentTraceReader:
-        return AgentTraceReader(
-            agent=self.get_agent(agent_id),
-            rollout_path=self.locate_rollout(agent_id),
-            events=self.read_rollout_events(agent_id),
-        )
-
-    def get_rollout_info(self, agent_id: str) -> AgentRolloutInfo:
-        return self.trace_reader(agent_id).get_rollout_info()
-
-    def list_trace_turns(self, agent_id: str) -> list[AgentTurnSummary]:
-        return self.trace_reader(agent_id).list_turns()
-
-    def get_trace_turn(
-        self,
-        agent_id: str,
-        *,
-        turn_id: str | None = None,
-        index: int | None = None,
-        latest: bool = False,
-    ) -> AgentTurnSummary | None:
-        return self.trace_reader(agent_id).get_turn(turn_id=turn_id, index=index, latest=latest)
-
-    def get_trace_event(
-        self,
-        agent_id: str,
-        *,
-        index: int | None = None,
-        last: bool = False,
-    ) -> AgentTraceEventView | None:
-        return self.trace_reader(agent_id).get_event(index=index, last=last)
-
-    def tail_trace_events(
-        self,
-        agent_id: str,
-        *,
-        limit: int = 20,
-        event_type: str | None = None,
-        payload_type: str | None = None,
-    ) -> list[AgentTraceEventView]:
-        return self.trace_reader(agent_id).tail_events(
-            limit=limit,
-            event_type=event_type,
-            payload_type=payload_type,
-        )
-
-    def list_response_texts(
-        self,
-        agent_id: str,
-        *,
-        turn_id: str | None = None,
-        latest: bool = False,
-    ) -> list[AgentResponseTextView]:
-        return self.trace_reader(agent_id).list_response_texts(turn_id=turn_id, latest=latest)
-
-    def get_latest_response_text(self, agent_id: str) -> str | None:
-        return self.trace_reader(agent_id).get_latest_response_text()
-
-    def list_tool_calls(
-        self,
-        agent_id: str,
-        *,
-        turn_id: str | None = None,
-        latest: bool = False,
-    ) -> list[AgentToolCallView]:
-        return self.trace_reader(agent_id).list_tool_calls(turn_id=turn_id, latest=latest)
-
-    def get_tool_call(
-        self,
-        agent_id: str,
-        *,
-        call_id: str | None = None,
-        index: int | None = None,
-        last: bool = False,
-    ) -> AgentToolCallView | None:
-        return self.trace_reader(agent_id).get_tool_call(call_id=call_id, index=index, last=last)
-
-    def build_trace_report(
-        self,
-        agent_id: str,
-        *,
-        artifact_path: str | Path | None = None,
-        slow_call_limit: int = 20,
-    ) -> AgentTraceReport:
-        return self.trace_reader(agent_id).build_trace_report(
-            artifact_path=artifact_path,
-            slow_call_limit=slow_call_limit,
-        )
-
-    def export_trace_report(
-        self,
-        agent_id: str,
-        *,
-        output_path: str | Path,
-        format: str = "json",
-        artifact_path: str | Path | None = None,
-        slow_call_limit: int = 20,
-    ) -> AgentTraceReport:
-        return self.trace_reader(agent_id).export_trace_report(
-            output_path=output_path,
-            format=format,
-            artifact_path=artifact_path,
-            slow_call_limit=slow_call_limit,
-        )
-
-    def get_default_trace_report_paths(self, agent_id: str) -> AgentTraceReportPaths:
-        reports_root = self.report_dir(agent_id)
-        return AgentTraceReportPaths(
-            agent_id=agent_id,
-            reports_root=str(reports_root),
-            latest_json_path=str(reports_root / "latest.json"),
-            latest_markdown_path=str(reports_root / "latest.md"),
-        )
-
-    def report_dir(self, agent_id: str) -> Path:
-        return self.runtime_root / "reports" / "agents" / _safe_report_key(agent_id)
-
-    def export_default_trace_reports(
-        self,
-        agent_id: str,
-        *,
-        artifact_path: str | Path | None = None,
-        slow_call_limit: int = 20,
-        include_turn_history: bool = True,
-    ) -> AgentTraceReportPaths:
-        reports_root = self.report_dir(agent_id)
-        latest_json = reports_root / "latest.json"
-        latest_markdown = reports_root / "latest.md"
-        reports_root.mkdir(parents=True, exist_ok=True)
-        report = self.export_trace_report(
-            agent_id,
-            output_path=latest_json,
-            format="json",
-            artifact_path=artifact_path,
-            slow_call_limit=slow_call_limit,
-        )
-        self.export_trace_report(
-            agent_id,
-            output_path=latest_markdown,
-            format="markdown",
-            artifact_path=artifact_path,
-            slow_call_limit=slow_call_limit,
-        )
-        written = [str(latest_json), str(latest_markdown)]
-        turn_json = None
-        turn_markdown = None
-        if include_turn_history and report.latest_turn is not None:
-            turn_key = _safe_report_key(report.latest_turn.turn_id)
-            turn_json = reports_root / "turns" / f"{turn_key}.json"
-            turn_markdown = reports_root / "turns" / f"{turn_key}.md"
-            turn_json.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(latest_json, turn_json)
-            shutil.copyfile(latest_markdown, turn_markdown)
-            written.extend([str(turn_json), str(turn_markdown)])
-        return AgentTraceReportPaths(
-            agent_id=agent_id,
-            reports_root=str(reports_root),
-            latest_json_path=str(latest_json),
-            latest_markdown_path=str(latest_markdown),
-            turn_json_path=str(turn_json) if turn_json is not None else None,
-            turn_markdown_path=str(turn_markdown) if turn_markdown is not None else None,
-            written_paths=written,
-        )
-
-    def read_default_trace_report(self, agent_id: str, *, format: str = "json") -> object | None:
-        paths = self.get_default_trace_report_paths(agent_id)
-        if format == "json":
-            path = Path(paths.latest_json_path)
-            return read_json(path) if path.exists() else None
-        if format == "markdown":
-            path = Path(paths.latest_markdown_path)
-            return path.read_text(encoding="utf-8") if path.exists() else None
-        raise ValueError(f"unsupported trace report format: {format}")
-
-    def read_thread(self, agent_id: str, include_turns: bool = True) -> object:
-        agent = self.get_agent(agent_id)
-        if not agent.thread_id:
-            raise AgentHasNoCompletedTurn(agent_id)
-        provider = self.providers.get(agent.cli_type)
-        if provider is None:
-            raise RuntimeError(f"no provider registered for {agent.cli_type}")
-        return provider.read_thread(agent, include_turns=include_turns)
-
-    def list_turns(self, agent_id: str) -> list[object]:
-        thread = self.read_thread(agent_id, include_turns=True)
-        return list(getattr(thread, "turns", []) or [])
-
-    def read_latest_turn_result(self, agent_id: str) -> object:
-        provider = self.providers.get(self.get_agent(agent_id).cli_type)
-        if provider is not None and hasattr(provider, "read_latest_turn_result"):
-            return provider.read_latest_turn_result(self.get_agent(agent_id))
-        turns = self.list_turns(agent_id)
-        completed = [turn for turn in turns if getattr(turn, "status", "completed") == "completed"]
-        if not completed:
-            raise AgentHasNoCompletedTurn(agent_id)
-        return completed[-1]
-
     def _ensure_scope(self, scope_id: str) -> None:
         scope_key = encode_scope_id(scope_id)
         scope_dir = self.scopes_root / scope_key
@@ -496,12 +230,12 @@ class AgentStoreService:
         self._ensure_scope_schema(scope_key)
 
     def _write_agent(self, agent: Agent) -> None:
-        agent.normalize_compat_fields()
+        agent.__post_init__()
         path = self._agent_json_path(agent)
         write_json_atomic(
             path,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "object_type": "agent",
                 **to_jsonable(agent),
             },
@@ -557,14 +291,12 @@ def _create_agents_schema(conn: sqlite3.Connection) -> None:
           scope_id text not null,
           scope_key text,
           agent_type text not null,
-          cli_type text not null,
+          provider_type text not null,
           home_id text not null,
           status text not null,
-          thread_id text,
-          rollout_relpath text,
+          session_id text,
           last_completion_status text,
           fork_source_agent_id text,
-          fork_source_thread_id text,
           agent_relpath text not null,
           created_at text not null,
           updated_at text not null
@@ -572,8 +304,8 @@ def _create_agents_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("create index if not exists idx_agents_type_status on agents(agent_type, status)")
-    conn.execute("create index if not exists idx_agents_cli_home on agents(cli_type, home_id)")
-    conn.execute("create index if not exists idx_agents_thread on agents(thread_id)")
+    conn.execute("create index if not exists idx_agents_provider_home on agents(provider_type, home_id)")
+    conn.execute("create index if not exists idx_agents_session on agents(session_id)")
     conn.execute("create index if not exists idx_agents_status_updated on agents(status, updated_at)")
     conn.execute("create index if not exists idx_agents_completion on agents(last_completion_status)")
     conn.execute("create index if not exists idx_agents_fork_source on agents(fork_source_agent_id)")
@@ -585,24 +317,21 @@ def _upsert_agent_row(conn: sqlite3.Connection, agent: Agent, scope_key: str, ag
     conn.execute(
         """
         insert into agents(
-          agent_id, scope_id, scope_key, agent_type, cli_type, home_id, status,
-          thread_id, rollout_relpath, last_completion_status,
-          fork_source_agent_id, fork_source_thread_id,
+          agent_id, scope_id, scope_key, agent_type, provider_type, home_id, status,
+          session_id, last_completion_status, fork_source_agent_id,
           agent_relpath, created_at, updated_at
         )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(agent_id) do update set
           scope_id=excluded.scope_id,
           scope_key=excluded.scope_key,
           agent_type=excluded.agent_type,
-          cli_type=excluded.cli_type,
+          provider_type=excluded.provider_type,
           home_id=excluded.home_id,
           status=excluded.status,
-          thread_id=excluded.thread_id,
-          rollout_relpath=excluded.rollout_relpath,
+          session_id=excluded.session_id,
           last_completion_status=excluded.last_completion_status,
           fork_source_agent_id=excluded.fork_source_agent_id,
-          fork_source_thread_id=excluded.fork_source_thread_id,
           agent_relpath=excluded.agent_relpath,
           updated_at=excluded.updated_at
         """,
@@ -611,23 +340,14 @@ def _upsert_agent_row(conn: sqlite3.Connection, agent: Agent, scope_key: str, ag
             agent.scope_id,
             scope_key,
             agent.agent_type,
-            agent.cli_type,
+            agent.provider_type,
             agent.home_id,
             agent.status,
-            agent.thread_id,
-            agent.rollout_relpath,
+            agent.session_locator.session_id if agent.session_locator is not None else None,
             completion_status,
-            agent.fork_source_agent_id,
-            agent.fork_source_thread_id,
+            agent.fork_info.source_agent_id if agent.fork_info is not None else None,
             agent_relpath,
             agent.created_at,
             agent.updated_at,
         ),
     )
-
-
-def _safe_report_key(value: str) -> str:
-    text = str(value).strip()
-    if not text:
-        return "unknown"
-    return "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in text)
