@@ -1,159 +1,198 @@
-# Agent Runtime Kit
+<p align="center">
+  <img
+    src="assets/agent-runtime-kit-logo.png"
+    alt="Agent Runtime Kit logo"
+    width="190"
+  >
+</p>
 
-`agent-runtime-kit` (ARK) is a lightweight Python runtime for provider-backed
-agents and application-defined workflows. It provides the reusable execution
-layer for applications that need isolated agent homes, persistent provider
-threads, typed Flow/Step orchestration, bounded scheduling, MCP runtime
-identity, and stable snapshot/restore.
+<h1 align="center">Agent Runtime Kit</h1>
 
-ARK is intentionally application-neutral. It owns runtime mechanics and
-persistence; the embedding application owns business services, concrete
-agents, tools, permissions, and workflow semantics.
+<p align="center">
+  <strong>One durable runtime contract for heterogeneous coding Agents and typed workflows.</strong>
+</p>
 
-## What ARK Supports
+<p align="center">
+  <a href="https://www.python.org/">
+    <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-172554?style=flat-square">
+  </a>
+  <img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-0f8f88?style=flat-square">
+  <a href="docs/provider-adapters.md">
+    <img alt="Provider neutral" src="https://img.shields.io/badge/runtime-provider--neutral-2563eb?style=flat-square">
+  </a>
+  <a href="#bundled-provider-adapters">
+    <img alt="Five providers" src="https://img.shields.io/badge/providers-5-e45132?style=flat-square">
+  </a>
+  <a href="docs/agent-context-compaction.md">
+    <img alt="Schema v3" src="https://img.shields.io/badge/persistence-schema_v3-6b4fbb?style=flat-square">
+  </a>
+  <img alt="Typed Flow and Step" src="https://img.shields.io/badge/workflows-typed_Flow%2FStep-d97706?style=flat-square">
+</p>
 
-The current implementation includes:
+<p align="center">
+  <a href="#quick-start">Quick Start</a>
+  &middot;
+  <a href="#architecture">Architecture</a>
+  &middot;
+  <a href="docs/README.md">Documentation</a>
+  &middot;
+  <a href="docs/provider-adapters.md">Provider SPI</a>
+  &middot;
+  <a href="docs/runtime-observation.md">Observation</a>
+  &middot;
+  <a href="https://github.com/iiis-lean/lean-constellation">Lean Constellation</a>
+</p>
 
-- code-defined `AgentType` templates with developer instructions, start and
-  continuation prompts, completion checks, and auto-continue policy;
-- isolated provider homes with configuration, credentials, environment
-  requirements, MCP server definitions, and materialized skills;
-- a provider-neutral contract layer with descriptors, capabilities, Home
-  renderers, runtime handles, query/context/artifact adapters, and a registry;
-- bundled Codex, Claude Code, Pi, OpenAI Agents, and OpenCode providers, all
-  connected through the same provider-neutral contracts and isolated Homes;
-- schema-v3 Agent records with exact provider/session/turn/artifact locators;
-- Agent start, wait, interrupt, session-only fork, close, stale-run
-  reconciliation, lifecycle-status observation, normalized results, usage,
-  and offline query APIs;
-- provider-neutral context inspection and between-turn compaction, with Codex
-  completion evidence, fail-closed recovery, and snapshot-safe maintenance;
-- typed `BaseFlow` and `BaseStep` models with registries, JSON truth, SQLite
-  indexes, lifecycle contexts, and transactional mutation;
-- asynchronous Step execution and a scheduler that advances Flows separately
-  from starting Steps, with concurrency limits and pause gates;
-- observation-only Step terminal waits that distinguish settled terminal,
-  timeout, not-started, active, and persisted-running-without-runner states;
-- numeric bounded runs and semantic run leases for controlled production
-  advancement;
-- standard `AgentStep` and `DispatchStep` implementations, including accepted
-  submissions, child-Flow dispatch, callback continuation, and terminal
-  handoff;
-- MCP runtime identity resolution for Flow/Step/Agent relationships and a
-  guarded helper for writing submissions to the current running Step;
-- scope and runtime snapshots, selective scope refresh, restore validation,
-  index/queue rebuilding, and stable-point checks across Agents and Steps;
-- structured rollout trace readers and configurable JSON/Markdown trace report
-  persistence.
+Agent Runtime Kit (ARK) is a lightweight Python framework for applications
+that need isolated Agent Homes, durable provider sessions, typed Flow/Step
+orchestration, bounded scheduling, normalized observation, and stable
+snapshot/restore.
+
+ARK does not impose a business domain or pretend that every Agent backend is
+the same. It defines one neutral upper contract, preserves provider evidence,
+and makes unsupported semantics explicit.
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>Provider-Neutral Agents</strong><br><br>
+      Assemble isolated Homes, start and resume sessions, interrupt, fork,
+      inspect context, query turns, and normalize results across adapters.
+    </td>
+    <td width="33%" valign="top">
+      <strong>Typed Orchestration</strong><br><br>
+      Build application-defined Flow and Step state machines with asynchronous
+      execution, callbacks, submissions, pause gates, and bounded scheduling.
+    </td>
+    <td width="33%" valign="top">
+      <strong>Restorable State</strong><br><br>
+      Keep schema-v3 truth, exact session/artifact locators, provider manifests,
+      snapshots, indexes, traces, and recovery rules under one runtime root.
+    </td>
+  </tr>
+</table>
+
+## What ARK Owns
+
+| Runtime surface | Included capabilities |
+| --- | --- |
+| **Agent definition** | Code-defined AgentTypes, instructions, start/continuation prompts, completion checks, and auto-continue policy |
+| **Home assembly** | Base/override configuration, environment requirements, auth references, MCP servers, skills, and provider-specific projection |
+| **Agent lifecycle** | Create, start/resume, wait, interrupt, session-only fork, close, reconcile, inspect status, and query offline artifacts |
+| **Normalized evidence** | Results, backend/model identity, usage, context, turns, tool activity, session locators, artifact locators, and provider details |
+| **Workflow runtime** | Typed Flow/Step truth, registries, asynchronous execution, child Flows, callbacks, accepted submissions, and terminal handoff |
+| **Scheduling** | Separate Flow advancement and Step-start queues, concurrency limits, pause gates, numeric bounds, and semantic run leases |
+| **Persistence** | JSON truth, rebuildable SQLite indexes, provider Artifact Manifests, scope/runtime snapshots, restore, traces, and reports |
+| **MCP integration** | Flow/Step/Agent runtime identity and guarded submission helpers for application-owned tools |
 
 ## Architecture
 
 ```text
 Embedding application
-  ├─ AppServices: business services and tool handlers
-  ├─ AgentType / Flow / Step subclasses
-  └─ application MCP and admin surfaces
-          │
-          ▼
-ARKServices
-  ├─ AgentService ── Provider Registry, Home, run handles, completion, query
-  ├─ FlowService  ── Flow lifecycle and child relationships
-  ├─ StepService  ── asynchronous Step execution
-  ├─ RuntimeScheduleService ── queues, limits, run control
-  ├─ AgentSnapshotService ── scope/runtime orchestration over Artifact adapters
-  └─ RuntimePauseController ── global and scope pause gates
+  business services · AgentTypes · Flows · Steps · MCP/Admin surfaces
+                              │
+                              ▼
+                         ARKServices
+  ┌──────────────────────────────────────────────────────────────┐
+  │ AgentService            Provider registry · Homes · sessions │
+  │ FlowService             Flow truth · lifecycle · children    │
+  │ StepService             asynchronous Step execution          │
+  │ RuntimeScheduleService  queues · limits · pause · leases     │
+  │ AgentSnapshotService    manifests · scope/runtime restore    │
+  └──────────────────────────────────────────────────────────────┘
+                              │
+          ┌───────────┬───────┼──────────┬──────────────┐
+          ▼           ▼       ▼          ▼              ▼
+        Codex      Claude     Pi    OpenAI Agents    OpenCode
 ```
 
-The shared `ARKServices` container is deliberately mutable so applications can
-assemble these services in two stages. Every runtime context carries both
-`ctx.ark` and `ctx.app`, keeping framework services separate from application
-services.
+The shared `ARKServices` container carries framework services, while
+`AppServices` carries the embedding application's domain services. Runtime
+contexts expose both as `ctx.ark` and `ctx.app`, preserving the boundary
+between reusable mechanics and application policy.
 
-## Core Runtime Model
+### One Agent lifecycle, provider-owned evidence
 
-A typical execution path is:
+```text
+AgentType + HomeSpec
+        │
+        ▼
+Provider Home renderer ──► isolated Home + capability resolution
+        │
+        ▼
+Runtime adapter ──► RunHandle ──► normalized status/result/usage
+        │                              │
+        └── provider session/artifacts ┘
+                         │
+                         ▼
+              query · compact · snapshot
+```
+
+Provider capabilities are resolved from the exact Home and backend. ARK fails
+closed for unsupported operations instead of silently substituting a weaker or
+different semantic.
+
+## Bundled Provider Adapters
+
+| Provider | Integration | Snapshot/context boundary |
+| --- | --- | --- |
+| **Codex** | OpenAI Codex Python SDK and isolated Codex Home | Provider rollout JSONL, normalized queries, native compact evidence |
+| **Claude Code** | Claude Agent SDK `0.2.124` and Claude Code CLI | Declared session transcript artifacts; fork is session-only, not workspace undo |
+| **Pi** | `@earendil-works/pi-coding-agent` `0.80.10` JSONL RPC | Agent-owned session artifacts and compaction; prepared Node runtime for MCP projection |
+| **OpenAI Agents** | `openai-agents` `0.18.3`, Responses or Chat Completions | Application-owned Agent factory, durable SQLite sessions, endpoint-dependent compaction |
+| **OpenCode** | External `opencode` `1.18.4` executable and isolated server | Isolated SQLite/session state and model-backed compact when supported |
+
+Model identity is independent of provider type. Results retain normalized
+backend/model/endpoint fields and provider-specific evidence without binding
+the upper runtime contract to one API protocol.
+
+Interactive approval/input requests have reserved neutral extension points,
+but ARK does not yet provide a complete `NEEDS_INPUT` service lifecycle.
+
+## Flow and Step Runtime
 
 ```text
 FlowRequest
-  -> FlowService.start_flow(...)
-  -> RuntimeScheduleService advances the Flow
-  -> BaseFlow.create_next_step(...) creates a Step
-  -> StepService runs the Step asynchronously
-  -> BaseFlow.on_step_terminal(...) consumes the Step result
-  -> the Flow completes, waits, fails, or creates another Step
+  └─► FlowService.start_flow(...)
+        └─► scheduler advances Flow
+              └─► Flow creates Step
+                    └─► StepService executes asynchronously
+                          └─► Flow consumes terminal Step result
+                                ├─► complete / fail / wait
+                                ├─► create another Step
+                                └─► dispatch a child Flow
 ```
 
-For an `AgentStep`, ARK additionally:
+For `AgentStep`, ARK creates or reuses a role-bound Agent, injects runtime
+identity, optionally inspects/compacts existing context, starts or resumes the
+provider session, waits for an accepted typed submission with bounded
+auto-continue, and converts it into terminal Step truth.
 
-1. creates or reuses an Agent bound to a role;
-2. injects `ARK_FLOW_ID`, `ARK_STEP_ID`, and `ARK_AGENT_ID` into the provider
-   environment;
-3. optionally inspects and compacts an existing provider context before the
-   first turn of the Step run;
-4. starts or resumes the provider thread;
-5. waits for an accepted typed submission, with bounded auto-continue;
-6. converts that submission into a terminal Step result.
+Applications own their MCP tools and permissions. ARK validates caller
+identity and Step binding but does not define domain ToolViews.
 
-Applications expose their own MCP tools. ARK validates the runtime caller
-identity and Step binding, but it does not define application tools, business
-permissions, or domain context.
+## Quick Start
 
-## Installation
-
-ARK requires Python 3.11 or newer.
+ARK requires Python 3.11 or newer:
 
 ```bash
 python -m pip install -e .
 ```
 
-For development:
+Install development or SDK-backed provider extras when needed:
 
 ```bash
 python -m pip install -e '.[dev]'
-```
-
-Codex support uses the OpenAI Codex Python SDK at runtime. The SDK may be
-installed normally or supplied from a local Codex source checkout through the
-provider's `sdk_python_root` option. Unit tests do not require a live Codex
-session.
-
-Claude Code support uses the optional, pinned Claude Agent SDK:
-
-```bash
 python -m pip install -e '.[claude]'
-```
-
-The Claude Code CLI and its backend credentials remain external runtime
-requirements. See [`docs/claude-code-provider.md`](docs/claude-code-provider.md)
-for isolated Home assembly, capabilities, and snapshot boundaries.
-
-OpenAI Agents support uses the pinned optional SDK set:
-
-```bash
 python -m pip install -e '.[openai-agents]'
 ```
 
-See [`docs/openai-agents-provider.md`](docs/openai-agents-provider.md) for
-resource factories, Responses versus Chat Completions, SQLite sessions, and
-compaction limits.
+Provider CLIs, model credentials, and application-owned Node/Python
+dependencies stay external. ARK renders isolated Homes but does not mutate the
+user's shared provider Home or install subprocess dependencies at runtime.
 
-Pi support targets `@earendil-works/pi-coding-agent` 0.80.10. Applications
-supply either an executable `pi` CLI or a Node executable plus the CLI entry
-file through `PiHomeOptions`. MCP projection additionally requires a prepared
-Node runtime containing `@modelcontextprotocol/sdk`; ARK packages the bridge
-code but does not install or mutate application Node dependencies. See the
-[Pi provider guide](docs/pi-provider.md) for assembly and capability details.
-
-OpenCode support uses an external `opencode` 1.18.4 executable. Applications
-register `build_opencode_provider_bundle(...)` explicitly and provide model
-credentials through environment references; ARK does not bundle OpenCode or
-copy credentials into a Home or snapshot.
-
-## Runtime Assembly
-
-Applications normally create one shared framework container and one
-application container, register their concrete types, then attach the runtime
-services:
+<details>
+<summary><strong>Minimal runtime assembly</strong></summary>
 
 ```python
 from pathlib import Path
@@ -202,89 +241,79 @@ AgentSnapshotService(
 )
 ```
 
-Concrete Flow, Step, AgentType, provider Home, and MCP setup remain application
-responsibilities. Tested examples are available under `tests/integration/`.
+Concrete AgentType, Flow, Step, provider registration, Home, and MCP assembly
+remain application responsibilities. Tested examples live under
+`tests/integration/`.
 
-## Persistence Layout
+</details>
 
-By default, runtime state lives below the configured runtime root:
+## Persistence and Recovery
 
 ```text
 .agent_runtime/
-├── homes/                 # isolated provider homes and Home index
-├── providers/             # provider-owned per-Agent runtime data (for example OpenCode SQLite/XDG)
+├── homes/                 # isolated provider Homes and Home index
+├── providers/             # provider-owned per-Agent runtime data
 ├── scopes/                # scope-owned Agent, Flow, and Step truth
-├── index/global.sqlite    # rebuildable global Agent/Flow/Step index
+├── index/global.sqlite    # rebuildable global index
 ├── snapshots/
 │   ├── scopes/
 │   └── runtime/
 └── reports/               # optional persisted trace reports
 ```
 
-JSON files and provider-native artifacts identified by each provider's Artifact
+Schema-v3 JSON records and provider-native artifacts named by each Artifact
 Manifest are authoritative restorable truth. SQLite databases and scheduler
-queues are rebuildable indexes or caches unless a provider explicitly declares
-a database authoritative in its manifest.
+queues are rebuildable unless an adapter explicitly declares a database
+authoritative in its manifest.
 
-## Boundaries
+Observation-only waits distinguish settled terminal, timeout, not-started,
+active, and persisted-running-without-runner states. Context inspection and
+between-turn compaction are optional capabilities with explicit admission,
+completion evidence, failure recovery, and snapshot rules.
 
-ARK does not provide:
+## Ecosystem
 
-- application-specific tools, ToolViews, authorization, or MCP endpoints;
-- business Flow definitions or domain services;
-- a web server, admin API, or production process supervisor;
-- a replacement event model for provider-native thread and rollout truth;
-- distributed scheduling across multiple ARK processes.
+| Project | Built on ARK for | Repository |
+| --- | --- | --- |
+| **Lean Constellation** | Multi-repository Lean formalization coordination, Agent workflows, release gates, and operator surfaces | [iiis-lean/lean-constellation](https://github.com/iiis-lean/lean-constellation) |
+| **Lean MCP Toolkit** | Application-owned Lean tools consumed through MCP/HTTP ToolViews in the Lean Constellation stack | [iiis-lean/lean-mcp-toolkit](https://github.com/iiis-lean/lean-mcp-toolkit) |
 
-These boundaries keep the framework small enough for applications to own their
-domain model without inheriting a second business abstraction layer.
+ARK itself remains application-neutral: it does not depend on Lean, define a
+web server, own business permissions, or prescribe application workflows.
+
+## Documentation
+
+| Area | Entry point |
+| --- | --- |
+| Documentation | [Public documentation index](docs/README.md) |
+| Provider contract | [Provider adapters and normalized runtime](docs/provider-adapters.md) |
+| Runtime observation | [Step terminal and Agent status waits](docs/runtime-observation.md) |
+| Context | [Inspection and compaction](docs/agent-context-compaction.md) |
+| Claude Code | [Claude Code provider](docs/claude-code-provider.md) |
+| Pi | [Pi provider](docs/pi-provider.md) |
+| OpenAI Agents | [OpenAI Agents provider](docs/openai-agents-provider.md) |
+| OpenCode | [OpenCode adapter](docs/provider-adapters.md#opencode-adapter) |
+
+## Framework Boundaries
+
+ARK intentionally does not provide application-specific tools, ToolViews,
+authorization, business Flow definitions, domain services, an Admin/web
+server, a process supervisor, or distributed multi-process scheduling. These
+belong to the embedding application.
 
 ## Testing
 
-Run the deterministic unit and integration suites with:
+Run deterministic unit and integration coverage with:
 
 ```bash
 python -m pytest -q tests/unit tests/integration
 ```
 
-Real provider tests are under `tests/real/` and require explicitly configured
-CLIs, Homes, credentials, and opt-in environment gates. They are intentionally
-separate from the default regression suite.
+Real provider tests live under `tests/real/` and require explicitly configured
+CLIs, Homes, credentials, and opt-in environment gates.
 
-The gated OpenCode integration tests use `ARK_OPENCODE_TEST_BINARY`. Real model
-tests additionally require `ARK_OPENCODE_RUN_REAL_MODELS=1` and backend keys in
-the documented environment variables. They never read a shared OpenCode Home.
-
-## Documentation
-
-See [Runtime observation](docs/runtime-observation.md) for Step terminal and
-Agent status wait contracts intended for application monitoring adapters.
-
-- [`docs/README.md`](docs/README.md) is the public documentation entry point.
-- [`docs/runtime-observation.md`](docs/runtime-observation.md) documents
-  observation-only Step terminal and Agent lifecycle waits.
-- [`docs/agent-context-compaction.md`](docs/agent-context-compaction.md)
-  documents context usage, compaction admission, failure recovery, and the
-  optional provider contract.
-- [`docs/provider-adapters.md`](docs/provider-adapters.md) documents the
-  provider-neutral contracts, capability rules, extension points, and bundled
-  provider adapters.
-- [`docs/claude-code-provider.md`](docs/claude-code-provider.md) documents the
-  bundled Claude Code adapter, configuration, controls, query projection, and
-  snapshot semantics.
-- [`docs/pi-provider.md`](docs/pi-provider.md) documents Pi Home projection,
-  RPC lifecycle, usage/context semantics, MCP, snapshots, and configuration.
-- [`docs/openai-agents-provider.md`](docs/openai-agents-provider.md) documents
-  OpenAI Agents SDK assembly, backend-neutral model configuration, durable
-  sessions, and compaction behavior.
-- [`docs/provider-adapters.md`](docs/provider-adapters.md#opencode-adapter)
-  documents OpenCode configuration, lifecycle, query, compact, fork, and
-  snapshot boundaries.
-
-Maintainer checkouts may also contain a local `dev_docs/` tree with Chinese
-design, implementation, and current-code reference material. It is intentionally
-not part of the public documentation surface.
-
-Public reusable documentation belongs in `README.md` and `docs/`. Local design
-notes, implementation plans, audits, and development records belong in
-`dev_docs/`.
+<p align="center">
+  <a href="https://github.com/iiis-lean">
+    <img src="assets/iiis-lean-logo.png" alt="IIIS LEAN" width="82">
+  </a>
+</p>
