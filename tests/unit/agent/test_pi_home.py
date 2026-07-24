@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeService, McpServerSpec
+from agent_runtime_kit.agent.homes import (
+    MCP_RESULT_PROFILE_HTTP_HEADER,
+    HomeService,
+    McpServerSpec,
+)
 from agent_runtime_kit.agent.provider_contracts import (
     BaseConfigSource,
     CapabilityKey,
@@ -106,6 +110,7 @@ def test_pi_home_mcp_bridge_manifest_uses_env_references_and_packaged_extension(
                     url="https://mcp.example/rpc",
                     required=True,
                     bearer_token_env_var="MCP_TOKEN",
+                    result_profile="content_only",
                 ),
             ),
             provider_options=PiHomeOptions(
@@ -118,6 +123,10 @@ def test_pi_home_mcp_bridge_manifest_uses_env_references_and_packaged_extension(
     root = service.resolve_home_root("pi", "mcp")
     manifest = json.loads((root / ".ark" / "pi_mcp_manifest.json").read_text(encoding="utf-8"))
     assert manifest["servers"][0]["bearer_token_env_var"] == "MCP_TOKEN"
+    assert (
+        manifest["servers"][0]["http_headers"][MCP_RESULT_PROFILE_HTTP_HEADER]
+        == "content_only"
+    )
     assert "token-value" not in json.dumps(manifest)
     assert (root / ".pi" / "extensions" / "ark_pi_mcp_bridge.mjs").is_file()
     context = service.build_execution_context("pi", "mcp", run_env={"MCP_TOKEN": "token-value"})

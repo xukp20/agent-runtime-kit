@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeService, McpServerSpec
+from agent_runtime_kit.agent.homes import (
+    MCP_RESULT_PROFILE_ENV,
+    HomeService,
+    McpServerSpec,
+)
 from agent_runtime_kit.agent.provider_contracts import (
     BaseConfigSource,
     ModelBackendIdentity,
@@ -51,6 +55,7 @@ def test_claude_home_materializes_settings_skills_mcp_and_isolated_env(tmp_path:
                 args=["server.py"],
                 required=True,
                 env_vars=["MCP_TOKEN"],
+                result_profile="content_only",
             ),
         ),
         required_env=("MCP_TOKEN",),
@@ -83,6 +88,12 @@ def test_claude_home_materializes_settings_skills_mcp_and_isolated_env(tmp_path:
     assert context.process_environment["CLAUDE_CONFIG_DIR"] == str(root / ".claude")
     assert context.process_environment["HOME"] == str(root)
     assert context.runtime_payload["mcp_servers_resolved"]["probe"]["env"]["MCP_TOKEN"] == "runtime-secret"
+    assert (
+        context.runtime_payload["mcp_servers_resolved"]["probe"]["env"][
+            MCP_RESULT_PROFILE_ENV
+        ]
+        == "content_only"
+    )
     manifest_text = (root / ".ark" / "home_materialization.json").read_text()
     assert "runtime-secret" not in manifest_text
 

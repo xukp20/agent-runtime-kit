@@ -52,7 +52,7 @@ from agent_runtime_kit.agent.providers import (
 )
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
-from agent_runtime_kit.agent.homes import McpServerSpec
+from agent_runtime_kit.agent.homes import MCP_RESULT_PROFILE_ENV, McpServerSpec
 
 
 class OpenAIAgentsTestType(AgentType):
@@ -560,8 +560,13 @@ def test_openai_agents_maps_stdio_mcp_and_owns_connection_lifecycle(
                 command=sys.executable,
                 args=[str(fixture)],
                 required=True,
+                result_profile="content_only",
             ),
         ),
+    )
+    assert (
+        execution.runtime_payload["mcp_servers"][0]["env"][MCP_RESULT_PROFILE_ENV]
+        == "content_only"
     )
     from openai.types.responses import ResponseFunctionToolCall
 

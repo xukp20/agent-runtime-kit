@@ -6,13 +6,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
-from .models import MissingProviderEnvError, to_jsonable
+from .models import to_jsonable
 from .provider_contracts import (
     HomeMaterializationResult,
     HomeValidationResult,
     ProviderHomeSpec,
 )
 from .store_utils import utc_now_iso, write_json_atomic
+
+MCP_RESULT_PROFILE_HTTP_HEADER = "x-ark-mcp-result-profile"
+MCP_RESULT_PROFILE_ENV = "ARK_MCP_RESULT_PROFILE"
+MCP_RESULT_PROFILES = frozenset({"content_only", "dual"})
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,49 @@ class McpServerSpec:
     bearer_token_env_var: str | None = None
     http_headers: dict[str, str] = field(default_factory=dict)
     env_http_headers: dict[str, str] = field(default_factory=dict)
+    result_profile: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.result_profile is None:
+            return
+        profile = self.result_profile.strip().lower()
+        if profile not in MCP_RESULT_PROFILES:
+            supported = ", ".join(sorted(MCP_RESULT_PROFILES))
+            raise ValueError(f"unsupported MCP result_profile: {self.result_profile!r}; expected one of {supported}")
+        self.result_profile = profile
+        if self.command is not None or self.transport == "stdio":
+            _set_fixed_mcp_value(
+                self.env,
+                MCP_RESULT_PROFILE_ENV,
+                profile,
+                label="MCP result profile environment",
+            )
+            return
+        _set_fixed_mcp_value(
+            self.http_headers,
+            MCP_RESULT_PROFILE_HTTP_HEADER,
+            profile,
+            label="MCP result profile header",
+            case_insensitive=True,
+        )
+
+
+def _set_fixed_mcp_value(
+    values: dict[str, str],
+    key: str,
+    expected: str,
+    *,
+    label: str,
+    case_insensitive: bool = False,
+) -> None:
+    matching_key = (
+        next((current for current in values if current.lower() == key.lower()), None)
+        if case_insensitive
+        else key if key in values else None
+    )
+    if matching_key is not None and values[matching_key] != expected:
+        raise ValueError(f"{label} conflicts with result_profile: {values[matching_key]!r}")
+    values[matching_key or key] = expected
 
 
 class HomeStore:

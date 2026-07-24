@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeRecord, McpServerSpec
+from agent_runtime_kit.agent.homes import (
+    MCP_RESULT_PROFILE_ENV,
+    HomeRecord,
+    McpServerSpec,
+)
 from agent_runtime_kit.agent.provider_contracts import (
     ArtifactCaptureRequest,
     ArtifactRestoreRequest,
@@ -71,6 +75,7 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
                     command="python",
                     args=["-m", "lean_mcp"],
                     env_vars=["LEAN_TOKEN"],
+                    result_profile="content_only",
                 ),
             ),
             fixed_env={"SAFE_SETTING": "yes"},
@@ -92,6 +97,10 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     assert config["provider"]["deepseek"]["options"]["baseURL"] == "https://example.test"
     assert config["mcp"]["lean"]["command"] == ["python", "-m", "lean_mcp"]
     assert config["mcp"]["lean"]["environment"]["LEAN_TOKEN"] == "{env:LEAN_TOKEN}"
+    assert (
+        config["mcp"]["lean"]["environment"][MCP_RESULT_PROFILE_ENV]
+        == "content_only"
+    )
     assert config["tools"] == {"bash": False, "mcp_lean_*": True}
     assert (home_root / "AGENTS.md").read_text() == "Keep changes surgical.\n"
     assert (home_root / "skills" / "proof" / "SKILL.md").is_file()
