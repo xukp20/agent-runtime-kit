@@ -53,6 +53,23 @@ class CodexHomeInitializationRecord:
     marker_path: str
 
 
+@dataclass(frozen=True)
+class CodexTransientRetryPolicy:
+    """Bounded retry policy for narrowly recognized transient Codex turn failures."""
+
+    max_attempts: int = 3
+    initial_delay_s: float = 0.25
+    max_delay_s: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("Codex transient retry max_attempts must be >= 1")
+        if self.initial_delay_s < 0:
+            raise ValueError("Codex transient retry initial_delay_s must be >= 0")
+        if self.max_delay_s < 0:
+            raise ValueError("Codex transient retry max_delay_s must be >= 0")
+
+
 @dataclass
 class _CodexAgentRun:
     agent_id: str
@@ -83,6 +100,7 @@ class CodexProvider:
         model: str | None = None,
         thread_config: dict[str, object] | None = None,
         approval_mode: str = "deny_all",
+        transient_retry_policy: CodexTransientRetryPolicy | None = None,
     ) -> None:
         self.runtime_root = Path(runtime_root) if runtime_root is not None else None
         self.codex_bin = codex_bin
@@ -90,6 +108,7 @@ class CodexProvider:
         self.model = model
         self.thread_config = dict(thread_config or {})
         self.approval_mode = approval_mode
+        self.transient_retry_policy = transient_retry_policy or CodexTransientRetryPolicy()
         self._agent_runs: dict[str, _CodexAgentRun] = {}
         self._home_init_locks: dict[tuple[str, str], threading.Lock] = {}
         self._lock = threading.RLock()
@@ -112,6 +131,7 @@ class CodexProvider:
         overwrite_developer_instructions: bool = False,
         on_thread_started: Callable[[str], None] | None = None,
         on_turn_started: Callable[[str, str], None] | None = None,
+        on_transient_retry: Callable[[dict[str, object]], None] | None = None,
     ) -> CodexTurnResult:
         self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
         self._begin_agent_run(home_id=home_id, agent_id=agent_id)
@@ -129,11 +149,13 @@ class CodexProvider:
                 if on_thread_started is not None:
                     on_thread_started(thread.id)
                 turn_result = self._run_turn_with_control_handle(
-                    thread,
+                    sdk=sdk,
+                    thread=thread,
                     prompt=prompt,
                     workdir=workdir,
                     agent_id=agent_id,
                     on_turn_started=on_turn_started,
+                    on_transient_retry=on_transient_retry,
                 )
                 rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
                 return CodexTurnResult(
@@ -158,6 +180,7 @@ class CodexProvider:
         agent_id: str,
         overwrite_developer_instructions: bool = False,
         on_turn_started: Callable[[str, str], None] | None = None,
+        on_transient_retry: Callable[[dict[str, object]], None] | None = None,
     ) -> CodexTurnResult:
         self.ensure_home_initialized(home_id=home_id, home_root=home_root, env=env, workdir=workdir)
         self._begin_agent_run(home_id=home_id, agent_id=agent_id, thread_id=thread_id)
@@ -174,6 +197,7 @@ class CodexProvider:
                         developer_instructions=developer_instructions,
                         agent_id=agent_id,
                         on_turn_started=on_turn_started,
+                        on_transient_retry=on_transient_retry,
                     )
                     rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
                     return CodexTurnResult(
@@ -190,11 +214,13 @@ class CodexProvider:
                     config=self.thread_config or None,
                 )
                 turn_result = self._run_turn_with_control_handle(
-                    thread,
+                    sdk=sdk,
+                    thread=thread,
                     prompt=prompt,
                     workdir=workdir,
                     agent_id=agent_id,
                     on_turn_started=on_turn_started,
+                    on_transient_retry=on_transient_retry,
                 )
                 rollout_relpath = _find_rollout_relpath(Path(home_root) / ".codex", thread.id)
                 return CodexTurnResult(
@@ -217,6 +243,7 @@ class CodexProvider:
         developer_instructions: str | None,
         agent_id: str,
         on_turn_started: Callable[[str, str], None] | None,
+        on_transient_retry: Callable[[dict[str, object]], None] | None,
     ) -> tuple[object, object]:
         client = getattr(codex, "_client", None)
         if client is None:
@@ -250,7 +277,6 @@ class CodexProvider:
                 },
             },
         }
-        started = client.turn_start(resumed_thread_id, prompt, params=params)
         turn_handle_type = getattr(sdk, "TurnHandle", None)
         thread_type = getattr(sdk, "Thread", None)
         if turn_handle_type is None or thread_type is None:
@@ -259,42 +285,126 @@ class CodexProvider:
                 "Thread and TurnHandle"
             )
         thread = thread_type(client, resumed_thread_id)
-        turn = getattr(started, "turn", None)
-        turn_id = str(getattr(turn, "id"))
-        turn_handle = turn_handle_type(client, resumed_thread_id, turn_id)
-        self._update_agent_run_locator(
-            agent_id,
+
+        def start_turn() -> object:
+            started = client.turn_start(resumed_thread_id, prompt, params=params)
+            turn = getattr(started, "turn", None)
+            turn_id = str(getattr(turn, "id"))
+            return turn_handle_type(client, resumed_thread_id, turn_id)
+
+        turn_result = self._run_codex_turn_with_retry(
+            sdk=sdk,
+            start_turn=start_turn,
             thread_id=resumed_thread_id,
-            turn_id=turn_id,
-            turn_handle=turn_handle,
+            agent_id=agent_id,
+            on_turn_started=on_turn_started,
+            on_transient_retry=on_transient_retry,
         )
-        if on_turn_started is not None:
-            on_turn_started(resumed_thread_id, turn_id)
-        turn_result = turn_handle.run()
         return thread, turn_result
 
     def _run_turn_with_control_handle(
         self,
+        sdk,
         thread: object,
         *,
         prompt: str,
         workdir: str | None,
         agent_id: str,
         on_turn_started: Callable[[str, str], None] | None,
+        on_transient_retry: Callable[[dict[str, object]], None] | None,
     ) -> object:
         start_turn = getattr(thread, "turn", None)
         if not callable(start_turn):
             raise TypeError("supported Codex SDK must expose Thread.turn()")
-        turn_handle = start_turn(prompt, cwd=workdir, model=self.model)
-        self._update_agent_run_locator(
-            agent_id,
-            thread_id=str(getattr(thread, "id")),
-            turn_id=str(getattr(turn_handle, "id")),
-            turn_handle=turn_handle,
+        thread_id = str(getattr(thread, "id"))
+        return self._run_codex_turn_with_retry(
+            sdk=sdk,
+            start_turn=lambda: start_turn(prompt, cwd=workdir, model=self.model),
+            thread_id=thread_id,
+            agent_id=agent_id,
+            on_turn_started=on_turn_started,
+            on_transient_retry=on_transient_retry,
         )
-        if on_turn_started is not None:
-            on_turn_started(str(getattr(thread, "id")), str(getattr(turn_handle, "id")))
-        return turn_handle.run()
+
+    def _run_codex_turn_with_retry(
+        self,
+        *,
+        sdk,
+        start_turn: Callable[[], object],
+        thread_id: str,
+        agent_id: str,
+        on_turn_started: Callable[[str, str], None] | None,
+        on_transient_retry: Callable[[dict[str, object]], None] | None,
+    ) -> object:
+        policy = self.transient_retry_policy
+        attempt = 1
+        while True:
+            turn_handle: object | None = None
+            try:
+                turn_handle = start_turn()
+            except Exception as exc:
+                classification = _classify_transient_codex_error(sdk, exc)
+                if classification is None or attempt >= policy.max_attempts:
+                    raise
+                self._wait_before_transient_retry(
+                    attempt=attempt,
+                    classification=classification,
+                    exc=exc,
+                    turn_id=None,
+                    on_transient_retry=on_transient_retry,
+                )
+                attempt += 1
+                continue
+
+            turn_id = str(getattr(turn_handle, "id"))
+            self._update_agent_run_locator(
+                agent_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                turn_handle=turn_handle,
+            )
+            if on_turn_started is not None:
+                on_turn_started(thread_id, turn_id)
+            try:
+                return turn_handle.run()
+            except Exception as exc:
+                classification = _classify_transient_codex_error(sdk, exc)
+                if classification is None or attempt >= policy.max_attempts:
+                    raise
+                self._wait_before_transient_retry(
+                    attempt=attempt,
+                    classification=classification,
+                    exc=exc,
+                    turn_id=turn_id,
+                    on_transient_retry=on_transient_retry,
+                )
+                attempt += 1
+
+    def _wait_before_transient_retry(
+        self,
+        *,
+        attempt: int,
+        classification: str,
+        exc: Exception,
+        turn_id: str | None,
+        on_transient_retry: Callable[[dict[str, object]], None] | None,
+    ) -> None:
+        policy = self.transient_retry_policy
+        delay_s = min(policy.max_delay_s, policy.initial_delay_s * (2 ** (attempt - 1)))
+        if on_transient_retry is not None:
+            on_transient_retry(
+                {
+                    "classification": classification,
+                    "failed_attempt": attempt,
+                    "next_attempt": attempt + 1,
+                    "max_attempts": policy.max_attempts,
+                    "delay_s": delay_s,
+                    "error_type": type(exc).__name__,
+                    "turn_id": turn_id,
+                }
+            )
+        if delay_s > 0:
+            sleep(delay_s)
 
     def fork_thread(
         self,
@@ -693,6 +803,40 @@ class CodexProvider:
 
     def find_rollout_relpath(self, *, home_root: Path, thread_id: str) -> str | None:
         return _find_rollout_relpath(Path(home_root) / ".codex", thread_id)
+
+
+def _classify_transient_codex_error(sdk: object, exc: Exception) -> str | None:
+    is_retryable = getattr(sdk, "is_retryable_error", None)
+    if callable(is_retryable):
+        try:
+            if is_retryable(exc):
+                return "server_overloaded"
+        except Exception:
+            pass
+
+    message = str(exc).casefold()
+    if "selected model is at capacity" in message:
+        return "model_capacity"
+
+    non_retryable_markers = (
+        "content_filter",
+        "content filter",
+        "context window exceeded",
+        "usage limit exceeded",
+        "unauthorized",
+        "bad request",
+        "cyber policy",
+    )
+    if any(marker in message for marker in non_retryable_markers):
+        return None
+
+    exception_classifications = {
+        "ServerBusyError": "server_overloaded",
+        "RetryLimitExceededError": "server_overloaded",
+    }
+    if classification := exception_classifications.get(type(exc).__name__):
+        return classification
+    return None
 
 
 def _find_rollout_relpath(

@@ -3,7 +3,6 @@ from __future__ import annotations
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from time import monotonic
 
 from ..provider_contracts import (
@@ -137,6 +136,7 @@ class CodexProviderRunHandle:
                 "agent_id": self.request.agent_id,
                 "overwrite_developer_instructions": self.request.replace_developer_instructions,
                 "on_turn_started": self._on_turn_started,
+                "on_transient_retry": self._on_transient_retry,
             }
             if self.resume:
                 if self.request.session_locator is None:
@@ -193,6 +193,10 @@ class CodexProviderRunHandle:
             assert self._session is not None
             self._turn = ProviderTurnLocator(session=self._session, turn_id=turn_id)
             self._append_event("turn.started", data={"turn_id": turn_id})
+
+    def _on_transient_retry(self, evidence: dict[str, object]) -> None:
+        with self._lock:
+            self._append_event("turn.retry_scheduled", data=evidence)
 
     def _append_event(self, kind: str, *, terminal: bool = False, data: object | None = None) -> None:
         event = AgentEvent(

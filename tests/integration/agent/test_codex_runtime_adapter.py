@@ -39,8 +39,9 @@ class _ThreadUsage:
 class _CodexProviderStub:
     model = "gpt-example"
 
-    def __init__(self, *, block: bool = False) -> None:
+    def __init__(self, *, block: bool = False, emit_transient_retry: bool = False) -> None:
         self.block = block
+        self.emit_transient_retry = emit_transient_retry
         self.started = threading.Event()
         self.release = threading.Event()
         self.interrupt_calls: list[str] = []
@@ -51,6 +52,19 @@ class _CodexProviderStub:
         on_thread_started("thread-1")
         self.operation_order.append("turn.started")
         on_turn_started("thread-1", "turn-1")
+        if self.emit_transient_retry:
+            kwargs["on_transient_retry"](
+                {
+                    "classification": "model_capacity",
+                    "failed_attempt": 1,
+                    "next_attempt": 2,
+                    "max_attempts": 3,
+                    "delay_s": 0.25,
+                    "error_type": "RuntimeError",
+                    "turn_id": "turn-1",
+                }
+            )
+            on_turn_started("thread-1", "turn-2")
         self.started.set()
         if self.block:
             assert self.release.wait(timeout=5)
@@ -173,6 +187,26 @@ def test_codex_runtime_adapter_normalizes_result_usage_and_context(tmp_path: Pat
     assert result.context_after.used_tokens == 100
     assert result.context_after.context_window_tokens == 200
     assert result.final_text == "done"
+
+
+def test_codex_runtime_adapter_emits_transient_retry_evidence(tmp_path: Path) -> None:
+    provider = _CodexProviderStub(emit_transient_retry=True)
+    handle = CodexRuntimeAdapter(provider).start(_request(tmp_path))  # type: ignore[arg-type]
+
+    handle.wait_terminal(timeout_s=5)
+    events = handle.drain_events().events
+
+    retry = next(event for event in events if event.kind == "turn.retry_scheduled")
+    assert retry.data == {
+        "classification": "model_capacity",
+        "failed_attempt": 1,
+        "next_attempt": 2,
+        "max_attempts": 3,
+        "delay_s": 0.25,
+        "error_type": "RuntimeError",
+        "turn_id": "turn-1",
+    }
+    assert [event.kind for event in events].count("turn.started") == 2
 
 
 def test_codex_runtime_commits_new_session_home_before_first_turn(tmp_path: Path) -> None:

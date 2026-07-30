@@ -10,7 +10,7 @@ import pytest
 from agent_runtime_kit.agent.homes import ProviderHomeSpec
 from agent_runtime_kit.agent.models import AgentContextCompactionEvidenceError
 from agent_runtime_kit.agent.provider_contracts import ProviderRegistry, ProviderRunState
-from agent_runtime_kit.agent.providers.codex import CodexProvider
+from agent_runtime_kit.agent.providers.codex import CodexProvider, CodexTransientRetryPolicy
 from agent_runtime_kit.agent.providers.codex_bundle import build_codex_provider_bundle
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 
@@ -67,6 +67,7 @@ class FakeHighLevelThread:
     compact_callback = None
     status_type = "idle"
     last_turn_handle = None
+    turn_errors: list[Exception] = []
 
     def __init__(self, thread_id: str) -> None:
         self.id = thread_id
@@ -79,6 +80,8 @@ class FakeHighLevelThread:
         return SimpleNamespace(id=f"turn-{prompt}", prompt=prompt, run_kwargs=kwargs)
 
     def turn(self, prompt: str, **kwargs):
+        if type(self).turn_errors:
+            raise type(self).turn_errors.pop(0)
         handle = FakeHighLevelTurnHandle(self.id, prompt, kwargs)
         type(self).last_turn_handle = handle
         return handle
@@ -101,14 +104,23 @@ class FakeHighLevelThread:
 
 
 class FakeHighLevelTurnHandle:
+    run_errors: list[Exception] = []
+    run_calls = 0
+    turn_counts: dict[str, int] = {}
+
     def __init__(self, thread_id: str, prompt: str, run_kwargs: dict[str, object]) -> None:
         self.thread_id = thread_id
         self.prompt = prompt
         self.run_kwargs = run_kwargs
-        self.id = f"turn-{prompt}"
+        count = type(self).turn_counts.get(prompt, 0) + 1
+        type(self).turn_counts[prompt] = count
+        self.id = f"turn-{prompt}" if count == 1 else f"turn-{prompt}-retry-{count}"
         self.interrupted = False
 
     def run(self):
+        type(self).run_calls += 1
+        if type(self).run_errors:
+            raise type(self).run_errors.pop(0)
         if FakeHighLevelThread.run_started is not None:
             FakeHighLevelThread.run_started.set()
         if FakeHighLevelThread.run_release is not None:
@@ -129,6 +141,7 @@ class FakeClient:
         self.thread_resume_calls: list[dict[str, object]] = []
         self.high_level_resume_calls: list[dict[str, object]] = []
         self.turn_start_calls: list[dict[str, object]] = []
+        self.turn_start_count = 0
 
     def thread_resume(self, thread_id: str, params: dict[str, object] | None = None):
         self.thread_resume_calls.append({"thread_id": thread_id, "params": params})
@@ -140,10 +153,11 @@ class FakeClient:
         input_items: str,
         params: dict[str, object] | None = None,
     ):
+        self.turn_start_count += 1
         self.turn_start_calls.append(
             {"thread_id": thread_id, "input_items": input_items, "params": params}
         )
-        return SimpleNamespace(turn=SimpleNamespace(id="turn-1"))
+        return SimpleNamespace(turn=SimpleNamespace(id=f"turn-{self.turn_start_count}"))
 
 
 class FakeThread:
@@ -153,13 +167,23 @@ class FakeThread:
 
 
 class FakeTurnHandle:
+    run_errors: list[Exception] = []
+    run_calls = 0
+
     def __init__(self, client: FakeClient, thread_id: str, turn_id: str) -> None:
         self._client = client
         self.thread_id = thread_id
         self.id = turn_id
 
     def run(self):
+        type(self).run_calls += 1
+        if type(self).run_errors:
+            raise type(self).run_errors.pop(0)
         return SimpleNamespace(id=self.id, thread_id=self.thread_id, final_response="done")
+
+
+class TransportClosedError(RuntimeError):
+    pass
 
 
 class FakeSdk:
@@ -295,6 +319,249 @@ def test_codex_provider_interrupts_the_live_turn_handle(tmp_path: Path) -> None:
     assert not worker.is_alive()
     assert FakeHighLevelThread.last_turn_handle.interrupted is True
     assert provider.list_active_agents() == []
+
+
+def test_codex_provider_retries_capacity_failure_on_a_new_turn(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=3,
+            initial_delay_s=0,
+        )
+    )
+    FakeHighLevelTurnHandle.run_errors = [RuntimeError("Selected model is at capacity")]
+    retries: list[dict[str, object]] = []
+    started_turns: list[tuple[str, str]] = []
+
+    result = provider.start_thread(
+        home_id="worker",
+        home_root=tmp_path / "home",
+        env={"CODEX_HOME": str(tmp_path / "home" / ".codex")},
+        workdir=str(tmp_path),
+        prompt="capacity",
+        developer_instructions=None,
+        agent_id="agent-a",
+        on_turn_started=lambda thread_id, turn_id: started_turns.append((thread_id, turn_id)),
+        on_transient_retry=retries.append,
+    )
+
+    assert result.turn_result.id == "turn-capacity-retry-2"
+    assert FakeHighLevelTurnHandle.run_calls == 2
+    assert started_turns == [
+        ("thread-started", "turn-capacity"),
+        ("thread-started", "turn-capacity-retry-2"),
+    ]
+    assert retries == [
+        {
+            "classification": "model_capacity",
+            "failed_attempt": 1,
+            "next_attempt": 2,
+            "max_attempts": 3,
+            "delay_s": 0,
+            "error_type": "RuntimeError",
+            "turn_id": "turn-capacity",
+        }
+    ]
+
+
+def test_codex_provider_does_not_retry_mid_stream_disconnect(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=2,
+            initial_delay_s=0,
+        )
+    )
+    FakeHighLevelTurnHandle.run_errors = [
+        RuntimeError("response stream disconnected before completion")
+    ]
+
+    with pytest.raises(RuntimeError, match="response stream disconnected"):
+        provider.resume_thread(
+            home_id="worker",
+            home_root=tmp_path / "home",
+            env={"CODEX_HOME": str(tmp_path / "home" / ".codex")},
+            thread_id="thread-existing",
+            workdir=str(tmp_path),
+            prompt="stream",
+            developer_instructions=None,
+            agent_id="agent-a",
+        )
+
+    assert FakeHighLevelTurnHandle.run_calls == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError("connection reset by peer"),
+        TimeoutError("network connection lost"),
+        TransportClosedError("transport closed unexpectedly"),
+    ],
+)
+def test_codex_provider_does_not_retry_unknown_transport_terminal(
+    tmp_path: Path,
+    error: Exception,
+) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=3,
+            initial_delay_s=0,
+        )
+    )
+    FakeHighLevelTurnHandle.run_errors = [error]
+
+    with pytest.raises(type(error), match=str(error)):
+        provider.start_thread(
+            home_id="worker",
+            home_root=tmp_path / "home",
+            env={"CODEX_HOME": str(tmp_path / "home" / ".codex")},
+            workdir=str(tmp_path),
+            prompt="network",
+            developer_instructions=None,
+            agent_id="agent-a",
+        )
+
+    assert FakeHighLevelTurnHandle.run_calls == 1
+
+
+def test_codex_provider_retries_capacity_before_turn_handle_exists(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=2,
+            initial_delay_s=0,
+        )
+    )
+    FakeHighLevelThread.turn_errors = [RuntimeError("Selected model is at capacity")]
+    retries: list[dict[str, object]] = []
+
+    result = provider.start_thread(
+        home_id="worker",
+        home_root=tmp_path / "home",
+        env={"CODEX_HOME": str(tmp_path / "home" / ".codex")},
+        workdir=str(tmp_path),
+        prompt="capacity",
+        developer_instructions=None,
+        agent_id="agent-a",
+        on_transient_retry=retries.append,
+    )
+
+    assert result.turn_result.id == "turn-capacity"
+    assert retries[0]["turn_id"] is None
+
+
+def test_codex_provider_does_not_retry_ambiguous_connection_failure_during_turn_start(
+    tmp_path: Path,
+) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=3,
+            initial_delay_s=0,
+        )
+    )
+    FakeHighLevelThread.turn_errors = [ConnectionResetError("connection reset by peer")]
+
+    with pytest.raises(ConnectionResetError, match="connection reset by peer"):
+        provider.start_thread(
+            home_id="worker",
+            home_root=tmp_path / "home",
+            env={"CODEX_HOME": str(tmp_path / "home" / ".codex")},
+            workdir=str(tmp_path),
+            prompt="network",
+            developer_instructions=None,
+            agent_id="agent-a",
+        )
+
+    assert FakeHighLevelTurnHandle.run_calls == 0
+
+
+def test_codex_provider_does_not_retry_non_transient_turn_failure(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=3,
+            initial_delay_s=0,
+        )
+    )
+    FakeHighLevelTurnHandle.run_errors = [RuntimeError("invalid request")]
+
+    with pytest.raises(RuntimeError, match="invalid request"):
+        provider.start_thread(
+            home_id="worker",
+            home_root=tmp_path / "home",
+            env={"CODEX_HOME": str(tmp_path / "home" / ".codex")},
+            workdir=str(tmp_path),
+            prompt="invalid",
+            developer_instructions=None,
+            agent_id="agent-a",
+        )
+
+    assert FakeHighLevelTurnHandle.run_calls == 1
+
+
+def test_codex_provider_does_not_retry_content_filter_stream_failure(tmp_path: Path) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=3,
+            initial_delay_s=0,
+        )
+    )
+    FakeHighLevelTurnHandle.run_errors = [
+        RuntimeError(
+            "stream disconnected before completion: Incomplete response returned, "
+            "reason: content_filter"
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match="content_filter"):
+        provider.start_thread(
+            home_id="worker",
+            home_root=tmp_path / "home",
+            env={"CODEX_HOME": str(tmp_path / "home" / ".codex")},
+            workdir=str(tmp_path),
+            prompt="filtered",
+            developer_instructions=None,
+            agent_id="agent-a",
+        )
+
+    assert FakeHighLevelTurnHandle.run_calls == 1
+
+
+def test_codex_provider_stops_after_transient_retry_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=3,
+            initial_delay_s=0,
+        )
+    )
+    FakeHighLevelTurnHandle.run_errors = [
+        RuntimeError("Selected model is at capacity"),
+        RuntimeError("Selected model is at capacity"),
+        RuntimeError("Selected model is at capacity"),
+    ]
+    retries: list[dict[str, object]] = []
+
+    with pytest.raises(RuntimeError, match="Selected model is at capacity"):
+        provider.start_thread(
+            home_id="worker",
+            home_root=tmp_path / "home",
+            env={"CODEX_HOME": str(tmp_path / "home" / ".codex")},
+            workdir=str(tmp_path),
+            prompt="capacity",
+            developer_instructions=None,
+            agent_id="agent-a",
+            on_transient_retry=retries.append,
+        )
+
+    assert FakeHighLevelTurnHandle.run_calls == 3
+    assert [item["next_attempt"] for item in retries] == [2, 3]
 
 
 def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
@@ -517,6 +784,42 @@ def test_codex_provider_resume_instruction_overwrite_uses_fresh_run_codex(
     }
 
 
+def test_codex_provider_retries_capacity_during_instruction_overwrite(
+    tmp_path: Path,
+) -> None:
+    _reset_fake_codex()
+    provider = _provider(
+        transient_retry_policy=CodexTransientRetryPolicy(
+            max_attempts=2,
+            initial_delay_s=0,
+        )
+    )
+    home_root = tmp_path / "home"
+    FakeTurnHandle.run_errors = [RuntimeError("Selected model is at capacity")]
+    started_turns: list[tuple[str, str]] = []
+
+    result = provider.resume_thread(
+        home_id="worker",
+        home_root=home_root,
+        env={"CODEX_HOME": str(home_root / ".codex")},
+        thread_id="thread-existing",
+        workdir=str(tmp_path),
+        prompt="next prompt",
+        developer_instructions="new developer instruction",
+        agent_id="agent-a",
+        overwrite_developer_instructions=True,
+        on_turn_started=lambda thread_id, turn_id: started_turns.append((thread_id, turn_id)),
+    )
+
+    assert result.turn_result.id == "turn-2"
+    assert FakeTurnHandle.run_calls == 2
+    assert started_turns == [
+        ("thread-existing", "turn-1"),
+        ("thread-existing", "turn-2"),
+    ]
+    assert len(FakeCodex.created[1]._client.turn_start_calls) == 2
+
+
 def test_codex_provider_resume_without_instruction_overwrite_uses_default_resume(
     tmp_path: Path,
 ) -> None:
@@ -606,8 +909,11 @@ def test_codex_provider_compact_rejects_non_idle_thread(tmp_path: Path) -> None:
         )
 
 
-def _provider() -> CodexProvider:
-    provider = CodexProvider()
+def _provider(
+    *,
+    transient_retry_policy: CodexTransientRetryPolicy | None = None,
+) -> CodexProvider:
+    provider = CodexProvider(transient_retry_policy=transient_retry_policy)
     provider._sdk = lambda: FakeSdk  # type: ignore[method-assign]
     return provider
 
@@ -621,6 +927,12 @@ def _reset_fake_codex() -> None:
     FakeHighLevelThread.compact_callback = None
     FakeHighLevelThread.status_type = "idle"
     FakeHighLevelThread.last_turn_handle = None
+    FakeHighLevelThread.turn_errors = []
+    FakeHighLevelTurnHandle.run_errors = []
+    FakeHighLevelTurnHandle.run_calls = 0
+    FakeHighLevelTurnHandle.turn_counts = {}
+    FakeTurnHandle.run_errors = []
+    FakeTurnHandle.run_calls = 0
 
 
 def _append_rollout(path: Path, payload: dict[str, object]) -> None:
