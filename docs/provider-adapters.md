@@ -205,6 +205,16 @@ does not report completion until it has both persisted assistant completion
 evidence and a live idle status. Query results normalize OpenCode messages,
 parts, tools, request usage, model identity, and provider-reported cost.
 
+OpenCode expands remote MCP environment-header references when the server
+process starts. ARK therefore fingerprints the effective process environment
+for each isolated server. A read-only session bootstrap may reuse an existing
+server, but a run or context preflight carrying a new ARK runtime identity
+restarts the server when that fingerprint changed. This preserves the SQLite
+session while ensuring reused Agents send the current Flow, Step, and Agent
+headers instead of stale or missing identities. Later read-only queries reuse
+the identity-bound server and never interrupt an active turn merely to remove
+those headers.
+
 OpenCode `summarize` is exposed as model-backed OpenCode compaction. It is not
 OpenAI Responses native compaction. Fork creates a session-only branch and
 copies the source SQLite database into the target Agent runtime; it does not

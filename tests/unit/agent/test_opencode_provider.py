@@ -34,7 +34,11 @@ from agent_runtime_kit.agent.providers.opencode_bundle import build_opencode_pro
 from agent_runtime_kit.agent.providers.opencode_home import OpenCodeHomeRenderer
 from agent_runtime_kit.agent.providers.opencode_models import OpenCodeHomeOptions
 from agent_runtime_kit.agent.providers.opencode_query import OpenCodeQueryAdapter, project_turns
-from agent_runtime_kit.agent.providers.opencode_runtime import _message_id
+from agent_runtime_kit.agent.providers.opencode_runtime import (
+    OpenCodeRuntimeRegistry,
+    _environment_fingerprint,
+    _message_id,
+)
 from agent_runtime_kit.agent.providers.opencode_client import (
     OpenCodeClient,
     OpenCodeSseEvent,
@@ -52,6 +56,97 @@ class _StoppedRegistry:
 
     def close_agent(self, agent_id: str) -> None:
         del agent_id
+
+
+class _EnvironmentProcess:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+@dataclass
+class _EnvironmentServer:
+    directory: str
+    database_path: Path
+    environment_fingerprint: str
+    process: _EnvironmentProcess
+    closed: bool = False
+
+    def close(self) -> None:
+        self.closed = True
+        self.process.returncode = 0
+
+
+def test_opencode_registry_restarts_for_new_runtime_identity_but_not_admin_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = OpenCodeRuntimeRegistry(tmp_path / "runtime")
+    created: list[_EnvironmentServer] = []
+
+    def fake_start(request: ProviderRunRequest) -> _EnvironmentServer:
+        server = _EnvironmentServer(
+            directory=str(tmp_path.resolve()),
+            database_path=tmp_path / "opencode.db",
+            environment_fingerprint=_environment_fingerprint(request),
+            process=_EnvironmentProcess(),
+        )
+        created.append(server)
+        return server
+
+    monkeypatch.setattr(registry, "_start_server", fake_start)
+
+    def request(environment: dict[str, str]) -> ProviderRunRequest:
+        context = ProviderExecutionContext(
+            provider_type="opencode",
+            home_id="main",
+            home_root=tmp_path / "home",
+            process_environment=environment,
+            workdir=str(tmp_path),
+        )
+        return ProviderRunRequest(
+            agent_id="agent-1",
+            scope_id="scope-1",
+            agent_type="worker",
+            provider_type="opencode",
+            home_id="main",
+            prompt="",
+            workdir=str(tmp_path),
+            environment=environment,
+            execution_context=context,
+        )
+
+    admin = registry.ensure(request({"STATIC": "value"}))
+    first_turn = registry.ensure(
+        request(
+            {
+                "STATIC": "value",
+                "ARK_STEP_ID": "step-1",
+                "ARK_FLOW_ID": "flow-1",
+                "ARK_AGENT_ID": "agent-1",
+            }
+        )
+    )
+    assert admin.closed
+    assert first_turn is created[1]
+
+    assert registry.ensure(request({"STATIC": "value"})) is first_turn
+    assert not first_turn.closed
+
+    second_turn = registry.ensure(
+        request(
+            {
+                "STATIC": "value",
+                "ARK_STEP_ID": "step-2",
+                "ARK_FLOW_ID": "flow-1",
+                "ARK_AGENT_ID": "agent-1",
+            }
+        )
+    )
+    assert first_turn.closed
+    assert second_turn is created[2]
 
 
 def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Path) -> None:

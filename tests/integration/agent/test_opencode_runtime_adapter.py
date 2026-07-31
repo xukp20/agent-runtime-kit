@@ -214,6 +214,30 @@ def test_real_opencode_service_bootstraps_query_context_and_fork_after_restart(
         usage = second_service.inspect_agent_context(agent.agent_id)
         assert usage.session_id == session_id
         assert usage.available is False
+        read_bootstrap_server = second_registry.server_for_agent(agent.agent_id)
+        assert read_bootstrap_server is not None
+        turn_context = second_service.home_service.build_execution_context(
+            "opencode",
+            "restart-home",
+            run_env={
+                "ARK_STEP_ID": "step-callback",
+                "ARK_FLOW_ID": "flow-content",
+                "ARK_AGENT_ID": agent.agent_id,
+            },
+            workdir=str(tmp_path),
+        )
+        second_registry.prepare_session_access(
+            session,
+            agent_id=agent.agent_id,
+            execution_context=turn_context,
+        )
+        turn_server = second_registry.server_for_agent(agent.agent_id)
+        assert turn_server is not None
+        assert turn_server is not read_bootstrap_server
+        assert read_bootstrap_server.process.poll() is not None
+        assert turn_server.process.poll() is None
+        assert second_service.query_turns(agent.agent_id).items == ()
+        assert second_registry.server_for_agent(agent.agent_id) is turn_server
     finally:
         second_service.close()
 

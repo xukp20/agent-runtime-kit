@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import shutil
@@ -53,6 +54,7 @@ class OpenCodeServer:
     process: subprocess.Popen[str]
     client: OpenCodeClient
     password: str
+    environment_fingerprint: str
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -86,7 +88,14 @@ class OpenCodeRuntimeRegistry:
                         raise RuntimeError(
                             "OpenCode session locator database does not match active Agent runtime"
                         )
-                return existing
+                desired_environment = _environment_fingerprint(request)
+                if (
+                    existing.environment_fingerprint == desired_environment
+                    or not _has_ark_runtime_identity(request)
+                ):
+                    return existing
+                existing.close()
+                self._servers.pop(request.agent_id, None)
             server = self._start_server(request)
             if request.session_locator is not None:
                 native = parse_native_locator(request.session_locator.native_locator)
@@ -272,7 +281,33 @@ class OpenCodeRuntimeRegistry:
             process=process,
             client=client,
             password=password,
+            environment_fingerprint=_environment_fingerprint(request),
         )
+
+
+def _environment_fingerprint(request: ProviderRunRequest) -> str:
+    context = request.execution_context
+    if context is None:
+        raise ValueError("OpenCode runtime requires a ProviderExecutionContext")
+    environment = dict(context.process_environment)
+    environment.update(request.environment)
+    digest = hashlib.sha256()
+    for name, value in sorted(environment.items()):
+        digest.update(str(name).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _has_ark_runtime_identity(request: ProviderRunRequest) -> bool:
+    environment = (
+        dict(request.execution_context.process_environment)
+        if request.execution_context
+        else {}
+    )
+    environment.update(request.environment)
+    return all(environment.get(name) for name in ("ARK_STEP_ID", "ARK_FLOW_ID", "ARK_AGENT_ID"))
 
 
 class OpenCodeProviderRunHandle:
