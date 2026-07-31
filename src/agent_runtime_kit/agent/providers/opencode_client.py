@@ -8,7 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Callable, Iterator, Mapping
+from typing import Iterator, Mapping
 
 
 class OpenCodeClientError(RuntimeError):
@@ -114,8 +114,19 @@ class OpenCodeClient:
             raise OpenCodeClientError("OpenCode fork response is not an object")
         return value
 
-    def summarize(self, session_id: str, payload: Mapping[str, object]) -> object:
-        return self.request("POST", f"/session/{_segment(session_id)}/summarize", payload=payload)
+    def summarize(
+        self,
+        session_id: str,
+        payload: Mapping[str, object],
+        *,
+        timeout_s: float | None = None,
+    ) -> object:
+        return self.request(
+            "POST",
+            f"/session/{_segment(session_id)}/summarize",
+            payload=payload,
+            timeout_s=timeout_s,
+        )
 
     def reply_permission(self, permission_id: str, payload: Mapping[str, object]) -> object:
         return self.request("POST", f"/permission/{_segment(permission_id)}/reply", payload=payload)

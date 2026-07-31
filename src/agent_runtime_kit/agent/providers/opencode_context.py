@@ -10,6 +10,8 @@ from ..provider_contracts import (
     CapabilitySupport,
     ContextUsageCategory,
     ModelBackendIdentity,
+    ProviderExecutionContext,
+    ProviderSessionLocator,
     ProviderContextCompactionRequest,
     ProviderContextCompactionResult,
     ProviderContextQuery,
@@ -20,7 +22,7 @@ from ..provider_contracts import (
     build_provider_payload,
 )
 from ..store_utils import utc_now_iso
-from .opencode_client import OpenCodeClientError
+from .opencode_client import OpenCodeClient, OpenCodeClientError
 from .opencode_models import ADAPTER_VERSION, PROVIDER_TYPE
 from .opencode_query import OpenCodeQueryAdapter
 from .opencode_runtime import OpenCodeRuntimeRegistry
@@ -39,13 +41,17 @@ class OpenCodeContextAdapter:
         self.query = query
 
     def inspect(self, request: ProviderContextQuery) -> ProviderContextUsage:
+        client = self._client(
+            request.session,
+            agent_id=request.agent_id,
+            execution_context=request.execution_context,
+        )
         usage = self.query.read_usage(
             ProviderUsageQuery(session=request.session, latest=True)
         )
         tokens = usage.token_usage
         used = _observed_input(tokens)
         identity = request.session.backend_identity
-        client = self.registry.client_for_locator(request.session)
         try:
             limits = _model_limits(client.list_providers(), identity)
         except OpenCodeClientError:
@@ -118,7 +124,11 @@ class OpenCodeContextAdapter:
 
     def compact(self, request: ProviderContextCompactionRequest) -> ProviderContextCompactionResult:
         started = utc_now_iso()
-        client = self.registry.client_for_locator(request.session)
+        client = self._client(
+            request.session,
+            agent_id=request.agent_id,
+            execution_context=request.execution_context,
+        )
         baseline = client.list_messages(request.session.session_id)
         operation_id = f"compact-{uuid.uuid4().hex}"
         if request.on_started is not None:
@@ -136,6 +146,7 @@ class OpenCodeContextAdapter:
                 "modelID": identity.effective_model,
                 "auto": False,
             },
+            timeout_s=request.timeout_s or 300,
         )
         deadline = time.monotonic() + (request.timeout_s or 300)
         latest: list[object] = baseline
@@ -150,7 +161,13 @@ class OpenCodeContextAdapter:
                     reason="OpenCode persisted a compaction part and completed summary message",
                     started_at=started,
                     completed_at=utc_now_iso(),
-                    usage_after=self.inspect(ProviderContextQuery(session=request.session)),
+                    usage_after=self.inspect(
+                        ProviderContextQuery(
+                            session=request.session,
+                            agent_id=request.agent_id,
+                            execution_context=request.execution_context,
+                        )
+                    ),
                     provider_operation_id=operation_id,
                     provider_payload=build_provider_payload(
                         provider_type=PROVIDER_TYPE,
@@ -175,7 +192,11 @@ class OpenCodeContextAdapter:
         if not isinstance(request.baseline, Mapping):
             return None
         before = set(str(value) for value in request.baseline.get("message_ids", []))
-        client = self.registry.client_for_locator(request.session)
+        client = self._client(
+            request.session,
+            agent_id=request.agent_id,
+            execution_context=request.execution_context,
+        )
         messages = client.list_messages(request.session.session_id)
         changed = bool(_message_ids(messages) - before)
         completed = changed and _has_completed_summary(messages, [])
@@ -194,6 +215,21 @@ class OpenCodeContextAdapter:
             completed_at=now,
             provider_operation_id=request.operation_id,
         )
+
+    def _client(
+        self,
+        session: ProviderSessionLocator,
+        *,
+        agent_id: str | None,
+        execution_context: ProviderExecutionContext | None,
+    ) -> OpenCodeClient:
+        if agent_id is not None and execution_context is not None:
+            return self.registry.ensure_client_for_locator(
+                session,
+                agent_id=agent_id,
+                execution_context=execution_context,
+            )
+        return self.registry.client_for_locator(session)
 
 
 def _observed_input(tokens: TokenUsage) -> int | None:

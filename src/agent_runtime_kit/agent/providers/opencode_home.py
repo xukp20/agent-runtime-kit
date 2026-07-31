@@ -72,6 +72,7 @@ class OpenCodeHomeRenderer:
         config = _deep_merge(config, _tools_config(spec.tools))
         config.update(
             {
+                "$schema": "https://opencode.ai/config.json",
                 "snapshot": False,
                 "share": "disabled",
                 "autoupdate": False,

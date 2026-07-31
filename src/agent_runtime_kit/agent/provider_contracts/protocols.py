@@ -146,6 +146,20 @@ class ProviderRuntimeAdapter(Protocol):
     def close(self) -> None: ...
 
 
+class ProviderSessionAccessAdapter(Protocol):
+    """Optional lifecycle hook for providers whose read APIs require a live session service."""
+
+    provider_type: str
+
+    def prepare_session_access(
+        self,
+        locator: ProviderSessionLocator,
+        *,
+        agent_id: str,
+        execution_context: ProviderExecutionContext,
+    ) -> None: ...
+
+
 class ProviderQueryAdapter(Protocol):
     provider_type: str
 

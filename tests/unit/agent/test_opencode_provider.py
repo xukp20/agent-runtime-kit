@@ -35,7 +35,11 @@ from agent_runtime_kit.agent.providers.opencode_home import OpenCodeHomeRenderer
 from agent_runtime_kit.agent.providers.opencode_models import OpenCodeHomeOptions
 from agent_runtime_kit.agent.providers.opencode_query import OpenCodeQueryAdapter, project_turns
 from agent_runtime_kit.agent.providers.opencode_runtime import _message_id
-from agent_runtime_kit.agent.providers.opencode_client import OpenCodeSseEvent, _safe_body
+from agent_runtime_kit.agent.providers.opencode_client import (
+    OpenCodeClient,
+    OpenCodeSseEvent,
+    _safe_body,
+)
 from agent_runtime_kit.agent.providers.opencode_context import OpenCodeContextAdapter, _model_limits
 from agent_runtime_kit.agent.providers.opencode_runtime import OpenCodeProviderRunHandle
 from agent_runtime_kit.agent.skills import SkillSpec
@@ -95,6 +99,7 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
         home_root,
     )
     config = json.loads((home_root / "opencode.json").read_text())
+    assert config["$schema"] == "https://opencode.ai/config.json"
     assert config["snapshot"] is False
     assert config["share"] == "disabled"
     assert config["plugin"] == []
@@ -368,6 +373,38 @@ def test_opencode_error_body_redacts_credentials() -> None:
     assert "Bearer private" not in value
 
 
+def test_opencode_summarize_propagates_requested_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OpenCodeClient(
+        "http://127.0.0.1:1",
+        password="test",
+        directory="/tmp",
+    )
+    observed: dict[str, object] = {}
+
+    def request(method, path, *, payload=None, query=None, timeout_s=None):  # noqa: ANN001, ANN202
+        observed.update(
+            method=method,
+            path=path,
+            payload=payload,
+            query=query,
+            timeout_s=timeout_s,
+        )
+        return True
+
+    monkeypatch.setattr(client, "request", request)
+
+    assert client.summarize("session", {"auto": False}, timeout_s=180) is True
+    assert observed == {
+        "method": "POST",
+        "path": "/session/session/summarize",
+        "payload": {"auto": False},
+        "query": None,
+        "timeout_s": 180,
+    }
+
+
 def test_opencode_context_resolves_live_model_limits_without_provider_secrets() -> None:
     identity = ModelBackendIdentity(
         api_provider="beeapi-responses",
@@ -452,6 +489,92 @@ def test_opencode_context_resolves_live_model_limits_without_provider_secrets() 
     }
     assert "must-not-be-retained" not in repr(usage.provider_payload)
     assert _model_limits(provider_payload, replace(identity, requested_model="unknown")) == {}
+
+
+def test_opencode_context_bootstraps_inactive_existing_session(tmp_path: Path) -> None:
+    client_messages = [
+        {
+            "info": {"id": "msg_user", "role": "user", "time": {"created": 1000}},
+            "parts": [{"id": "p_user", "type": "text", "text": "hello"}],
+        },
+        {
+            "info": {
+                "id": "msg_assistant",
+                "role": "assistant",
+                "parentID": "msg_user",
+                "providerID": "opencode-go",
+                "modelID": "deepseek-v4-flash",
+                "finish": "stop",
+                "tokens": {"input": 10},
+                "time": {"created": 1100, "completed": 1200},
+            },
+            "parts": [{"id": "p_text", "type": "text", "text": "done"}],
+        },
+    ]
+
+    class _Client:
+        def list_messages(self, session_id: str) -> list[object]:
+            assert session_id == "ses_restart"
+            return client_messages
+
+        def list_providers(self) -> dict[str, object]:
+            return {"all": []}
+
+    class _RestartRegistry:
+        def __init__(self) -> None:
+            self.active = False
+            self.ensure_calls = 0
+            self.client = _Client()
+
+        def ensure_client_for_locator(self, locator, *, agent_id, execution_context):  # noqa: ANN001, ANN201
+            assert locator.session_id == "ses_restart"
+            assert agent_id == "agent-restart"
+            assert execution_context.home_id == "main"
+            self.active = True
+            self.ensure_calls += 1
+            return self.client
+
+        def client_for_locator(self, locator):  # noqa: ANN001, ANN201
+            assert locator.session_id == "ses_restart"
+            if not self.active:
+                raise RuntimeError("server is inactive")
+            return self.client
+
+    registry = _RestartRegistry()
+    session = ProviderSessionLocator(
+        provider_type="opencode",
+        session_id="ses_restart",
+        home_id="main",
+        created_at="2026-08-01T00:00:00Z",
+        native_locator={
+            "agent_id": "agent-restart",
+            "directory": str(tmp_path),
+            "database_path": str(tmp_path / "runtime" / "opencode.db"),
+            "runtime_relpath": "providers/opencode/agents/agent-restart",
+        },
+    )
+    context = ProviderExecutionContext(
+        provider_type="opencode",
+        home_id="main",
+        home_root=tmp_path / "home",
+        process_environment={},
+        workdir=str(tmp_path),
+    )
+
+    usage = OpenCodeContextAdapter(
+        registry=registry,
+        query=OpenCodeQueryAdapter(registry.client_for_locator),
+    ).inspect(
+        ProviderContextQuery(
+            session=session,
+            agent_id="agent-restart",
+            execution_context=context,
+        )
+    )
+
+    assert registry.ensure_calls == 1
+    assert usage.session_id == "ses_restart"
+    assert usage.used_tokens == 10
 
 
 class _InteractionClient:

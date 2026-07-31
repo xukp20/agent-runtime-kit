@@ -62,6 +62,7 @@ from .protocols import (
     ProviderQueryAdapter,
     ProviderRunHandle,
     ProviderRuntimeAdapter,
+    ProviderSessionAccessAdapter,
 )
 from .query import (
     AgentSessionView,

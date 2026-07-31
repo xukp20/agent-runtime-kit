@@ -20,14 +20,18 @@ from agent_runtime_kit.agent.provider_contracts import (
     ProviderRunOptions,
     ProviderRunRequest,
     ProviderRegistry,
+    ProviderSessionLocator,
     ProviderTurnQuery,
 )
 from agent_runtime_kit.agent.providers.opencode_artifacts import OpenCodeArtifactAdapter
 from agent_runtime_kit.agent.providers.opencode_bundle import build_opencode_provider_bundle
 from agent_runtime_kit.agent.providers.opencode_context import OpenCodeContextAdapter
 from agent_runtime_kit.agent.providers.opencode_home import OpenCodeHomeRenderer
-from agent_runtime_kit.agent.providers.opencode_models import OpenCodeHomeOptions
-from agent_runtime_kit.agent.providers.opencode_models import OpenCodeRunOptions
+from agent_runtime_kit.agent.providers.opencode_models import (
+    OpenCodeHomeOptions,
+    OpenCodeNativeLocator,
+    OpenCodeRunOptions,
+)
 from agent_runtime_kit.agent.providers.opencode_query import OpenCodeQueryAdapter
 from agent_runtime_kit.agent.providers.opencode_runtime import (
     OpenCodeRuntimeAdapter,
@@ -106,6 +110,134 @@ def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Pat
         registry.close()
 
 
+def test_real_opencode_service_bootstraps_query_context_and_fork_after_restart(
+    tmp_path: Path,
+) -> None:
+    binary = os.environ.get("ARK_OPENCODE_TEST_BINARY")
+    if not binary:
+        pytest.skip("set ARK_OPENCODE_TEST_BINARY to an OpenCode 1.18.4 executable")
+    runtime_root = tmp_path / "runtime"
+    agent_types = AgentTypeRegistry()
+    agent_types.register(_OpenCodeRealAgentType())
+
+    first_bundle = build_opencode_provider_bundle(
+        runtime_root=runtime_root,
+        binary_path=binary,
+    )
+    first_service = AgentService(
+        runtime_root,
+        agent_types=agent_types,
+        provider_registry=ProviderRegistry((first_bundle,)),
+    )
+    first_service.create_home(
+        ProviderHomeSpec(
+            provider_type="opencode",
+            home_id="restart-home",
+            base_config=BaseConfigSource(
+                mapping={"model": "opencode-go/deepseek-v4-flash"}
+            ),
+            provider_options=OpenCodeHomeOptions(binary_path=binary),
+        )
+    )
+    agent = first_service.create_agent(
+        "scope-restart",
+        "OpenCodeRealAgent",
+        provider_type="opencode",
+        home_id="restart-home",
+    )
+    first_registry = first_bundle.session_access
+    assert isinstance(first_registry, OpenCodeRuntimeRegistry)
+    execution_context = first_service.home_service.build_execution_context(
+        "opencode",
+        "restart-home",
+        run_env={},
+        workdir=str(tmp_path),
+    )
+    server = first_registry.ensure(
+        ProviderRunRequest(
+            agent_id=agent.agent_id,
+            scope_id=agent.scope_id,
+            agent_type=agent.agent_type,
+            provider_type="opencode",
+            home_id="restart-home",
+            prompt="not submitted",
+            workdir=str(tmp_path),
+            execution_context=execution_context,
+        )
+    )
+    session_id = str(server.client.create_session()["id"])
+    session = ProviderSessionLocator(
+        provider_type="opencode",
+        session_id=session_id,
+        home_id="restart-home",
+        created_at="2026-08-01T00:00:00Z",
+        backend_identity=ModelBackendIdentity(
+            api_provider="opencode-go",
+            api_mode="chat_completions",
+            requested_model="deepseek-v4-flash",
+        ),
+        native_locator=OpenCodeNativeLocator(
+            agent_id=agent.agent_id,
+            directory=str(tmp_path.resolve()),
+            database_path=str(server.database_path),
+            runtime_relpath=str(server.runtime_root.relative_to(runtime_root)),
+        ).as_dict(),
+    )
+    first_service.store.update_session_locators(
+        agent.agent_id,
+        session_locator=session,
+    )
+    first_service.close()
+
+    second_bundle = build_opencode_provider_bundle(
+        runtime_root=runtime_root,
+        binary_path=binary,
+    )
+    second_service = AgentService(
+        runtime_root,
+        agent_types=agent_types,
+        provider_registry=ProviderRegistry((second_bundle,)),
+    )
+    second_registry = second_bundle.session_access
+    assert isinstance(second_registry, OpenCodeRuntimeRegistry)
+    try:
+        assert second_registry.server_for_agent(agent.agent_id) is None
+        preflight = second_service.compact_agent_if_needed(
+            agent.agent_id,
+            threshold=0.80,
+            timeout_s=30,
+        )
+        assert preflight.status.value == "skipped"
+        assert preflight.reason == "OpenCode did not report latest input usage"
+        assert second_registry.server_for_agent(agent.agent_id) is not None
+        assert second_service.query_turns(agent.agent_id).items == ()
+        usage = second_service.inspect_agent_context(agent.agent_id)
+        assert usage.session_id == session_id
+        assert usage.available is False
+    finally:
+        second_service.close()
+
+    third_bundle = build_opencode_provider_bundle(
+        runtime_root=runtime_root,
+        binary_path=binary,
+    )
+    third_service = AgentService(
+        runtime_root,
+        agent_types=agent_types,
+        provider_registry=ProviderRegistry((third_bundle,)),
+    )
+    third_registry = third_bundle.session_access
+    assert isinstance(third_registry, OpenCodeRuntimeRegistry)
+    try:
+        assert third_registry.server_for_agent(agent.agent_id) is None
+        forked = third_service.fork_agent(agent.agent_id)
+        assert forked.session_locator is not None
+        assert forked.session_locator.session_id != session_id
+        assert third_registry.server_for_agent(agent.agent_id) is not None
+    finally:
+        third_service.close()
+
+
 def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
     binary = os.environ.get("ARK_OPENCODE_TEST_BINARY")
     auth_path = os.environ.get("ARK_OPENCODE_ACCOUNT_AUTH_JSON")
@@ -141,6 +273,7 @@ def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
     context = renderer.build_execution_context(record, run_env={}, workdir=str(tmp_path))
     registry = OpenCodeRuntimeRegistry(runtime_root, binary_path=binary)
     runtime = OpenCodeRuntimeAdapter(registry)
+    active_runtime = runtime
     request = ProviderRunRequest(
         agent_id="agent-account",
         scope_id="scope-real",
@@ -180,7 +313,6 @@ def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
         assert isolated_auth.is_file()
         assert isolated_auth.stat().st_mode & 0o777 == 0o600
 
-        query = OpenCodeQueryAdapter(registry.client_for_locator)
         artifacts = OpenCodeArtifactAdapter(runtime_root=runtime_root, registry=registry)
         snapshot = artifacts.capture(
             ArtifactCaptureRequest(
@@ -190,7 +322,40 @@ def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
             )
         )
         assert all(entry.snapshot_relpath != "auth.json" for entry in snapshot.manifest.entries)
-        second = runtime.resume(
+
+        runtime.close()
+        restarted_registry = OpenCodeRuntimeRegistry(runtime_root, binary_path=binary)
+        restarted_runtime = OpenCodeRuntimeAdapter(restarted_registry)
+        active_runtime = restarted_runtime
+        restarted_query = OpenCodeQueryAdapter(restarted_registry.client_for_locator)
+        restarted_context = OpenCodeContextAdapter(
+            registry=restarted_registry,
+            query=restarted_query,
+        )
+        usage = restarted_context.inspect(
+            ProviderContextQuery(
+                session=result.session_locator,
+                agent_id="agent-account",
+                execution_context=context,
+            )
+        )
+        assert usage.session_id == result.session_locator.session_id
+        assert restarted_registry.server_for_agent("agent-account") is not None
+        compact = restarted_context.compact(
+            ProviderContextCompactionRequest(
+                session=result.session_locator,
+                trigger="account_auth_restart_test",
+                timeout_s=180,
+                agent_id="agent-account",
+                execution_context=context,
+            )
+        )
+        assert compact.status == "completed"
+        assert restarted_query.list_turns(
+            ProviderTurnQuery(session=result.session_locator)
+        ).items
+
+        second = restarted_runtime.resume(
             replace(
                 request,
                 prompt="Reply with exactly ACCOUNT_SECOND and no other text.",
@@ -199,14 +364,18 @@ def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
         ).wait_terminal(190)
         assert "ACCOUNT_SECOND" in (second.final_text or "")
 
-        restored = artifacts.restore(
+        restored_artifacts = OpenCodeArtifactAdapter(
+            runtime_root=runtime_root,
+            registry=restarted_registry,
+        )
+        restored = restored_artifacts.restore(
             ArtifactRestoreRequest(
                 manifest=snapshot.manifest,
                 snapshot_root=snapshot.snapshot_root,
             )
         )
         assert restored.restored
-        third = runtime.resume(
+        third = restarted_runtime.resume(
             replace(
                 request,
                 prompt="Reply with exactly ACCOUNT_RESTORED and no other text.",
@@ -214,24 +383,16 @@ def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
             )
         ).wait_terminal(190)
         assert "ACCOUNT_RESTORED" in (third.final_text or "")
-        turns = query.list_turns(ProviderTurnQuery(session=third.session_locator)).items
+        turns = restarted_query.list_turns(
+            ProviderTurnQuery(session=third.session_locator)
+        ).items
         texts = [turn.result.final_text for turn in turns if turn.result is not None]
         assert any(text and "OPENCODE_ACCOUNT_OK" in text for text in texts)
         assert any(text and "ACCOUNT_RESTORED" in text for text in texts)
         assert not any(text and "ACCOUNT_SECOND" in text for text in texts)
 
-        context_adapter = OpenCodeContextAdapter(registry=registry, query=query)
-        compact = context_adapter.compact(
-            ProviderContextCompactionRequest(
-                session=third.session_locator,
-                trigger="account_auth_real_test",
-                timeout_s=180,
-                agent_id="agent-account",
-            )
-        )
-        assert compact.status == "completed"
     finally:
-        runtime.close()
+        active_runtime.close()
 
 
 def test_real_opencode_deepseek_run_and_query(tmp_path: Path) -> None:

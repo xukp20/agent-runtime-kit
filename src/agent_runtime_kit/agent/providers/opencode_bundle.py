@@ -130,6 +130,11 @@ def build_opencode_provider_bundle(
             capability=key,
             status=CapabilityStatus.NATIVE,
             available=True,
+            limitations=(
+                ("requires a known Agent session locator; ARK starts its isolated OpenCode server on demand",)
+                if key in _LIVE_SESSION_ACCESS_CAPABILITIES
+                else ()
+            ),
             evidence_version="opencode-1.18.4",
         )
         for key in native
@@ -150,7 +155,7 @@ def build_opencode_provider_bundle(
         capability=CapabilityKey.CONTROL_FORK_FROM_TURN,
         status=CapabilityStatus.UNSUPPORTED,
         available=False,
-        reason="first version only forks the latest complete session",
+        reason="the adapter only forks the latest complete session",
         evidence_version="opencode-adapter-v1",
     )
     supports[CapabilityKey.ARTIFACT_IN_FLIGHT_STATE] = CapabilitySupport(
@@ -164,7 +169,7 @@ def build_opencode_provider_bundle(
         capability=CapabilityKey.ARTIFACT_OFFLINE_QUERY,
         status=CapabilityStatus.UNSUPPORTED,
         available=False,
-        reason="first version queries through a live isolated OpenCode server",
+        reason="queries use an isolated OpenCode server started on demand",
         evidence_version="opencode-adapter-v1",
     )
     capabilities = ProviderCapabilities(provider_type=PROVIDER_TYPE, supports=supports)
@@ -189,6 +194,7 @@ def build_opencode_provider_bundle(
         query=query,
         context=OpenCodeContextAdapter(registry=registry, query=query),
         artifacts=OpenCodeArtifactAdapter(runtime_root=runtime_root, registry=registry),
+        session_access=registry,
     )
 
 
@@ -196,6 +202,18 @@ _MODEL_CAPABILITIES = {
     CapabilityKey.MODEL_RESPONSES,
     CapabilityKey.MODEL_CHAT_COMPLETIONS,
     CapabilityKey.MODEL_OTHER_API,
+}
+
+_LIVE_SESSION_ACCESS_CAPABILITIES = {
+    CapabilityKey.SESSION_READ,
+    CapabilityKey.CONTROL_FORK,
+    CapabilityKey.QUERY_TURNS,
+    CapabilityKey.QUERY_EVENTS,
+    CapabilityKey.QUERY_CONTENT,
+    CapabilityKey.QUERY_TOOL_CALLS,
+    CapabilityKey.QUERY_REQUEST_USAGE,
+    CapabilityKey.QUERY_SESSION_USAGE,
+    CapabilityKey.QUERY_CONTEXT_USAGE,
 }
 
 

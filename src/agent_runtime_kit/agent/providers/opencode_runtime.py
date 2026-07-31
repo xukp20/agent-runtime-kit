@@ -23,6 +23,7 @@ from ..provider_contracts import (
     ProviderEventBatch,
     ProviderForkRequest,
     ProviderForkResult,
+    ProviderExecutionContext,
     ProviderRunRequest,
     ProviderRunState,
     ProviderSessionLocator,
@@ -65,6 +66,8 @@ class OpenCodeServer:
 
 
 class OpenCodeRuntimeRegistry:
+    provider_type = PROVIDER_TYPE
+
     def __init__(self, runtime_root: Path, *, binary_path: str | Path = "opencode") -> None:
         self.runtime_root = Path(runtime_root)
         self.binary_path = str(binary_path)
@@ -77,8 +80,21 @@ class OpenCodeRuntimeRegistry:
             if existing is not None and existing.process.poll() is None:
                 if request.workdir and Path(existing.directory).resolve() != Path(request.workdir).resolve():
                     raise ValueError("OpenCode Agent runtime cannot change workdir while its server is active")
+                if request.session_locator is not None:
+                    native = parse_native_locator(request.session_locator.native_locator)
+                    if str(existing.database_path) != native.database_path:
+                        raise RuntimeError(
+                            "OpenCode session locator database does not match active Agent runtime"
+                        )
                 return existing
             server = self._start_server(request)
+            if request.session_locator is not None:
+                native = parse_native_locator(request.session_locator.native_locator)
+                if str(server.database_path) != native.database_path:
+                    server.close()
+                    raise RuntimeError(
+                        "OpenCode session locator database does not match Agent runtime"
+                    )
             self._servers[request.agent_id] = server
             return server
 
@@ -91,6 +107,56 @@ class OpenCodeRuntimeRegistry:
         if str(server.database_path) != native.database_path:
             raise RuntimeError("OpenCode locator database does not match active Agent runtime")
         return server.client
+
+    def ensure_client_for_locator(
+        self,
+        locator: ProviderSessionLocator,
+        *,
+        agent_id: str,
+        execution_context: ProviderExecutionContext,
+    ) -> OpenCodeClient:
+        native = parse_native_locator(locator.native_locator)
+        if agent_id != native.agent_id:
+            raise ValueError("OpenCode context Agent does not match session locator")
+        if (
+            execution_context.provider_type != PROVIDER_TYPE
+            or execution_context.home_id != locator.home_id
+        ):
+            raise ValueError("OpenCode context does not match session locator")
+        context_workdir = execution_context.workdir
+        if context_workdir and Path(str(context_workdir)).resolve() != Path(native.directory).resolve():
+            raise ValueError("OpenCode context workdir does not match session locator")
+        server = self.ensure(
+            ProviderRunRequest(
+                agent_id=agent_id,
+                scope_id="provider-session-bootstrap",
+                agent_type="provider-session-bootstrap",
+                provider_type=PROVIDER_TYPE,
+                home_id=locator.home_id,
+                prompt="",
+                session_locator=locator,
+                workdir=native.directory,
+                environment=execution_context.process_environment,
+                model_overrides=execution_context.resolved_defaults,
+                execution_context=execution_context,
+            )
+        )
+        if str(server.database_path) != native.database_path:
+            raise RuntimeError("OpenCode locator database does not match bootstrapped Agent runtime")
+        return server.client
+
+    def prepare_session_access(
+        self,
+        locator: ProviderSessionLocator,
+        *,
+        agent_id: str,
+        execution_context: ProviderExecutionContext,
+    ) -> None:
+        self.ensure_client_for_locator(
+            locator,
+            agent_id=agent_id,
+            execution_context=execution_context,
+        )
 
     def server_for_agent(self, agent_id: str) -> OpenCodeServer | None:
         with self._lock:
@@ -578,7 +644,13 @@ class OpenCodeRuntimeAdapter:
 
     def fork(self, request: ProviderForkRequest) -> ProviderForkResult:
         source_native = parse_native_locator(request.source_session.native_locator)
-        source_client = self.registry.client_for_locator(request.source_session)
+        if request.execution_context is None:
+            raise ValueError("OpenCode fork requires ProviderExecutionContext")
+        source_client = self.registry.ensure_client_for_locator(
+            request.source_session,
+            agent_id=request.source_agent_id,
+            execution_context=request.execution_context,
+        )
         forked = source_client.fork(request.source_session.session_id, {})
         target_id = str(forked.get("id") or "")
         if not target_id:

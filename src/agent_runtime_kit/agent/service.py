@@ -1466,6 +1466,17 @@ class AgentService:
         bundle = self._provider_bundle(agent.provider_type)
         if bundle.query is None:
             raise RuntimeError(f"provider does not support standard query: {agent.provider_type}")
+        if bundle.session_access is not None:
+            bundle.session_access.prepare_session_access(
+                agent.session_locator,
+                agent_id=agent.agent_id,
+                execution_context=self.home_service.build_execution_context(
+                    agent.provider_type,
+                    agent.home_id,
+                    run_env=None,
+                    workdir=None,
+                ),
+            )
         return bundle, agent.session_locator
 
     def _provider_session_locator(self, agent: Agent) -> ProviderSessionLocator:

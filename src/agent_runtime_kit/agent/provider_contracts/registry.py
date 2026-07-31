@@ -10,6 +10,7 @@ from .protocols import (
     ProviderHomeRenderer,
     ProviderQueryAdapter,
     ProviderRuntimeAdapter,
+    ProviderSessionAccessAdapter,
 )
 
 
@@ -22,6 +23,7 @@ class AgentProviderBundle:
     query: ProviderQueryAdapter | None = None
     context: ProviderContextAdapter | None = None
     artifacts: ProviderArtifactAdapter | None = None
+    session_access: ProviderSessionAccessAdapter | None = None
 
     @property
     def provider_type(self) -> str:
@@ -82,6 +84,7 @@ class ProviderRegistry:
             ("query", bundle.query),
             ("context", bundle.context),
             ("artifacts", bundle.artifacts),
+            ("session_access", bundle.session_access),
         ):
             if adapter is None:
                 continue
