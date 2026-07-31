@@ -594,8 +594,13 @@ class AgentSnapshotService:
         if current_scope_dir.exists():
             shutil.copytree(current_scope_dir, files_root / "scopes" / scope_key)
         provider_artifacts: list[dict[str, object]] = []
+        provider_artifact_owners: dict[str, str] = {}
         for agent in self.store.list_agents(scope_id=scope_id):
-            artifact_manifest = self._capture_provider_artifacts(agent, files_root)
+            artifact_manifest = self._capture_provider_artifacts(
+                agent,
+                files_root,
+                provider_artifact_owners=provider_artifact_owners,
+            )
             if artifact_manifest is not None:
                 provider_artifacts.append(
                     {
@@ -704,6 +709,8 @@ class AgentSnapshotService:
         self,
         agent: Any,
         files_root: Path,
+        *,
+        provider_artifact_owners: dict[str, str] | None = None,
     ) -> ProviderArtifactManifest | None:
         session = self._provider_session(agent)
         if session is None:
@@ -719,6 +726,15 @@ class AgentSnapshotService:
                     f"provider artifacts are not stable for {agent.agent_id}: "
                     f"{stability.reason or 'unknown'}"
                 )
+            described = adapter.describe(
+                ArtifactDescribeRequest(session=session, agent_id=str(agent.agent_id))
+            )
+            owners = provider_artifact_owners if provider_artifact_owners is not None else {}
+            self._reserve_provider_artifact_paths(
+                agent_id=str(agent.agent_id),
+                manifest=described,
+                owners=owners,
+            )
             captured = adapter.capture(
                 ArtifactCaptureRequest(
                     session=session,
@@ -728,8 +744,44 @@ class AgentSnapshotService:
             )
             if not captured.manifest.stable:
                 raise RuntimeError(f"provider returned an unstable artifact manifest: {agent.agent_id}")
+            described_paths = {
+                (entry.artifact_id, entry.snapshot_relpath) for entry in described.entries
+            }
+            captured_paths = {
+                (entry.artifact_id, entry.snapshot_relpath) for entry in captured.manifest.entries
+            }
+            if captured_paths != described_paths:
+                raise RuntimeError(
+                    f"provider artifact paths changed during capture: {agent.agent_id}"
+                )
             return captured.manifest
         raise RuntimeError(f"provider does not support artifact snapshot: {agent.provider_type}")
+
+    @staticmethod
+    def _reserve_provider_artifact_paths(
+        *,
+        agent_id: str,
+        manifest: ProviderArtifactManifest,
+        owners: dict[str, str],
+    ) -> None:
+        pending: dict[str, str] = {}
+        for entry in manifest.entries:
+            if entry.snapshot_relpath is None:
+                continue
+            relpath = Path(entry.snapshot_relpath)
+            if relpath.is_absolute() or ".." in relpath.parts:
+                raise RuntimeError(
+                    f"provider artifact snapshot path is unsafe: {agent_id}/{entry.artifact_id}"
+                )
+            normalized = relpath.as_posix()
+            owner = pending.get(normalized) or owners.get(normalized)
+            if owner is not None:
+                raise RuntimeError(
+                    "provider artifact snapshot path collision: "
+                    f"{normalized} is claimed by {owner} and {agent_id}/{entry.artifact_id}"
+                )
+            pending[normalized] = f"{agent_id}/{entry.artifact_id}"
+        owners.update(pending)
 
     def _prepare_provider_artifacts(self, agents: list[Any]) -> None:
         for agent in agents:

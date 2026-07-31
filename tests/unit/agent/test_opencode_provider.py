@@ -15,6 +15,7 @@ from agent_runtime_kit.agent.homes import (
 )
 from agent_runtime_kit.agent.provider_contracts import (
     ArtifactCaptureRequest,
+    ArtifactDescribeRequest,
     ArtifactRestoreRequest,
     BaseConfigSource,
     CapabilityKey,
@@ -265,6 +266,55 @@ def test_opencode_artifact_uses_sqlite_backup_and_restores(tmp_path: Path) -> No
         assert conn.execute("select value from sessions").fetchone()[0] == "before"
         assert conn.execute("pragma integrity_check").fetchone()[0] == "ok"
     assert (tool_output / "large.txt").read_text() == "result"
+
+
+def test_opencode_artifacts_are_namespaced_per_agent_in_shared_snapshot_root(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    adapter = OpenCodeArtifactAdapter(runtime_root=runtime_root, registry=_StoppedRegistry())
+    snapshots = tmp_path / "snapshot"
+    locators: list[ProviderSessionLocator] = []
+    for agent_id, value in (("agent-1", "first"), ("agent-2", "second")):
+        database = runtime_root / "providers" / "opencode" / "agents" / agent_id / "opencode.db"
+        database.parent.mkdir(parents=True)
+        with sqlite3.connect(database) as conn:
+            conn.execute("create table sessions(id text primary key, value text)")
+            conn.execute("insert into sessions values ('session', ?)", (value,))
+        locators.append(
+            ProviderSessionLocator(
+                provider_type="opencode",
+                session_id=f"session-{agent_id}",
+                home_id="main",
+                created_at="2026-07-21T00:00:00Z",
+                native_locator={
+                    "agent_id": agent_id,
+                    "directory": str(tmp_path),
+                    "database_path": str(database),
+                    "runtime_relpath": f"providers/opencode/agents/{agent_id}",
+                },
+            )
+        )
+
+    captured = [
+        adapter.capture(ArtifactCaptureRequest(session=locator, snapshot_root=str(snapshots)))
+        for locator in locators
+    ]
+
+    relpaths = [snapshot.manifest.entries[0].snapshot_relpath for snapshot in captured]
+    assert relpaths == [
+        "providers/opencode/agents/agent-1/opencode.db",
+        "providers/opencode/agents/agent-2/opencode.db",
+    ]
+    assert len(set(relpaths)) == 2
+    for relpath, expected in zip(relpaths, ("first", "second"), strict=True):
+        assert relpath is not None
+        with sqlite3.connect(snapshots / relpath) as conn:
+            assert conn.execute("select value from sessions").fetchone()[0] == expected
+
+    described = [
+        adapter.describe(ArtifactDescribeRequest(session=locator))
+        for locator in locators
+    ]
+    assert [manifest.entries[0].snapshot_relpath for manifest in described] == relpaths
 
 
 def test_opencode_bundle_resolves_backend_capabilities(tmp_path: Path) -> None:

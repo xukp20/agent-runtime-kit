@@ -54,14 +54,15 @@ class OpenCodeArtifactAdapter:
     def describe(self, request: ArtifactDescribeRequest) -> ProviderArtifactManifest:
         native = parse_native_locator(request.session.native_locator)
         database = Path(native.database_path)
+        database_ref = _native_ref(self.runtime_root, database)
         entries: list[ProviderArtifactEntry] = [
             ProviderArtifactEntry(
                 artifact_id="opencode-database",
                 kind="provider_database",
                 authority="provider_native",
                 capture_strategy="sqlite_backup",
-                native_ref=_native_ref(self.runtime_root, database),
-                snapshot_relpath="opencode.db",
+                native_ref=database_ref,
+                snapshot_relpath=database_ref,
                 size_bytes=database.stat().st_size if database.is_file() else None,
                 required_for_resume=True,
             )
@@ -69,14 +70,15 @@ class OpenCodeArtifactAdapter:
         runtime = self.runtime_root / native.runtime_relpath
         for name, path in _additional_paths(runtime):
             if path.exists():
+                native_ref = _native_ref(self.runtime_root, path)
                 entries.append(
                     ProviderArtifactEntry(
                         artifact_id=f"opencode-{name}",
                         kind=name,
                         authority="provider_native",
                         capture_strategy="copy_tree",
-                        native_ref=_native_ref(self.runtime_root, path),
-                        snapshot_relpath=name,
+                        native_ref=native_ref,
+                        snapshot_relpath=native_ref,
                         required_for_resume=name == "tool-output",
                     )
                 )
@@ -85,7 +87,7 @@ class OpenCodeArtifactAdapter:
             home_id=request.session.home_id,
             session_id=request.session.session_id,
             adapter_version=ADAPTER_VERSION,
-            native_primary_ref=_native_ref(self.runtime_root, database),
+            native_primary_ref=database_ref,
         )
         return ProviderArtifactManifest(
             provider_type=PROVIDER_TYPE,
