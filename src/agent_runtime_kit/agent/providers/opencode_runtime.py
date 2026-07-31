@@ -150,6 +150,14 @@ class OpenCodeRuntimeRegistry:
                 "OPENCODE_CONFIG_DIR": str(context.home_root),
             }
         )
+        auth_source = context.home_root / ".opencode" / "auth.json"
+        auth_target = paths["data"] / "opencode" / "auth.json"
+        if auth_source.is_file():
+            auth_target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(auth_source, auth_target)
+            auth_target.chmod(0o600)
+        elif auth_target.exists():
+            auth_target.unlink()
         binary = env.pop("ARK_OPENCODE_BINARY", self.binary_path)
         start_timeout_s = float(env.pop("ARK_OPENCODE_SERVER_START_TIMEOUT", "15"))
         process = subprocess.Popen(

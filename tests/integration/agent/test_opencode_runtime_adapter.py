@@ -49,6 +49,8 @@ def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Pat
     runtime_root = tmp_path / "runtime"
     home_root = runtime_root / "homes" / "opencode" / "real"
     renderer = OpenCodeHomeRenderer(runtime_root=runtime_root)
+    auth_source = tmp_path / "auth.json"
+    auth_source.write_text('{"opencode":{"type":"api","key":"isolated-test-key"}}\n')
     materialization = renderer.materialize(
         ProviderHomeSpec(
             provider_type="opencode",
@@ -56,7 +58,10 @@ def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Pat
             base_config=BaseConfigSource(
                 mapping={"model": "deepseek/deepseek-chat", "snapshot": True}
             ),
-            provider_options=OpenCodeHomeOptions(binary_path=binary),
+            provider_options=OpenCodeHomeOptions(
+                binary_path=binary,
+                auth_json_path=auth_source,
+            ),
         ),
         home_root,
     )
@@ -92,10 +97,141 @@ def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Pat
         assert str(session.get("id", "")).startswith("ses_")
         assert server.client.session_status() == {}
         assert server.database_path.is_file()
+        isolated_auth = server.runtime_root / "xdg-data" / "opencode" / "auth.json"
+        assert isolated_auth.read_text() == auth_source.read_text()
+        assert isolated_auth.stat().st_mode & 0o777 == 0o600
         assert str(server.database_path).startswith(str(runtime_root / "providers" / "opencode"))
         assert server.directory == str(tmp_path.resolve())
     finally:
         registry.close()
+
+
+def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
+    binary = os.environ.get("ARK_OPENCODE_TEST_BINARY")
+    auth_path = os.environ.get("ARK_OPENCODE_ACCOUNT_AUTH_JSON")
+    model = os.environ.get("ARK_OPENCODE_ACCOUNT_MODEL", "opencode-go/deepseek-v4-flash")
+    if (
+        os.environ.get("ARK_OPENCODE_RUN_REAL_MODELS") != "1"
+        or not binary
+        or not auth_path
+    ):
+        pytest.skip("enable the gated OpenCode account-auth real test")
+    provider_id, model_id = model.split("/", 1)
+    runtime_root = tmp_path / "runtime"
+    home_root = runtime_root / "homes" / "opencode" / "account"
+    renderer = OpenCodeHomeRenderer(runtime_root=runtime_root)
+    materialization = renderer.materialize(
+        ProviderHomeSpec(
+            provider_type="opencode",
+            home_id="account",
+            base_config=BaseConfigSource(mapping={"model": model}),
+            provider_options=OpenCodeHomeOptions(
+                binary_path=binary,
+                auth_json_path=Path(auth_path),
+            ),
+        ),
+        home_root,
+    )
+    record = HomeRecord(
+        provider_type="opencode",
+        home_id="account",
+        home_relpath="homes/opencode/account",
+        materialization_manifest_hash=materialization.manifest_hash,
+    )
+    context = renderer.build_execution_context(record, run_env={}, workdir=str(tmp_path))
+    registry = OpenCodeRuntimeRegistry(runtime_root, binary_path=binary)
+    runtime = OpenCodeRuntimeAdapter(registry)
+    request = ProviderRunRequest(
+        agent_id="agent-account",
+        scope_id="scope-real",
+        agent_type="worker",
+        provider_type="opencode",
+        home_id="account",
+        prompt="Reply with exactly OPENCODE_ACCOUNT_OK and no other text.",
+        workdir=str(tmp_path),
+        model_overrides=ModelBackendIdentity(
+            api_provider=provider_id,
+            api_mode="chat_completions",
+            requested_model=model_id,
+        ),
+        run_options=ProviderRunOptions(timeout_s=180),
+        provider_options=OpenCodeRunOptions(
+            provider_id=provider_id,
+            model_id=model_id,
+            tools={"bash": False, "edit": False, "write": False},
+        ),
+        execution_context=context,
+    )
+    try:
+        result = runtime.start(request).wait_terminal(190)
+        assert result.status.value == "completed", result.error
+        assert "OPENCODE_ACCOUNT_OK" in (result.final_text or "")
+        assert result.turn_usage is not None
+        isolated_auth = (
+            runtime_root
+            / "providers"
+            / "opencode"
+            / "agents"
+            / "agent-account"
+            / "xdg-data"
+            / "opencode"
+            / "auth.json"
+        )
+        assert isolated_auth.is_file()
+        assert isolated_auth.stat().st_mode & 0o777 == 0o600
+
+        query = OpenCodeQueryAdapter(registry.client_for_locator)
+        artifacts = OpenCodeArtifactAdapter(runtime_root=runtime_root, registry=registry)
+        snapshot = artifacts.capture(
+            ArtifactCaptureRequest(
+                session=result.session_locator,
+                snapshot_root=str(tmp_path / "snapshot"),
+                agent_id="agent-account",
+            )
+        )
+        assert all(entry.snapshot_relpath != "auth.json" for entry in snapshot.manifest.entries)
+        second = runtime.resume(
+            replace(
+                request,
+                prompt="Reply with exactly ACCOUNT_SECOND and no other text.",
+                session_locator=result.session_locator,
+            )
+        ).wait_terminal(190)
+        assert "ACCOUNT_SECOND" in (second.final_text or "")
+
+        restored = artifacts.restore(
+            ArtifactRestoreRequest(
+                manifest=snapshot.manifest,
+                snapshot_root=snapshot.snapshot_root,
+            )
+        )
+        assert restored.restored
+        third = runtime.resume(
+            replace(
+                request,
+                prompt="Reply with exactly ACCOUNT_RESTORED and no other text.",
+                session_locator=result.session_locator,
+            )
+        ).wait_terminal(190)
+        assert "ACCOUNT_RESTORED" in (third.final_text or "")
+        turns = query.list_turns(ProviderTurnQuery(session=third.session_locator)).items
+        texts = [turn.result.final_text for turn in turns if turn.result is not None]
+        assert any(text and "OPENCODE_ACCOUNT_OK" in text for text in texts)
+        assert any(text and "ACCOUNT_RESTORED" in text for text in texts)
+        assert not any(text and "ACCOUNT_SECOND" in text for text in texts)
+
+        context_adapter = OpenCodeContextAdapter(registry=registry, query=query)
+        compact = context_adapter.compact(
+            ProviderContextCompactionRequest(
+                session=third.session_locator,
+                trigger="account_auth_real_test",
+                timeout_s=180,
+                agent_id="agent-account",
+            )
+        )
+        assert compact.status == "completed"
+    finally:
+        runtime.close()
 
 
 def test_real_opencode_deepseek_run_and_query(tmp_path: Path) -> None:

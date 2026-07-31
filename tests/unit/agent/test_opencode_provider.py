@@ -53,6 +53,8 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     runtime_root = tmp_path / "runtime"
     home_root = runtime_root / "homes" / "opencode" / "main"
     renderer = OpenCodeHomeRenderer(runtime_root=runtime_root)
+    auth_source = tmp_path / "auth.json"
+    auth_source.write_text('{"opencode":{"type":"api","key":"test-key"}}\n')
     result = renderer.materialize(
         ProviderHomeSpec(
             provider_type="opencode",
@@ -84,6 +86,7 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
             tools=({"bash": False, "mcp_lean_*": True},),
             provider_options=OpenCodeHomeOptions(
                 binary_path="/opt/opencode",
+                auth_json_path=auth_source,
                 agent_files={"reviewer": "---\ndescription: Review changes\n---\nReview."},
                 command_files={"check": "Run the focused checks."},
             ),
@@ -106,6 +109,11 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     assert (home_root / "skills" / "proof" / "SKILL.md").is_file()
     assert (home_root / "agents" / "reviewer.md").is_file()
     assert (home_root / "commands" / "check.md").is_file()
+    auth_path = home_root / ".opencode" / "auth.json"
+    assert auth_path.read_text() == auth_source.read_text()
+    assert auth_path.stat().st_mode & 0o777 == 0o600
+    auth_entry = next(item for item in result.generated_files if item.relpath == ".opencode/auth.json")
+    assert auth_entry.secret is True
     assert result.resolved_defaults == ModelBackendIdentity(
         api_provider="deepseek",
         api_mode="chat_completions",
@@ -143,6 +151,16 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     assert '"LEAN_TOKEN": "secret"' not in (
         home_root / ".ark" / "home_materialization.json"
     ).read_text()
+
+    renderer.materialize(
+        ProviderHomeSpec(
+            provider_type="opencode",
+            home_id="main",
+            base_config=BaseConfigSource(mapping={"model": "opencode-go/deepseek-v4-flash"}),
+        ),
+        home_root,
+    )
+    assert not auth_path.exists()
 
 
 def test_opencode_query_projects_usage_tools_and_cost() -> None:
@@ -212,6 +230,8 @@ def test_opencode_artifact_uses_sqlite_backup_and_restores(tmp_path: Path) -> No
     tool_output = agent_runtime / "xdg-data" / "opencode" / "tool-output"
     tool_output.mkdir(parents=True)
     (tool_output / "large.txt").write_text("result")
+    auth_path = agent_runtime / "xdg-data" / "opencode" / "auth.json"
+    auth_path.write_text('{"opencode":{"type":"api","key":"must-not-be-captured"}}')
     locator = ProviderSessionLocator(
         provider_type="opencode",
         session_id="ses_1",
@@ -227,6 +247,12 @@ def test_opencode_artifact_uses_sqlite_backup_and_restores(tmp_path: Path) -> No
     adapter = OpenCodeArtifactAdapter(runtime_root=runtime_root, registry=_StoppedRegistry())
     snapshot = adapter.capture(
         ArtifactCaptureRequest(session=locator, snapshot_root=str(tmp_path / "snapshot"))
+    )
+    assert all(entry.snapshot_relpath != "auth.json" for entry in snapshot.manifest.entries)
+    assert "must-not-be-captured" not in "".join(
+        path.read_text(errors="ignore")
+        for path in Path(snapshot.snapshot_root).rglob("*")
+        if path.is_file()
     )
     with sqlite3.connect(database) as conn:
         conn.execute("update sessions set value='after'")

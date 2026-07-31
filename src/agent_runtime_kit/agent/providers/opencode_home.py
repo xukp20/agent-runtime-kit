@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import Mapping
@@ -41,6 +42,13 @@ class OpenCodeHomeRenderer:
             errors.append("OpenCode provider_options must be OpenCodeHomeOptions")
         if spec.extensions:
             errors.append("OpenCode extensions/plugins are disabled in the first adapter version")
+        options = spec.provider_options
+        if (
+            isinstance(options, OpenCodeHomeOptions)
+            and options.auth_json_path is not None
+            and not options.auth_json_path.is_file()
+        ):
+            errors.append(f"auth_json_path must be an existing file: {options.auth_json_path}")
         try:
             config = _read_config(spec)
             _deep_merge(config, dict(spec.config_overrides))
@@ -79,6 +87,16 @@ class OpenCodeHomeRenderer:
         )
         config_path = root / options.config_filename
         config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        auth_root = root / ".opencode"
+        auth_path = auth_root / "auth.json"
+        if options.auth_json_path is not None:
+            auth_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(options.auth_json_path, auth_path)
+            auth_path.chmod(0o600)
+        elif auth_path.exists():
+            auth_path.unlink()
+            if auth_root.exists() and not any(auth_root.iterdir()):
+                auth_root.rmdir()
         instructions = _instructions_text(spec.instructions)
         if instructions:
             (root / "AGENTS.md").write_text(instructions.rstrip() + "\n", encoding="utf-8")
@@ -469,7 +487,14 @@ def _provider_payload_from_manifest(value: object) -> ProviderPayload | None:
 def _generated_files(root: Path) -> tuple[HomeMaterializedFile, ...]:
     values: list[HomeMaterializedFile] = []
     for path in sorted(item for item in root.rglob("*") if item.is_file() and ".ark" not in item.parts):
-        values.append(HomeMaterializedFile(relpath=str(path.relative_to(root)), sha256=_sha256(path)))
+        relpath = str(path.relative_to(root))
+        values.append(
+            HomeMaterializedFile(
+                relpath=relpath,
+                sha256=_sha256(path),
+                secret=relpath == ".opencode/auth.json",
+            )
+        )
     return tuple(values)
 
 

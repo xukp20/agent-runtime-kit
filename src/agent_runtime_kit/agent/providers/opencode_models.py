@@ -14,6 +14,7 @@ SUPPORTED_CLI_VERSION = "1.18.4"
 class OpenCodeHomeOptions:
     binary_path: str | Path = "opencode"
     server_start_timeout_s: float = 15.0
+    auth_json_path: Path | None = None
     allow_project_config: bool = False
     config_filename: str = "opencode.json"
     agent_files: Mapping[str, str] = field(default_factory=dict)
