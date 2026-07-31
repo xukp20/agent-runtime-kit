@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from threading import RLock
@@ -10,6 +11,10 @@ from agent_runtime_kit.agent.store_utils import encode_scope_id, read_json, utc_
 
 from .models import BaseFlow, BaseStep, FlowStatus, StepStatus
 from .registry import FlowTypeRegistry, StepTypeRegistry
+
+
+logger = logging.getLogger(__name__)
+FLOW_STEP_SCHEMA_VERSION = 1
 
 
 class FlowStepStoreError(Exception):
@@ -486,6 +491,15 @@ class FlowStepStore:
         object_type = payload.get("object_type")
         if object_type != expected_object_type:
             raise FlowStepStoreError(f"expected {expected_object_type} payload, got {object_type!r}")
+        observed_version = payload.get("schema_version")
+        if observed_version != FLOW_STEP_SCHEMA_VERSION:
+            logger.warning(
+                "ARK %s envelope schema version differs from the current version: observed=%r current=%s object_id=%s",
+                expected_object_type,
+                observed_version,
+                FLOW_STEP_SCHEMA_VERSION,
+                payload.get(f"{expected_object_type}_id"),
+            )
         data = dict(payload)
         data.pop("schema_version", None)
         data.pop("object_type", None)

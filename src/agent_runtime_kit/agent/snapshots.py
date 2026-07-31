@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
 import sqlite3
 import threading
@@ -31,6 +32,9 @@ from .provider_contracts import (
 from .report_policy import AgentTraceReportPolicy
 from .store import AgentStoreService
 from .store_utils import encode_scope_id, read_json, utc_now_iso, write_json_atomic
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentSnapshotService:
@@ -1066,6 +1070,12 @@ def _provider_artifact_manifest_from_dict(payload: dict[str, Any]) -> ProviderAr
     entries_payload = payload.get("entries") or []
     if not isinstance(entries_payload, list):
         raise RuntimeError("provider artifact entries must be a list")
+    for item in entries_payload:
+        if isinstance(item, dict) and "required_for_resume" not in item:
+            logger.warning(
+                "ARK Provider Artifact entry omits required_for_resume; using false: artifact_id=%s",
+                item.get("artifact_id"),
+            )
     entries = tuple(
         ProviderArtifactEntry(
             artifact_id=str(item["artifact_id"]),
@@ -1087,6 +1097,13 @@ def _provider_artifact_manifest_from_dict(payload: dict[str, Any]) -> ProviderAr
     )
     if len(entries) != len(entries_payload):
         raise RuntimeError("provider artifact entry must be a mapping")
+    if "warnings" not in payload:
+        logger.warning(
+            "ARK Provider Artifact manifest omits warnings; using an empty list: provider_type=%s home_id=%s session_id=%s",
+            payload.get("provider_type"),
+            payload.get("home_id"),
+            payload.get("session_id"),
+        )
     return ProviderArtifactManifest(
         provider_type=str(payload["provider_type"]),
         home_id=str(payload["home_id"]),

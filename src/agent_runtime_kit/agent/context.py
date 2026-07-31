@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from .provider_contracts.models import AgentContextUsage, ProviderContextCompactionResult
+from .provider_contracts.models import AgentContextUsage
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentContextCompactionStatus(str, Enum):
@@ -80,9 +84,14 @@ class AgentContextMaintenanceJournal:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "AgentContextMaintenanceJournal":
-        schema_version = int(payload.get("schema_version", 1))
-        if schema_version != 1:
-            raise ValueError(f"unsupported context maintenance journal schema: {schema_version}")
+        observed_version = payload.get("schema_version")
+        schema_version = int(observed_version if observed_version is not None else 1)
+        if observed_version != 1:
+            logger.warning(
+                "ARK context maintenance journal schema version differs from the current version: observed=%r current=1 agent_id=%s",
+                observed_version,
+                payload.get("agent_id"),
+            )
         return cls(
             schema_version=schema_version,
             agent_id=str(payload["agent_id"]),

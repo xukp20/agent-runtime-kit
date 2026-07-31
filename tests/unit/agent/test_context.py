@@ -60,3 +60,29 @@ def test_context_policy_and_journal_validation() -> None:
     )
     assert AgentContextMaintenanceJournal.from_dict(journal.to_dict()) == journal
     assert journal.unresolved
+
+
+@pytest.mark.parametrize("observed_version", [None, 2])
+def test_context_journal_warns_but_reads_compatible_version(
+    caplog,
+    observed_version: int | None,
+) -> None:
+    journal = AgentContextMaintenanceJournal(
+        agent_id="agent-1",
+        provider_type="codex",
+        session_id="session-1",
+        status=AgentContextMaintenanceJournalStatus.STARTED,
+        trigger="manual",
+        prepared_at="2026-07-22T00:00:00Z",
+    )
+    payload = journal.to_dict()
+    if observed_version is None:
+        payload.pop("schema_version")
+    else:
+        payload["schema_version"] = observed_version
+
+    restored = AgentContextMaintenanceJournal.from_dict(payload)
+
+    assert restored.schema_version == (observed_version or 1)
+    assert restored.agent_id == "agent-1"
+    assert "schema version differs" in caplog.text

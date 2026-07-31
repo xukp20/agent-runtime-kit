@@ -1,9 +1,10 @@
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
 from pydantic import BaseModel
 
-from agent_runtime_kit.agent.store_utils import encode_scope_id, read_json
+from agent_runtime_kit.agent.store_utils import encode_scope_id, read_json, write_json_atomic
 from agent_runtime_kit.flow import (
     BaseFlow,
     BaseFlowState,
@@ -122,3 +123,64 @@ def test_store_reads_truth_through_registered_types(tmp_path: Path) -> None:
     assert isinstance(restored_step, StoreStep)
     assert isinstance(restored_step.state, StoreStepState)
     assert restored_step.state.marker == "restored-step"
+
+
+@pytest.mark.parametrize("observed_version", [None, 7])
+def test_store_warns_but_reads_compatible_envelope_version(
+    tmp_path: Path,
+    caplog,
+    observed_version: int | None,
+) -> None:
+    store = make_store(tmp_path / ".agent_runtime")
+    flow = StoreFlow(flow_id="flow-1", scope_id="scope")
+    store.create_flow(flow)
+    flow_path = (
+        tmp_path
+        / ".agent_runtime"
+        / "scopes"
+        / encode_scope_id("scope")
+        / "flows"
+        / "flow-1"
+        / "flow.json"
+    )
+    payload = read_json(flow_path)
+    if observed_version is None:
+        payload.pop("schema_version")
+    else:
+        payload["schema_version"] = observed_version
+    write_json_atomic(flow_path, payload)
+
+    restored = store.get_flow("flow-1")
+
+    assert restored.flow_id == "flow-1"
+    assert "schema version differs" in caplog.text
+
+
+def test_store_warns_but_reads_compatible_step_envelope_version(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    store = make_store(tmp_path / ".agent_runtime")
+    flow = StoreFlow(flow_id="flow-1", scope_id="scope")
+    step = StoreStep(step_id="step-1", flow_id="flow-1", scope_id="scope")
+    store.create_flow(flow)
+    store.create_step(step)
+    step_path = (
+        tmp_path
+        / ".agent_runtime"
+        / "scopes"
+        / encode_scope_id("scope")
+        / "flows"
+        / "flow-1"
+        / "steps"
+        / "step-1"
+        / "step.json"
+    )
+    payload = read_json(step_path)
+    payload["schema_version"] = 7
+    write_json_atomic(step_path, payload)
+
+    restored = store.get_step("step-1")
+
+    assert restored.step_id == "step-1"
+    assert "schema version differs" in caplog.text
