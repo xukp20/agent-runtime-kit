@@ -199,11 +199,16 @@ keys and authorization values are rejected. Project-local config discovery,
 OpenCode workspace snapshots, sharing, and automatic updates are disabled by
 default.
 
-Each Agent receives its own server process, XDG directories, and
-`OPENCODE_DB`. The adapter subscribes to SSE before submitting a prompt and
-does not report completion until it has both persisted assistant completion
-evidence and a live idle status. Query results normalize OpenCode messages,
-parts, tools, request usage, model identity, and provider-reported cost.
+Each Agent receives its own server process, `OPENCODE_DB`, data, state, and
+temporary directories. The materialized Home remains sealed and contains only
+ARK-owned static configuration. OpenCode's mutable config and package runtime
+is shared by Agents using the same exact Home materialization, while npm and
+Bun download caches are shared at provider-runtime scope. A changed Home
+manifest selects a new config runtime. The adapter subscribes to SSE before
+submitting a prompt and does not report completion until it has both persisted
+assistant completion evidence and a live idle status. Query results normalize
+OpenCode messages, parts, tools, request usage, model identity, and
+provider-reported cost.
 
 OpenCode expands remote MCP environment-header references when the server
 process starts. ARK therefore fingerprints the effective process environment

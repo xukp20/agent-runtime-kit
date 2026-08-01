@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -44,6 +45,14 @@ pytestmark = pytest.mark.real
 
 class _OpenCodeRealAgentType(AgentType):
     agent_type = "OpenCodeRealAgent"
+
+
+def _tree_hashes(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Path) -> None:
@@ -92,6 +101,7 @@ def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Pat
         ),
         execution_context=context,
     )
+    sealed_home = _tree_hashes(home_root)
     try:
         server = registry.ensure(request)
         health = server.client.health()
@@ -106,6 +116,26 @@ def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Pat
         assert isolated_auth.stat().st_mode & 0o777 == 0o600
         assert str(server.database_path).startswith(str(runtime_root / "providers" / "opencode"))
         assert server.directory == str(tmp_path.resolve())
+        assert server.config_root != home_root
+        assert server.config_root.joinpath("opencode.json").read_bytes() == home_root.joinpath(
+            "opencode.json"
+        ).read_bytes()
+        assert not server.runtime_root.joinpath("xdg-config").exists()
+        assert not server.runtime_root.joinpath("home", ".npm").exists()
+        assert runtime_root.joinpath(
+            "providers", "opencode", "shared-cache", "npm"
+        ).is_dir()
+        assert runtime_root.joinpath(
+            "providers", "opencode", "shared-cache", "bun"
+        ).is_dir()
+        first_config_runtime = _tree_hashes(server.config_root)
+
+        second = registry.ensure(replace(request, agent_id="agent-real-2"))
+        assert second.config_root == server.config_root
+        assert second.database_path != server.database_path
+        assert second.client.health().get("healthy") is True
+        assert _tree_hashes(server.config_root) == first_config_runtime
+        assert _tree_hashes(home_root) == sealed_home
     finally:
         registry.close()
 

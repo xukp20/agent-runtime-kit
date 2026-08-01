@@ -34,6 +34,7 @@ from ..provider_contracts import (
 )
 from ..store_utils import utc_now_iso
 from .opencode_client import OpenCodeClient, OpenCodeClientError, event_properties
+from .opencode_home import MUTABLE_CONFIG_RUNTIME_NAMES
 from .opencode_models import (
     ADAPTER_VERSION,
     OpenCodeNativeLocator,
@@ -51,6 +52,7 @@ class OpenCodeServer:
     runtime_root: Path
     directory: str
     database_path: Path
+    config_root: Path
     process: subprocess.Popen[str]
     client: OpenCodeClient
     password: str
@@ -189,9 +191,9 @@ class OpenCodeRuntimeRegistry:
         if context is None or context.provider_type != PROVIDER_TYPE:
             raise ValueError("OpenCode runtime requires an OpenCode ProviderExecutionContext")
         runtime = self.runtime_root / "providers" / PROVIDER_TYPE / "agents" / request.agent_id
+        config_root = self._prepare_config_runtime(context)
         paths = {
             "home": runtime / "home",
-            "config": runtime / "xdg-config",
             "data": runtime / "xdg-data",
             "cache": runtime / "xdg-cache",
             "state": runtime / "xdg-state",
@@ -199,6 +201,11 @@ class OpenCodeRuntimeRegistry:
         }
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
+        shared_cache_root = self.runtime_root / "providers" / PROVIDER_TYPE / "shared-cache"
+        npm_cache = shared_cache_root / "npm"
+        bun_cache = shared_cache_root / "bun"
+        npm_cache.mkdir(parents=True, exist_ok=True)
+        bun_cache.mkdir(parents=True, exist_ok=True)
         database = runtime / "opencode.db"
         directory = str(Path(request.workdir or context.workdir or os.getcwd()).resolve())
         password = secrets.token_urlsafe(32)
@@ -215,14 +222,17 @@ class OpenCodeRuntimeRegistry:
         env.update(
             {
                 "HOME": str(paths["home"]),
-                "XDG_CONFIG_HOME": str(paths["config"]),
+                "XDG_CONFIG_HOME": str(config_root.parent),
                 "XDG_DATA_HOME": str(paths["data"]),
                 "XDG_CACHE_HOME": str(paths["cache"]),
                 "XDG_STATE_HOME": str(paths["state"]),
                 "TMPDIR": str(paths["tmp"]),
                 "OPENCODE_DB": str(database),
                 "OPENCODE_SERVER_PASSWORD": password,
-                "OPENCODE_CONFIG_DIR": str(context.home_root),
+                "OPENCODE_CONFIG_DIR": str(config_root),
+                "NPM_CONFIG_CACHE": str(npm_cache),
+                "npm_config_cache": str(npm_cache),
+                "BUN_INSTALL_CACHE_DIR": str(bun_cache),
             }
         )
         auth_source = context.home_root / ".opencode" / "auth.json"
@@ -278,11 +288,51 @@ class OpenCodeRuntimeRegistry:
             runtime_root=runtime,
             directory=directory,
             database_path=database,
+            config_root=config_root,
             process=process,
             client=client,
             password=password,
             environment_fingerprint=_environment_fingerprint(request),
         )
+
+    def _prepare_config_runtime(self, context: ProviderExecutionContext) -> Path:
+        manifest_hash = str(context.runtime_payload.get("materialization_manifest_hash") or "")
+        if len(manifest_hash) != 64 or any(char not in "0123456789abcdef" for char in manifest_hash):
+            raise RuntimeError("OpenCode runtime requires the current Home materialization hash")
+        runtime = (
+            self.runtime_root
+            / "providers"
+            / PROVIDER_TYPE
+            / "home-runtimes"
+            / manifest_hash
+        )
+        config_root = runtime / "xdg-config" / "opencode"
+        marker = runtime / "source-home-manifest"
+        if (
+            marker.is_file()
+            and marker.read_text(encoding="utf-8").strip() == manifest_hash
+            and config_root.joinpath("opencode.json").is_file()
+        ):
+            return config_root
+
+        config_root.mkdir(parents=True, exist_ok=True)
+        for path in tuple(config_root.iterdir()):
+            if path.name in MUTABLE_CONFIG_RUNTIME_NAMES:
+                continue
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        for source in context.home_root.iterdir():
+            if source.name in MUTABLE_CONFIG_RUNTIME_NAMES or source.name in {".ark", ".opencode"}:
+                continue
+            target = config_root / source.name
+            if source.is_dir() and not source.is_symlink():
+                shutil.copytree(source, target, symlinks=True)
+            else:
+                shutil.copy2(source, target, follow_symlinks=False)
+        marker.write_text(manifest_hash + "\n", encoding="utf-8")
+        return config_root
 
 
 def _environment_fingerprint(request: ProviderRunRequest) -> str:

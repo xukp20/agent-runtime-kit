@@ -152,6 +152,9 @@ def test_opencode_registry_restarts_for_new_runtime_identity_but_not_admin_read(
 def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Path) -> None:
     runtime_root = tmp_path / "runtime"
     home_root = runtime_root / "homes" / "opencode" / "main"
+    (home_root / "node_modules" / "stale-package").mkdir(parents=True)
+    (home_root / "node_modules" / "stale-package" / "index.js").write_text("stale\n")
+    (home_root / "package.json").write_text('{"dependencies":{"stale":"1"}}\n')
     renderer = OpenCodeHomeRenderer(runtime_root=runtime_root)
     auth_source = tmp_path / "auth.json"
     auth_source.write_text('{"opencode":{"type":"api","key":"test-key"}}\n')
@@ -210,6 +213,9 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     assert (home_root / "skills" / "proof" / "SKILL.md").is_file()
     assert (home_root / "agents" / "reviewer.md").is_file()
     assert (home_root / "commands" / "check.md").is_file()
+    assert not (home_root / "node_modules").exists()
+    assert not (home_root / "package.json").exists()
+    assert all(not item.relpath.startswith("node_modules/") for item in result.generated_files)
     auth_path = home_root / ".opencode" / "auth.json"
     assert auth_path.read_text() == auth_source.read_text()
     assert auth_path.stat().st_mode & 0o777 == 0o600
@@ -246,9 +252,23 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     assert context.process_environment["ARK_OPENCODE_BINARY"] == "/opt/opencode"
     assert context.process_environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert context.process_environment["OPENCODE_PURE"] == "1"
+    assert "OPENCODE_CONFIG_DIR" not in context.process_environment
     assert "OPENCODE_CONFIG" not in context.process_environment
     assert "OPENCODE_CONFIG_CONTENT" not in context.process_environment
     assert context.process_environment["MAPPED_TOKEN"] == "source-secret"
+    registry = OpenCodeRuntimeRegistry(runtime_root)
+    config_root = registry._prepare_config_runtime(context)
+    assert config_root != home_root
+    assert config_root.joinpath("opencode.json").read_bytes() == home_root.joinpath(
+        "opencode.json"
+    ).read_bytes()
+    assert config_root.joinpath("AGENTS.md").read_bytes() == home_root.joinpath(
+        "AGENTS.md"
+    ).read_bytes()
+    (config_root / "node_modules" / "runtime-package").mkdir(parents=True)
+    (config_root / "node_modules" / "runtime-package" / "index.js").write_text("runtime\n")
+    assert registry._prepare_config_runtime(context) == config_root
+    assert (config_root / "node_modules" / "runtime-package" / "index.js").is_file()
     assert '"LEAN_TOKEN": "secret"' not in (
         home_root / ".ark" / "home_materialization.json"
     ).read_text()

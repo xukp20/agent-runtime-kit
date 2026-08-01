@@ -25,6 +25,20 @@ from ..store_utils import read_json, write_json_atomic
 from .opencode_models import OpenCodeHomeOptions, PROVIDER_TYPE
 
 
+MUTABLE_CONFIG_RUNTIME_NAMES = frozenset(
+    {
+        ".gitignore",
+        "bun.lock",
+        "bun.lockb",
+        "node_modules",
+        "package-lock.json",
+        "package.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+    }
+)
+
+
 class OpenCodeHomeRenderer:
     provider_type = PROVIDER_TYPE
     renderer_version = "opencode-home-v1"
@@ -67,6 +81,7 @@ class OpenCodeHomeRenderer:
         options = _options(spec)
         root = Path(home_root)
         root.mkdir(parents=True, exist_ok=True)
+        _prune_mutable_config_runtime(root)
         config = _deep_merge(_read_config(spec), dict(spec.config_overrides))
         config = _deep_merge(config, _mcp_config(spec.mcp_servers))
         config = _deep_merge(config, _tools_config(spec.tools))
@@ -143,6 +158,7 @@ class OpenCodeHomeRenderer:
 
     def refresh_materialization(self, home: object, home_root: Path) -> HomeMaterializationResult:
         root = Path(home_root)
+        _prune_mutable_config_runtime(root)
         payload = read_json(root / ".ark" / "home_materialization.json")
         result = HomeMaterializationResult(
             provider_type=self.provider_type,
@@ -214,7 +230,6 @@ class OpenCodeHomeRenderer:
         for name in required_env:
             if not env.get(name):
                 raise MissingProviderEnvError(name)
-        env["OPENCODE_CONFIG_DIR"] = str(home_root)
         allow_project_config = bool(options_data.get("allow_project_config", False))
         env["OPENCODE_PURE"] = "1"
         if allow_project_config:
@@ -237,6 +252,7 @@ class OpenCodeHomeRenderer:
             runtime_payload={
                 "runtime_root": str(self.runtime_root),
                 "allow_project_config": allow_project_config,
+                "materialization_manifest_hash": declared,
             },
         )
 
@@ -487,7 +503,13 @@ def _provider_payload_from_manifest(value: object) -> ProviderPayload | None:
 
 def _generated_files(root: Path) -> tuple[HomeMaterializedFile, ...]:
     values: list[HomeMaterializedFile] = []
-    for path in sorted(item for item in root.rglob("*") if item.is_file() and ".ark" not in item.parts):
+    for path in sorted(
+        item
+        for item in root.rglob("*")
+        if item.is_file()
+        and ".ark" not in item.parts
+        and item.relative_to(root).parts[0] not in MUTABLE_CONFIG_RUNTIME_NAMES
+    ):
         relpath = str(path.relative_to(root))
         values.append(
             HomeMaterializedFile(
@@ -497,6 +519,15 @@ def _generated_files(root: Path) -> tuple[HomeMaterializedFile, ...]:
             )
         )
     return tuple(values)
+
+
+def _prune_mutable_config_runtime(root: Path) -> None:
+    for name in MUTABLE_CONFIG_RUNTIME_NAMES:
+        path = root / name
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
 
 
 def _sha256(path: Path) -> str:
