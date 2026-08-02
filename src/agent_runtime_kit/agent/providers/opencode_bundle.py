@@ -232,4 +232,5 @@ def _home_backend(home: object) -> ModelBackendIdentity | None:
         requested_model=value.get("requested_model"),
         resolved_model=value.get("resolved_model"),
         model_version=value.get("model_version"),
+        reasoning_effort=value.get("reasoning_effort"),
     )

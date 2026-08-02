@@ -331,6 +331,15 @@ def _request_usage(
     cache = tokens.get("cache") if isinstance(tokens.get("cache"), Mapping) else {}
     provider_id = str(info.get("providerID") or "unknown")
     model_id = str(info.get("modelID") or "unknown")
+    variant = info.get("variant")
+    reasoning_effort = variant if isinstance(variant, str) and variant else None
+    if (
+        reasoning_effort is None
+        and session_backend is not None
+        and session_backend.api_provider == provider_id
+        and session_backend.effective_model == model_id
+    ):
+        reasoning_effort = session_backend.reasoning_effort
     identity = ModelBackendIdentity(
         api_provider=provider_id,
         api_mode=(
@@ -340,6 +349,7 @@ def _request_usage(
         ),
         requested_model=model_id,
         resolved_model=model_id,
+        reasoning_effort=reasoning_effort,
     )
     reported = tuple(
         name

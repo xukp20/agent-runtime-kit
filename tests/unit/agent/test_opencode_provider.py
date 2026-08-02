@@ -30,14 +30,19 @@ from agent_runtime_kit.agent.provider_contracts import (
     ProviderSessionLocator,
 )
 from agent_runtime_kit.agent.providers.opencode_artifacts import OpenCodeArtifactAdapter
-from agent_runtime_kit.agent.providers.opencode_bundle import build_opencode_provider_bundle
+from agent_runtime_kit.agent.providers.opencode_bundle import (
+    _home_backend,
+    build_opencode_provider_bundle,
+)
 from agent_runtime_kit.agent.providers.opencode_home import OpenCodeHomeRenderer
-from agent_runtime_kit.agent.providers.opencode_models import OpenCodeHomeOptions
+from agent_runtime_kit.agent.providers.opencode_models import OpenCodeHomeOptions, OpenCodeRunOptions
 from agent_runtime_kit.agent.providers.opencode_query import OpenCodeQueryAdapter, project_turns
 from agent_runtime_kit.agent.providers.opencode_runtime import (
     OpenCodeRuntimeRegistry,
     _environment_fingerprint,
     _message_id,
+    _require_persisted_variant,
+    _require_supported_variant,
 )
 from agent_runtime_kit.agent.providers.opencode_client import (
     OpenCodeClient,
@@ -284,6 +289,39 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     assert not auth_path.exists()
 
 
+def test_opencode_home_refresh_preserves_reasoning_effort(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    home_root = runtime_root / "homes" / "opencode" / "effort"
+    renderer = OpenCodeHomeRenderer(runtime_root=runtime_root)
+    materialized = renderer.materialize(
+        ProviderHomeSpec(
+            provider_type="opencode",
+            home_id="effort",
+            base_config=BaseConfigSource(
+                mapping={"model": "opencode-go/deepseek-v4-flash"}
+            ),
+            model_config=ModelBackendIdentity(
+                api_provider="opencode-go",
+                api_mode="chat_completions",
+                requested_model="deepseek-v4-flash",
+                reasoning_effort="max",
+            ),
+        ),
+        home_root,
+    )
+    refreshed = renderer.refresh_materialization(
+        HomeRecord(
+            provider_type="opencode",
+            home_id="effort",
+            home_relpath="homes/opencode/effort",
+            materialization_manifest_hash=materialized.manifest_hash,
+        ),
+        home_root,
+    )
+    assert refreshed.resolved_defaults is not None
+    assert refreshed.resolved_defaults.reasoning_effort == "max"
+
+
 def test_opencode_query_projects_usage_tools_and_cost() -> None:
     session = ProviderSessionLocator(
         provider_type="opencode",
@@ -304,6 +342,7 @@ def test_opencode_query_projects_usage_tools_and_cost() -> None:
                 "providerID": "beeapi-responses",
                 "modelID": "gpt-5.4",
                 "apiMode": "responses",
+                "variant": "max",
                 "finish": "stop",
                 "cost": 0.125,
                 "tokens": {
@@ -334,6 +373,7 @@ def test_opencode_query_projects_usage_tools_and_cost() -> None:
     assert turn.tool_calls[0].call_id == "call_1"
     request = turn.usage.requests[0]
     assert request.model_identity.api_mode == "responses"
+    assert request.model_identity.reasoning_effort == "max"
     assert request.token_usage.cache_read_input_tokens == 3
     assert request.token_usage.total_tokens is None
     assert request.reported_cost is not None
@@ -448,8 +488,10 @@ def test_opencode_bundle_resolves_backend_capabilities(tmp_path: Path) -> None:
             "api_provider": "beeapi-responses",
             "api_mode": "responses",
             "requested_model": "gpt-5.4",
+            "reasoning_effort": "high",
         },
     )
+    assert _home_backend(home).reasoning_effort == "high"
     capabilities = bundle.resolve_capabilities(home)
     assert capabilities.available(CapabilityKey.MODEL_RESPONSES)
     assert not capabilities.available(CapabilityKey.MODEL_CHAT_COMPLETIONS)
@@ -604,6 +646,96 @@ def test_opencode_context_resolves_live_model_limits_without_provider_secrets() 
     }
     assert "must-not-be-retained" not in repr(usage.provider_payload)
     assert _model_limits(provider_payload, replace(identity, requested_model="unknown")) == {}
+
+
+def test_opencode_variant_helpers_validate_catalog_and_persisted_message() -> None:
+    catalog = {
+        "all": [
+            {
+                "id": "opencode-go",
+                "models": {
+                    "deepseek-v4-flash": {
+                        "variants": {"high": {}, "max": {}},
+                    }
+                },
+            }
+        ]
+    }
+    _require_supported_variant(
+        catalog,
+        provider_id="opencode-go",
+        model_id="deepseek-v4-flash",
+        variant="max",
+    )
+    with pytest.raises(ValueError, match="does not support variant 'low'"):
+        _require_supported_variant(
+            catalog,
+            provider_id="opencode-go",
+            model_id="deepseek-v4-flash",
+            variant="low",
+        )
+
+    messages = [
+        {
+            "info": {
+                "id": "msg_user",
+                "role": "user",
+                "model": {
+                    "providerID": "opencode-go",
+                    "modelID": "deepseek-v4-flash",
+                    "variant": "max",
+                },
+            },
+            "parts": [],
+        }
+    ]
+    _require_persisted_variant(messages, "msg_user", "max")
+    with pytest.raises(RuntimeError, match="does not match"):
+        _require_persisted_variant(messages, "msg_user", "high")
+
+
+def test_opencode_prompt_uses_reasoning_effort_and_rejects_variant_conflict(
+    tmp_path: Path,
+) -> None:
+    context = ProviderExecutionContext(
+        provider_type="opencode",
+        home_id="main",
+        home_root=tmp_path / "home",
+        process_environment={},
+        resolved_defaults=ModelBackendIdentity(
+            api_provider="opencode-go",
+            api_mode="chat_completions",
+            requested_model="deepseek-v4-flash",
+            reasoning_effort="max",
+        ),
+    )
+    request = ProviderRunRequest(
+        agent_id="agent-variant",
+        scope_id="scope-variant",
+        agent_type="worker",
+        provider_type="opencode",
+        home_id="main",
+        prompt="test",
+        workdir=str(tmp_path),
+        run_options=ProviderRunOptions(timeout_s=1),
+        execution_context=context,
+    )
+    handle = OpenCodeProviderRunHandle.__new__(OpenCodeProviderRunHandle)
+    handle.request = request
+    assert handle._prompt_payload("msg_1")["variant"] == "max"
+
+    handle.request = replace(
+        request,
+        provider_options=OpenCodeRunOptions(variant="max"),
+    )
+    assert handle._prompt_payload("msg_2")["variant"] == "max"
+
+    handle.request = replace(
+        request,
+        provider_options=OpenCodeRunOptions(variant="high"),
+    )
+    with pytest.raises(ValueError, match="conflicts"):
+        handle._prompt_payload("msg_3")
 
 
 def test_opencode_context_bootstraps_inactive_existing_session(tmp_path: Path) -> None:

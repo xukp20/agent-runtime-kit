@@ -10,7 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
@@ -57,6 +57,7 @@ class OpenCodeServer:
     client: OpenCodeClient
     password: str
     environment_fingerprint: str
+    validated_variants: set[tuple[str, str, str]] = field(default_factory=set)
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -516,7 +517,20 @@ class OpenCodeProviderRunHandle:
                 raise TimeoutError("OpenCode SSE did not report server.connected")
             with self._lock:
                 self._state = ProviderRunState.RUNNING
-            client.prompt_async(self._session.session_id, self._prompt_payload(turn_id))
+            prompt_payload = self._prompt_payload(turn_id)
+            expected_variant = _prompt_variant(prompt_payload)
+            if expected_variant is not None:
+                provider_id, model_id = _prompt_model(prompt_payload)
+                variant_key = (provider_id, model_id, expected_variant)
+                if variant_key not in server.validated_variants:
+                    _require_supported_variant(
+                        client.list_providers(),
+                        provider_id=provider_id,
+                        model_id=model_id,
+                        variant=expected_variant,
+                    )
+                    server.validated_variants.add(variant_key)
+            client.prompt_async(self._session.session_id, prompt_payload)
             self._armed.set()
             deadline = time.monotonic() + (self.request.run_options.timeout_s or 3600)
             while time.monotonic() < deadline:
@@ -544,6 +558,8 @@ class OpenCodeProviderRunHandle:
                     and status == "idle"
                     and _turn_complete(messages, turn_id)
                 ):
+                    if expected_variant is not None:
+                        _require_persisted_variant(messages, turn_id, expected_variant)
                     self._finish(ProviderRunState.COMPLETED, messages=messages)
                     return
                 time.sleep(0.25)
@@ -604,8 +620,15 @@ class OpenCodeProviderRunHandle:
         }
         if options.agent:
             payload["agent"] = options.agent
-        if options.variant:
-            payload["variant"] = options.variant
+        configured_variant = backend.reasoning_effort if backend is not None else None
+        if options.variant and configured_variant and options.variant != configured_variant:
+            raise ValueError(
+                "OpenCode run variant conflicts with configured model reasoning effort: "
+                f"{options.variant!r} != {configured_variant!r}"
+            )
+        effective_variant = options.variant or configured_variant
+        if effective_variant:
+            payload["variant"] = effective_variant
         if options.tools:
             payload["tools"] = dict(options.tools)
         if options.output_format is not None:
@@ -904,6 +927,79 @@ def _turn_complete(messages: list[object], turn_id: str) -> bool:
         if completed or info.get("finish") is not None or info.get("error") is not None:
             return True
     return False
+
+
+def _prompt_model(payload: Mapping[str, object]) -> tuple[str, str]:
+    model = payload.get("model")
+    if not isinstance(model, Mapping):
+        raise RuntimeError("OpenCode prompt payload is missing model identity")
+    provider_id = model.get("providerID")
+    model_id = model.get("modelID")
+    if not isinstance(provider_id, str) or not provider_id:
+        raise RuntimeError("OpenCode prompt payload is missing providerID")
+    if not isinstance(model_id, str) or not model_id:
+        raise RuntimeError("OpenCode prompt payload is missing modelID")
+    return provider_id, model_id
+
+
+def _prompt_variant(payload: Mapping[str, object]) -> str | None:
+    value = payload.get("variant")
+    return value if isinstance(value, str) and value else None
+
+
+def _require_supported_variant(
+    catalog: Mapping[str, object],
+    *,
+    provider_id: str,
+    model_id: str,
+    variant: str,
+) -> None:
+    providers = catalog.get("all")
+    if not isinstance(providers, list):
+        raise RuntimeError("OpenCode provider catalog is missing the all list")
+    provider = next(
+        (
+            item
+            for item in providers
+            if isinstance(item, Mapping) and item.get("id") == provider_id
+        ),
+        None,
+    )
+    if provider is None:
+        raise ValueError(f"OpenCode provider catalog does not contain {provider_id!r}")
+    models = provider.get("models")
+    model = models.get(model_id) if isinstance(models, Mapping) else None
+    if not isinstance(model, Mapping):
+        raise ValueError(
+            f"OpenCode provider {provider_id!r} does not contain model {model_id!r}"
+        )
+    variants = model.get("variants")
+    if not isinstance(variants, Mapping) or variant not in variants:
+        raise ValueError(
+            f"OpenCode model {provider_id}/{model_id} does not support variant {variant!r}"
+        )
+
+
+def _require_persisted_variant(
+    messages: list[object],
+    turn_id: str,
+    expected_variant: str,
+) -> None:
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        info = message.get("info") if isinstance(message.get("info"), Mapping) else message
+        if info.get("role") != "user" or str(info.get("id") or "") != turn_id:
+            continue
+        model = info.get("model")
+        persisted_variant = model.get("variant") if isinstance(model, Mapping) else None
+        if persisted_variant != expected_variant:
+            raise RuntimeError(
+                "OpenCode persisted user message variant does not match the requested variant: "
+                f"{persisted_variant!r} != {expected_variant!r}"
+            )
+        return
+    raise RuntimeError("OpenCode completed turn is missing its persisted user message")
 
 
 def _event_is_turn_activity(

@@ -296,6 +296,7 @@ def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
     binary = os.environ.get("ARK_OPENCODE_TEST_BINARY")
     auth_path = os.environ.get("ARK_OPENCODE_ACCOUNT_AUTH_JSON")
     model = os.environ.get("ARK_OPENCODE_ACCOUNT_MODEL", "opencode-go/deepseek-v4-flash")
+    variant = os.environ.get("ARK_OPENCODE_ACCOUNT_VARIANT")
     if (
         os.environ.get("ARK_OPENCODE_RUN_REAL_MODELS") != "1"
         or not binary
@@ -340,6 +341,7 @@ def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
             api_provider=provider_id,
             api_mode="chat_completions",
             requested_model=model_id,
+            reasoning_effort=variant,
         ),
         run_options=ProviderRunOptions(timeout_s=180),
         provider_options=OpenCodeRunOptions(
@@ -354,6 +356,20 @@ def test_real_opencode_account_auth_run(tmp_path: Path) -> None:
         assert result.status.value == "completed", result.error
         assert "OPENCODE_ACCOUNT_OK" in (result.final_text or "")
         assert result.turn_usage is not None
+        if variant is not None:
+            messages = registry.client_for_locator(result.session_locator).list_messages(
+                result.session_locator.session_id
+            )
+            user_info = next(
+                message["info"]
+                for message in messages
+                if message.get("info", {}).get("id") == result.turn_locator.turn_id
+            )
+            assert user_info["model"]["variant"] == variant
+            assert {
+                item.model_identity.reasoning_effort
+                for item in result.turn_usage.requests
+            } == {variant}
         isolated_auth = (
             runtime_root
             / "providers"
