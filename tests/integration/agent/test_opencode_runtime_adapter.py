@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from agent_runtime_kit.agent.homes import HomeRecord
+from agent_runtime_kit.agent.homes import HomeRecord, McpServerSpec
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
 from agent_runtime_kit.agent.provider_contracts import (
     BaseConfigSource,
@@ -37,6 +38,7 @@ from agent_runtime_kit.agent.providers.opencode_query import OpenCodeQueryAdapte
 from agent_runtime_kit.agent.providers.opencode_runtime import (
     OpenCodeRuntimeAdapter,
     OpenCodeRuntimeRegistry,
+    _ensure_required_mcp_ready,
 )
 
 
@@ -136,6 +138,75 @@ def test_real_opencode_server_health_session_and_isolated_database(tmp_path: Pat
         assert second.client.health().get("healthy") is True
         assert _tree_hashes(server.config_root) == first_config_runtime
         assert _tree_hashes(home_root) == sealed_home
+    finally:
+        registry.close()
+
+
+def test_real_opencode_required_stdio_mcp_is_ready_without_model_turn(tmp_path: Path) -> None:
+    binary = os.environ.get("ARK_OPENCODE_TEST_BINARY")
+    if not binary:
+        pytest.skip("set ARK_OPENCODE_TEST_BINARY to an OpenCode 1.18.4 executable")
+    mcp_script = tmp_path / "fixture_mcp.py"
+    mcp_script.write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "server = FastMCP('ark-readiness-fixture')\n"
+        "@server.tool()\n"
+        "def ping() -> str:\n"
+        "    return 'pong'\n"
+        "if __name__ == '__main__':\n"
+        "    server.run(transport='stdio')\n",
+        encoding="utf-8",
+    )
+    runtime_root = tmp_path / "runtime"
+    home_root = runtime_root / "homes" / "opencode" / "mcp-ready"
+    renderer = OpenCodeHomeRenderer(runtime_root=runtime_root)
+    materialization = renderer.materialize(
+        ProviderHomeSpec(
+            provider_type="opencode",
+            home_id="mcp-ready",
+            base_config=BaseConfigSource(
+                mapping={"model": "opencode-go/deepseek-v4-flash"}
+            ),
+            mcp_servers=(
+                McpServerSpec(
+                    name="required_fixture",
+                    command=sys.executable,
+                    args=[str(mcp_script)],
+                    required=True,
+                ),
+            ),
+            provider_options=OpenCodeHomeOptions(binary_path=binary),
+        ),
+        home_root,
+    )
+    record = HomeRecord(
+        provider_type="opencode",
+        home_id="mcp-ready",
+        home_relpath="homes/opencode/mcp-ready",
+        materialization_manifest_hash=materialization.manifest_hash,
+    )
+    context = renderer.build_execution_context(record, run_env={}, workdir=str(tmp_path))
+    registry = OpenCodeRuntimeRegistry(runtime_root, binary_path=binary)
+    request = ProviderRunRequest(
+        agent_id="agent-mcp-ready",
+        scope_id="scope-mcp-ready",
+        agent_type="worker",
+        provider_type="opencode",
+        home_id="mcp-ready",
+        prompt="must not be submitted",
+        workdir=str(tmp_path),
+        execution_context=context,
+    )
+    try:
+        server = registry.ensure(request)
+        result = _ensure_required_mcp_ready(
+            server,
+            required_mcp_names=("required_fixture",),
+        )
+        assert result.attempts <= 3
+        assert server.client.mcp_status()["required_fixture"]["status"] == "connected"
+        assert server.client.session_status() == {}
+        assert not server.database_path.exists() or server.database_path.stat().st_size >= 0
     finally:
         registry.close()
 

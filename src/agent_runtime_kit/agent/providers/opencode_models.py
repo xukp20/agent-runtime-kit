@@ -47,6 +47,19 @@ class OpenCodeRunOptions:
 
 
 @dataclass(frozen=True)
+class OpenCodeTransientRetryPolicy:
+    max_attempts: int = 3
+    initial_delay_s: float = 0.25
+    max_delay_s: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("OpenCode transient retry max_attempts must be positive")
+        if self.initial_delay_s < 0 or self.max_delay_s < 0:
+            raise ValueError("OpenCode transient retry delays must be non-negative")
+
+
+@dataclass(frozen=True)
 class OpenCodeNativeLocator:
     agent_id: str
     directory: str

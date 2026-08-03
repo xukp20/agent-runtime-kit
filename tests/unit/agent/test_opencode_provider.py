@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -35,11 +35,18 @@ from agent_runtime_kit.agent.providers.opencode_bundle import (
     build_opencode_provider_bundle,
 )
 from agent_runtime_kit.agent.providers.opencode_home import OpenCodeHomeRenderer
-from agent_runtime_kit.agent.providers.opencode_models import OpenCodeHomeOptions, OpenCodeRunOptions
+from agent_runtime_kit.agent.providers.opencode_models import (
+    OpenCodeHomeOptions,
+    OpenCodeRunOptions,
+    OpenCodeTransientRetryPolicy,
+)
 from agent_runtime_kit.agent.providers.opencode_query import OpenCodeQueryAdapter, project_turns
 from agent_runtime_kit.agent.providers.opencode_runtime import (
+    OpenCodeMcpReadinessError,
+    OpenCodeMcpReadinessPolicy,
     OpenCodeRuntimeRegistry,
     _environment_fingerprint,
+    _ensure_required_mcp_ready,
     _message_id,
     _require_persisted_variant,
     _require_supported_variant,
@@ -69,6 +76,152 @@ class _EnvironmentProcess:
 
     def poll(self) -> int | None:
         return self.returncode
+
+
+class _McpReadinessClient:
+    def __init__(self, statuses: list[dict[str, object]]) -> None:
+        self.statuses = list(statuses)
+        self.status_calls = 0
+        self.connect_calls: list[str] = []
+
+    def mcp_status(self) -> dict[str, object]:
+        index = min(self.status_calls, len(self.statuses) - 1)
+        self.status_calls += 1
+        return self.statuses[index]
+
+    def connect_mcp(self, name: str) -> bool:
+        self.connect_calls.append(name)
+        return True
+
+
+@dataclass
+class _McpReadinessServer:
+    agent_id: str
+    client: _McpReadinessClient
+    ready_mcp_names: set[str]
+
+
+def test_opencode_client_exposes_authoritative_mcp_status_and_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OpenCodeClient(
+        "http://127.0.0.1:4096",
+        password="secret",
+        directory=str(tmp_path),
+    )
+    calls: list[tuple[str, str, object | None]] = []
+
+    def request(method: str, path: str, *, payload=None, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        del kwargs
+        calls.append((method, path, payload))
+        return {"lc_app": {"status": "connected"}} if method == "GET" else True
+
+    monkeypatch.setattr(client, "request", request)
+
+    assert client.mcp_status() == {"lc_app": {"status": "connected"}}
+    assert client.connect_mcp("lc/app") is True
+    assert calls == [
+        ("GET", "/mcp", None),
+        ("POST", "/mcp/lc%2Fapp/connect", {}),
+    ]
+
+
+def test_opencode_required_mcp_readiness_is_cached_per_server() -> None:
+    client = _McpReadinessClient(
+        [{"lc_app": {"status": "connected"}, "optional": {"status": "failed"}}]
+    )
+    server = _McpReadinessServer("agent-1", client, set())
+    policy = OpenCodeMcpReadinessPolicy(max_attempts=3, initial_delay_s=0, max_delay_s=0)
+
+    first = _ensure_required_mcp_ready(
+        server,
+        required_mcp_names=("lc_app",),
+        policy=policy,
+    )
+    second = _ensure_required_mcp_ready(
+        server,
+        required_mcp_names=("lc_app",),
+        policy=policy,
+    )
+
+    assert first.attempts == 1
+    assert first.reconnected == ()
+    assert second.cached is True
+    assert client.status_calls == 1
+    assert client.connect_calls == []
+
+
+def test_opencode_required_mcp_readiness_reconnects_within_budget() -> None:
+    client = _McpReadinessClient(
+        [
+            {"lc_app": {"status": "failed", "error": "connection refused"}},
+            {"lc_app": {"status": "connected"}},
+        ]
+    )
+    server = _McpReadinessServer("agent-1", client, set())
+
+    result = _ensure_required_mcp_ready(
+        server,
+        required_mcp_names=("lc_app",),
+        policy=OpenCodeMcpReadinessPolicy(
+            max_attempts=3,
+            initial_delay_s=0,
+            max_delay_s=0,
+        ),
+    )
+
+    assert result.attempts == 2
+    assert result.reconnected == ("lc_app",)
+    assert client.connect_calls == ["lc_app"]
+    assert server.ready_mcp_names == {"lc_app"}
+
+
+@pytest.mark.parametrize("status", ["disabled", "needs_auth", "needs_client_registration"])
+def test_opencode_required_mcp_readiness_rejects_deterministic_status(status: str) -> None:
+    client = _McpReadinessClient([{"lc_app": {"status": status}}])
+    server = _McpReadinessServer("agent-1", client, set())
+
+    with pytest.raises(OpenCodeMcpReadinessError) as exc_info:
+        _ensure_required_mcp_ready(
+            server,
+            required_mcp_names=("lc_app",),
+            policy=OpenCodeMcpReadinessPolicy(
+                max_attempts=3,
+                initial_delay_s=0,
+                max_delay_s=0,
+            ),
+        )
+
+    assert exc_info.value.retryable is False
+    assert exc_info.value.model_turn_started is False
+    assert exc_info.value.attempts == 1
+    assert client.connect_calls == []
+
+
+def test_opencode_required_mcp_readiness_fails_typed_before_model_after_budget() -> None:
+    client = _McpReadinessClient(
+        [{"lc_app": {"status": "failed", "error": "temporarily unavailable"}}]
+    )
+    server = _McpReadinessServer("agent-1", client, set())
+
+    with pytest.raises(OpenCodeMcpReadinessError) as exc_info:
+        _ensure_required_mcp_ready(
+            server,
+            required_mcp_names=("lc_app",),
+            policy=OpenCodeMcpReadinessPolicy(
+                max_attempts=3,
+                initial_delay_s=0,
+                max_delay_s=0,
+            ),
+        )
+
+    assert exc_info.value.retryable is True
+    assert exc_info.value.required_mcp_names == ("lc_app",)
+    assert exc_info.value.attempts == 3
+    assert exc_info.value.model_turn_started is False
+    assert client.status_calls == 3
+    assert client.connect_calls == ["lc_app", "lc_app"]
 
 
 @dataclass
@@ -184,6 +337,7 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
                     name="lean",
                     command="python",
                     args=["-m", "lean_mcp"],
+                    required=True,
                     env_vars=["LEAN_TOKEN"],
                     result_profile="content_only",
                 ),
@@ -214,6 +368,8 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
         == "content_only"
     )
     assert config["tools"] == {"bash": False, "mcp_lean_*": True}
+    assert result.provider_payload is not None
+    assert result.provider_payload.sanitized_data["required_mcp_names"] == ["lean"]
     assert (home_root / "AGENTS.md").read_text() == "Keep changes surgical.\n"
     assert (home_root / "skills" / "proof" / "SKILL.md").is_file()
     assert (home_root / "agents" / "reviewer.md").is_file()
@@ -261,6 +417,7 @@ def test_opencode_home_materializes_resources_and_isolated_context(tmp_path: Pat
     assert "OPENCODE_CONFIG" not in context.process_environment
     assert "OPENCODE_CONFIG_CONTENT" not in context.process_environment
     assert context.process_environment["MAPPED_TOKEN"] == "source-secret"
+    assert context.runtime_payload["required_mcp_names"] == ["lean"]
     registry = OpenCodeRuntimeRegistry(runtime_root)
     config_root = registry._prepare_config_runtime(context)
     assert config_root != home_root
@@ -896,6 +1053,7 @@ class _InteractionServer:
     directory: str
     database_path: Path
     runtime_root: Path
+    validated_variants: set[tuple[str, str, str]] = field(default_factory=set)
 
 
 class _InteractionRegistry:
@@ -955,6 +1113,274 @@ def test_opencode_run_handle_keeps_interaction_alive(tmp_path: Path) -> None:
     result = handle.wait_terminal(3)
     assert result.status.value == "completed"
     assert result.final_text == "approved"
+    handle.close()
+
+
+class _TransientProviderClient:
+    def __init__(
+        self,
+        failures: list[str],
+        *,
+        include_completed_tool: bool = False,
+    ) -> None:
+        self.session_id = "ses_transient"
+        self.failures = list(failures)
+        self.include_completed_tool = include_completed_tool
+        self.messages: list[object] = []
+        self.prompt_ids: list[str] = []
+        self._emitted = 0
+        self._busy = False
+        self._lock = threading.RLock()
+
+    def create_session(self):  # noqa: ANN201
+        return {"id": self.session_id}
+
+    def list_providers(self) -> dict[str, object]:
+        return {
+            "all": [
+                {
+                    "id": "opencode-go",
+                    "models": {
+                        "deepseek-v4-flash": {"variants": {"max": {}}},
+                    },
+                }
+            ]
+        }
+
+    def list_messages(self, session_id: str) -> list[object]:
+        assert session_id == self.session_id
+        with self._lock:
+            return list(self.messages)
+
+    def prompt_async(self, session_id: str, payload) -> None:  # noqa: ANN001
+        assert session_id == self.session_id
+        turn_id = str(payload["messageID"])
+        with self._lock:
+            self.prompt_ids.append(turn_id)
+            self.messages.append(
+                {
+                    "info": {
+                        "id": turn_id,
+                        "role": "user",
+                        "model": {
+                            **payload["model"],
+                            **(
+                                {"variant": payload["variant"]}
+                                if payload.get("variant") is not None
+                                else {}
+                            ),
+                        },
+                        "time": {"created": 1000 + len(self.prompt_ids)},
+                    },
+                    "parts": payload["parts"],
+                }
+            )
+            self._busy = True
+
+    def session_status(self):  # noqa: ANN201
+        with self._lock:
+            return {self.session_id: {"type": "busy"}} if self._busy else {}
+
+    def iter_events(self, stop):  # noqa: ANN001, ANN201
+        yield OpenCodeSseEvent(
+            event="message", data={"type": "server.connected", "properties": {}}
+        )
+        while not stop.wait(0.005):
+            with self._lock:
+                if self._emitted >= len(self.prompt_ids):
+                    continue
+                attempt = self._emitted
+                turn_id = self.prompt_ids[attempt]
+                self._emitted += 1
+                if attempt < len(self.failures):
+                    parts: list[object] = []
+                    if self.include_completed_tool:
+                        parts.append(
+                            {
+                                "id": f"tool_{attempt}",
+                                "type": "tool",
+                                "tool": "submit_truth",
+                                "state": {
+                                    "status": "completed",
+                                    "input": {},
+                                    "output": "accepted",
+                                },
+                            }
+                        )
+                    error = self.failures[attempt]
+                    self.messages.append(
+                        {
+                            "info": {
+                                "id": f"assistant_{attempt}",
+                                "role": "assistant",
+                                "parentID": turn_id,
+                                "providerID": "opencode-go",
+                                "modelID": "deepseek-v4-flash",
+                                "error": {"message": error},
+                                "time": {"created": 1100, "completed": 1200},
+                            },
+                            "parts": parts,
+                        }
+                    )
+                    self._busy = False
+                    event = OpenCodeSseEvent(
+                        event="message",
+                        data={
+                            "type": "session.error",
+                            "properties": {
+                                "sessionID": self.session_id,
+                                "error": {"message": error},
+                            },
+                        },
+                    )
+                else:
+                    self.messages.append(
+                        {
+                            "info": {
+                                "id": f"assistant_{attempt}",
+                                "role": "assistant",
+                                "parentID": turn_id,
+                                "providerID": "opencode-go",
+                                "modelID": "deepseek-v4-flash",
+                                "finish": "stop",
+                                "time": {"created": 1100, "completed": 1200},
+                            },
+                            "parts": [
+                                {
+                                    "id": f"text_{attempt}",
+                                    "type": "text",
+                                    "text": "recovered",
+                                }
+                            ],
+                        }
+                    )
+                    self._busy = False
+                    event = OpenCodeSseEvent(
+                        event="message",
+                        data={
+                            "type": "message.updated",
+                            "properties": {
+                                "sessionID": self.session_id,
+                                "info": {"parentID": turn_id, "role": "assistant"},
+                            },
+                        },
+                    )
+            yield event
+
+
+def _transient_request(tmp_path: Path) -> ProviderRunRequest:
+    context = ProviderExecutionContext(
+        provider_type="opencode",
+        home_id="main",
+        home_root=tmp_path / "home",
+        process_environment={},
+        resolved_defaults=ModelBackendIdentity(
+            api_provider="opencode-go",
+            api_mode="chat_completions",
+            requested_model="deepseek-v4-flash",
+            reasoning_effort="max",
+        ),
+    )
+    return ProviderRunRequest(
+        agent_id="agent-1",
+        scope_id="scope-1",
+        agent_type="worker",
+        provider_type="opencode",
+        home_id="main",
+        prompt="continue the task",
+        workdir=str(tmp_path),
+        run_options=ProviderRunOptions(timeout_s=5),
+        execution_context=context,
+    )
+
+
+def test_opencode_transient_provider_error_retries_before_effect_and_recovers(
+    tmp_path: Path,
+) -> None:
+    client = _TransientProviderClient(["Model unavailable"])
+    registry = _InteractionRegistry(tmp_path, client=client)
+    registry.transient_retry_policy = OpenCodeTransientRetryPolicy(
+        max_attempts=3,
+        initial_delay_s=0,
+        max_delay_s=0,
+    )
+
+    handle = OpenCodeProviderRunHandle(registry, _transient_request(tmp_path), resume=False)
+    result = handle.wait_terminal(3)
+
+    assert result.status.value == "completed"
+    assert result.final_text == "recovered"
+    assert len(client.prompt_ids) == 2
+    assert result.session_locator.session_id == client.session_id
+    assert result.turn_locator.turn_id == client.prompt_ids[-1]
+    retry_events = [event for event in handle.drain_events().events if event.kind == "turn.retry_scheduled"]
+    assert len(retry_events) == 1
+    assert retry_events[0].data["classification"] == "model_unavailable"
+    handle.close()
+
+
+def test_opencode_transient_provider_error_exhaustion_returns_typed_failure(
+    tmp_path: Path,
+) -> None:
+    client = _TransientProviderClient(["Model unavailable"] * 3)
+    registry = _InteractionRegistry(tmp_path, client=client)
+    registry.transient_retry_policy = OpenCodeTransientRetryPolicy(
+        max_attempts=3,
+        initial_delay_s=0,
+        max_delay_s=0,
+    )
+
+    result = OpenCodeProviderRunHandle(
+        registry,
+        _transient_request(tmp_path),
+        resume=False,
+    ).wait_terminal(3)
+
+    assert result.status.value == "failed"
+    assert result.error is not None
+    assert result.error.error_type == "opencode_transient_provider_exhausted"
+    assert len(client.prompt_ids) == 3
+
+
+def test_opencode_non_retryable_provider_error_is_not_replayed(tmp_path: Path) -> None:
+    client = _TransientProviderClient(["Unauthorized: invalid API key"])
+    registry = _InteractionRegistry(tmp_path, client=client)
+    registry.transient_retry_policy = OpenCodeTransientRetryPolicy(
+        max_attempts=3,
+        initial_delay_s=0,
+        max_delay_s=0,
+    )
+
+    result = OpenCodeProviderRunHandle(
+        registry,
+        _transient_request(tmp_path),
+        resume=False,
+    ).wait_terminal(3)
+
+    assert result.status.value == "failed"
+    assert result.error is not None
+    assert result.error.error_type == "opencode_session_error"
+    assert len(client.prompt_ids) == 1
+
+
+def test_opencode_transient_error_after_completed_tool_is_not_replayed(tmp_path: Path) -> None:
+    client = _TransientProviderClient(
+        ["Model unavailable"],
+        include_completed_tool=True,
+    )
+    registry = _InteractionRegistry(tmp_path, client=client)
+    registry.transient_retry_policy = OpenCodeTransientRetryPolicy(
+        max_attempts=3,
+        initial_delay_s=0,
+        max_delay_s=0,
+    )
+    handle = OpenCodeProviderRunHandle(registry, _transient_request(tmp_path), resume=False)
+
+    result = handle.wait_terminal(3)
+
+    assert result.status.value == "failed"
+    assert len(client.prompt_ids) == 1
+    assert any(event.kind == "turn.retry_blocked" for event in handle.drain_events().events)
     handle.close()
 
 

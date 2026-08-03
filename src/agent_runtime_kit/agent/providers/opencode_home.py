@@ -41,7 +41,7 @@ MUTABLE_CONFIG_RUNTIME_NAMES = frozenset(
 
 class OpenCodeHomeRenderer:
     provider_type = PROVIDER_TYPE
-    renderer_version = "opencode-home-v1"
+    renderer_version = "opencode-home-v2"
 
     def __init__(self, *, runtime_root: Path) -> None:
         self.runtime_root = Path(runtime_root)
@@ -101,6 +101,7 @@ class OpenCodeHomeRenderer:
                 | set(spec.fixed_env_refs.values())
             )
         )
+        required_mcp_names = _required_mcp_names(spec.mcp_servers)
         config_path = root / options.config_filename
         config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         auth_root = root / ".opencode"
@@ -149,6 +150,7 @@ class OpenCodeHomeRenderer:
                     "allow_project_config": options.allow_project_config,
                     "config_filename": options.config_filename,
                     "fixed_env_refs": dict(spec.fixed_env_refs),
+                    "required_mcp_names": list(required_mcp_names),
                 },
             ),
         )
@@ -194,6 +196,11 @@ class OpenCodeHomeRenderer:
         home_root = self.runtime_root / str(getattr(home, "home_relpath"))
         manifest_path = home_root / ".ark" / "home_materialization.json"
         payload = read_json(manifest_path)
+        if payload.get("renderer_version") != self.renderer_version:
+            raise RuntimeError(
+                f"OpenCode Home requires current renderer {self.renderer_version}: "
+                f"{getattr(home, 'home_id')}"
+            )
         declared = str(payload.get("manifest_hash", ""))
         if (
             declared != str(getattr(home, "materialization_manifest_hash", ""))
@@ -217,6 +224,13 @@ class OpenCodeHomeRenderer:
             and isinstance(options_payload.get("sanitized_data"), Mapping)
             else {}
         )
+        raw_required_mcp_names = options_data.get("required_mcp_names")
+        if not isinstance(raw_required_mcp_names, list) or any(
+            not isinstance(name, str) or not name.strip()
+            for name in raw_required_mcp_names
+        ):
+            raise RuntimeError("OpenCode Home manifest is missing current required MCP names")
+        required_mcp_names = sorted(set(raw_required_mcp_names))
         fixed_env_refs = options_data.get("fixed_env_refs")
         if isinstance(fixed_env_refs, Mapping):
             for target_name, source_name in fixed_env_refs.items():
@@ -253,6 +267,7 @@ class OpenCodeHomeRenderer:
                 "runtime_root": str(self.runtime_root),
                 "allow_project_config": allow_project_config,
                 "materialization_manifest_hash": declared,
+                "required_mcp_names": required_mcp_names,
             },
         )
 
@@ -397,6 +412,20 @@ def _mcp_config(servers: tuple[object, ...]) -> dict[str, object]:
             raise ValueError(f"OpenCode MCP server {name} requires command or url")
         values[name] = item
     return {"mcp": values} if values else {}
+
+
+def _required_mcp_names(servers: tuple[object, ...]) -> tuple[str, ...]:
+    names: list[str] = []
+    for server in servers:
+        if not bool(getattr(server, "required", False)):
+            continue
+        name = str(getattr(server, "name", "")).strip()
+        if not name:
+            raise ValueError("required OpenCode MCP server requires a name")
+        if not bool(getattr(server, "enabled", True)):
+            raise ValueError(f"required OpenCode MCP server must be enabled: {name}")
+        names.append(name)
+    return tuple(sorted(set(names)))
 
 
 def _tools_config(tools: tuple[object, ...]) -> dict[str, object]:

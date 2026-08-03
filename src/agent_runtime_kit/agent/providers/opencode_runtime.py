@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -33,12 +34,13 @@ from ..provider_contracts import (
     build_provider_payload,
 )
 from ..store_utils import utc_now_iso
-from .opencode_client import OpenCodeClient, OpenCodeClientError, event_properties
+from .opencode_client import OpenCodeClient, OpenCodeClientError, _safe_body, event_properties
 from .opencode_home import MUTABLE_CONFIG_RUNTIME_NAMES
 from .opencode_models import (
     ADAPTER_VERSION,
     OpenCodeNativeLocator,
     OpenCodeRunOptions,
+    OpenCodeTransientRetryPolicy,
     PROVIDER_TYPE,
     SUPPORTED_CLI_VERSION,
     parse_native_locator,
@@ -58,6 +60,7 @@ class OpenCodeServer:
     password: str
     environment_fingerprint: str
     validated_variants: set[tuple[str, str, str]] = field(default_factory=set)
+    ready_mcp_names: set[str] = field(default_factory=set)
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -70,12 +73,239 @@ class OpenCodeServer:
             self.process.wait(timeout=5)
 
 
+@dataclass(frozen=True)
+class OpenCodeMcpReadinessPolicy:
+    max_attempts: int = 3
+    initial_delay_s: float = 0.25
+    max_delay_s: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("OpenCode MCP readiness max_attempts must be positive")
+        if self.initial_delay_s < 0 or self.max_delay_s < 0:
+            raise ValueError("OpenCode MCP readiness delays must be non-negative")
+
+
+@dataclass(frozen=True)
+class OpenCodeMcpReadinessResult:
+    required_mcp_names: tuple[str, ...]
+    attempts: int
+    elapsed_s: float
+    reconnected: tuple[str, ...] = ()
+    cached: bool = False
+
+
+class OpenCodeMcpReadinessError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        required_mcp_names: tuple[str, ...],
+        statuses: Mapping[str, str],
+        attempts: int,
+        elapsed_s: float,
+        retryable: bool,
+        reconnected: tuple[str, ...] = (),
+        reason: str,
+    ) -> None:
+        self.agent_id = agent_id
+        self.required_mcp_names = required_mcp_names
+        self.statuses = dict(statuses)
+        self.attempts = attempts
+        self.elapsed_s = elapsed_s
+        self.retryable = retryable
+        self.reconnected = reconnected
+        self.process_healthy = True
+        self.model_turn_started = False
+        super().__init__(
+            "OpenCode required MCP readiness failed before model turn "
+            f"for {agent_id} after {attempts} attempt(s): {_safe_body(reason)}"
+        )
+
+    def event_data(self) -> dict[str, object]:
+        return {
+            "agent_id": self.agent_id,
+            "required_mcp_names": list(self.required_mcp_names),
+            "statuses": dict(self.statuses),
+            "attempts": self.attempts,
+            "elapsed_s": self.elapsed_s,
+            "retryable": self.retryable,
+            "reconnected": list(self.reconnected),
+            "process_healthy": self.process_healthy,
+            "model_turn_started": self.model_turn_started,
+        }
+
+
+def _ensure_required_mcp_ready(
+    server: OpenCodeServer,
+    *,
+    required_mcp_names: tuple[str, ...],
+    policy: OpenCodeMcpReadinessPolicy | None = None,
+) -> OpenCodeMcpReadinessResult:
+    required = tuple(sorted(set(required_mcp_names)))
+    pending = tuple(name for name in required if name not in server.ready_mcp_names)
+    if not pending:
+        return OpenCodeMcpReadinessResult(
+            required_mcp_names=required,
+            attempts=0,
+            elapsed_s=0.0,
+            cached=True,
+        )
+    resolved_policy = policy or OpenCodeMcpReadinessPolicy()
+    started = time.monotonic()
+    reconnected: set[str] = set()
+    last_statuses: dict[str, str] = {}
+    last_reason = "required MCP status was not observed"
+    for attempt in range(1, resolved_policy.max_attempts + 1):
+        try:
+            status_map = server.client.mcp_status()
+        except OpenCodeClientError as exc:
+            retryable = _opencode_client_error_is_retryable(exc)
+            last_reason = str(exc)
+            if not retryable or attempt == resolved_policy.max_attempts:
+                raise OpenCodeMcpReadinessError(
+                    agent_id=server.agent_id,
+                    required_mcp_names=required,
+                    statuses=last_statuses,
+                    attempts=attempt,
+                    elapsed_s=time.monotonic() - started,
+                    retryable=retryable,
+                    reconnected=tuple(sorted(reconnected)),
+                    reason=last_reason,
+                ) from exc
+            _sleep_mcp_backoff(resolved_policy, attempt)
+            continue
+
+        missing = [name for name in pending if name not in status_map]
+        if missing:
+            raise OpenCodeMcpReadinessError(
+                agent_id=server.agent_id,
+                required_mcp_names=required,
+                statuses=last_statuses,
+                attempts=attempt,
+                elapsed_s=time.monotonic() - started,
+                retryable=False,
+                reconnected=tuple(sorted(reconnected)),
+                reason=f"required MCP server is not configured: {', '.join(missing)}",
+            )
+
+        retry_names: list[str] = []
+        deterministic: list[str] = []
+        for name in pending:
+            raw = status_map[name]
+            if not isinstance(raw, Mapping):
+                deterministic.append(f"{name}=invalid_status")
+                last_statuses[name] = "invalid_status"
+                continue
+            status = str(raw.get("status") or "unknown")
+            last_statuses[name] = status
+            if status == "connected":
+                continue
+            if status in {"disabled", "needs_auth", "needs_client_registration"}:
+                deterministic.append(f"{name}={status}")
+                continue
+            if status == "failed" and not _mcp_failure_is_retryable(str(raw.get("error") or "")):
+                deterministic.append(f"{name}=failed")
+                last_reason = str(raw.get("error") or "deterministic MCP connection failure")
+                continue
+            if status in {"failed", "connecting"}:
+                retry_names.append(name)
+                last_reason = str(raw.get("error") or status)
+                continue
+            deterministic.append(f"{name}={status}")
+
+        if deterministic:
+            raise OpenCodeMcpReadinessError(
+                agent_id=server.agent_id,
+                required_mcp_names=required,
+                statuses=last_statuses,
+                attempts=attempt,
+                elapsed_s=time.monotonic() - started,
+                retryable=False,
+                reconnected=tuple(sorted(reconnected)),
+                reason=last_reason if "failed" in deterministic else ", ".join(deterministic),
+            )
+        if not retry_names:
+            server.ready_mcp_names.update(required)
+            return OpenCodeMcpReadinessResult(
+                required_mcp_names=required,
+                attempts=attempt,
+                elapsed_s=time.monotonic() - started,
+                reconnected=tuple(sorted(reconnected)),
+            )
+        if attempt == resolved_policy.max_attempts:
+            raise OpenCodeMcpReadinessError(
+                agent_id=server.agent_id,
+                required_mcp_names=required,
+                statuses=last_statuses,
+                attempts=attempt,
+                elapsed_s=time.monotonic() - started,
+                retryable=True,
+                reconnected=tuple(sorted(reconnected)),
+                reason=last_reason,
+            )
+        for name in retry_names:
+            try:
+                server.client.connect_mcp(name)
+            except OpenCodeClientError as exc:
+                if not _opencode_client_error_is_retryable(exc):
+                    raise OpenCodeMcpReadinessError(
+                        agent_id=server.agent_id,
+                        required_mcp_names=required,
+                        statuses=last_statuses,
+                        attempts=attempt,
+                        elapsed_s=time.monotonic() - started,
+                        retryable=False,
+                        reconnected=tuple(sorted(reconnected)),
+                        reason=str(exc),
+                    ) from exc
+                last_reason = str(exc)
+            reconnected.add(name)
+        _sleep_mcp_backoff(resolved_policy, attempt)
+    raise AssertionError("unreachable OpenCode MCP readiness state")
+
+
+def _sleep_mcp_backoff(policy: OpenCodeMcpReadinessPolicy, attempt: int) -> None:
+    delay = min(policy.max_delay_s, policy.initial_delay_s * (2 ** (attempt - 1)))
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _opencode_client_error_is_retryable(error: OpenCodeClientError) -> bool:
+    return error.status is None or error.status in {408, 409, 429} or (
+        error.status is not None and 500 <= error.status < 600
+    )
+
+
+def _mcp_failure_is_retryable(reason: str) -> bool:
+    normalized = reason.casefold()
+    deterministic_markers = (
+        "401",
+        "403",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "invalid url",
+        "malformed",
+    )
+    return not any(marker in normalized for marker in deterministic_markers)
+
+
 class OpenCodeRuntimeRegistry:
     provider_type = PROVIDER_TYPE
 
-    def __init__(self, runtime_root: Path, *, binary_path: str | Path = "opencode") -> None:
+    def __init__(
+        self,
+        runtime_root: Path,
+        *,
+        binary_path: str | Path = "opencode",
+        transient_retry_policy: OpenCodeTransientRetryPolicy | None = None,
+    ) -> None:
         self.runtime_root = Path(runtime_root)
         self.binary_path = str(binary_path)
+        self.transient_retry_policy = (
+            transient_retry_policy or OpenCodeTransientRetryPolicy()
+        )
         self._servers: dict[str, OpenCodeServer] = {}
         self._lock = threading.RLock()
 
@@ -361,6 +591,18 @@ def _has_ark_runtime_identity(request: ProviderRunRequest) -> bool:
     return all(environment.get(name) for name in ("ARK_STEP_ID", "ARK_FLOW_ID", "ARK_AGENT_ID"))
 
 
+def _required_mcp_names(context: ProviderExecutionContext | None) -> tuple[str, ...]:
+    if context is None or not isinstance(context.runtime_payload, Mapping):
+        return ()
+    raw = context.runtime_payload.get("required_mcp_names", ())
+    if not isinstance(raw, (list, tuple)) or any(
+        not isinstance(name, str) or not name.strip()
+        for name in raw
+    ):
+        raise RuntimeError("OpenCode execution context has invalid required MCP names")
+    return tuple(sorted(set(raw)))
+
+
 class OpenCodeProviderRunHandle:
     def __init__(self, registry: OpenCodeRuntimeRegistry, request: ProviderRunRequest, *, resume: bool) -> None:
         self.registry = registry
@@ -485,6 +727,27 @@ class OpenCodeProviderRunHandle:
         try:
             server = self.registry.ensure(self.request)
             client = server.client
+            required_mcp_names = _required_mcp_names(self.request.execution_context)
+            try:
+                readiness = _ensure_required_mcp_ready(
+                    server,
+                    required_mcp_names=required_mcp_names,
+                )
+            except OpenCodeMcpReadinessError as exc:
+                self._append_event("mcp.readiness_failed", data=exc.event_data())
+                raise
+            if required_mcp_names:
+                self._append_event(
+                    "mcp.ready",
+                    data={
+                        "required_mcp_names": list(required_mcp_names),
+                        "attempts": readiness.attempts,
+                        "elapsed_s": readiness.elapsed_s,
+                        "reconnected": list(readiness.reconnected),
+                        "cached": readiness.cached,
+                        "model_turn_started": False,
+                    },
+                )
             if self.resume:
                 if self._session is None:
                     raise ValueError("OpenCode resume requires session_locator")
@@ -517,21 +780,13 @@ class OpenCodeProviderRunHandle:
                 raise TimeoutError("OpenCode SSE did not report server.connected")
             with self._lock:
                 self._state = ProviderRunState.RUNNING
-            prompt_payload = self._prompt_payload(turn_id)
-            expected_variant = _prompt_variant(prompt_payload)
-            if expected_variant is not None:
-                provider_id, model_id = _prompt_model(prompt_payload)
-                variant_key = (provider_id, model_id, expected_variant)
-                if variant_key not in server.validated_variants:
-                    _require_supported_variant(
-                        client.list_providers(),
-                        provider_id=provider_id,
-                        model_id=model_id,
-                        variant=expected_variant,
-                    )
-                    server.validated_variants.add(variant_key)
-            client.prompt_async(self._session.session_id, prompt_payload)
-            self._armed.set()
+            expected_variant = self._submit_prompt_attempt(server, turn_id)
+            attempt = 1
+            retry_policy = getattr(
+                self.registry,
+                "transient_retry_policy",
+                OpenCodeTransientRetryPolicy(),
+            )
             deadline = time.monotonic() + (self.request.run_options.timeout_s or 3600)
             while time.monotonic() < deadline:
                 messages = client.list_messages(self._session.session_id)
@@ -547,6 +802,80 @@ class OpenCodeProviderRunHandle:
                         raise TimeoutError("OpenCode interaction was not answered before run timeout")
                     continue
                 if self._armed.is_set() and status == "idle" and self._provider_error is not None:
+                    classification = _classify_transient_opencode_error(self._provider_error)
+                    has_tool_side_effect = _turn_has_tool_side_effect(messages, turn_id)
+                    if classification is not None and has_tool_side_effect:
+                        self._append_event(
+                            "turn.retry_blocked",
+                            data={
+                                "classification": classification,
+                                "failed_attempt": attempt,
+                                "max_attempts": retry_policy.max_attempts,
+                                "reason": "tool_side_effect_or_uncertain_tool_state",
+                                "session_id": self._session.session_id,
+                                "turn_id": turn_id,
+                            },
+                        )
+                    elif classification is not None and attempt < retry_policy.max_attempts:
+                        delay_s = min(
+                            retry_policy.max_delay_s,
+                            retry_policy.initial_delay_s * (2 ** (attempt - 1)),
+                        )
+                        self._append_event(
+                            "turn.retry_scheduled",
+                            data={
+                                "classification": classification,
+                                "failed_attempt": attempt,
+                                "next_attempt": attempt + 1,
+                                "max_attempts": retry_policy.max_attempts,
+                                "delay_s": delay_s,
+                                "session_id": self._session.session_id,
+                                "turn_id": turn_id,
+                                "has_tool_side_effect": False,
+                            },
+                        )
+                        if delay_s > 0:
+                            time.sleep(delay_s)
+                        attempt += 1
+                        self._provider_error = None
+                        self._turn_seen.clear()
+                        self._armed.clear()
+                        turn_id = _message_id()
+                        self._turn = ProviderTurnLocator(
+                            session=self._session,
+                            turn_id=turn_id,
+                        )
+                        expected_variant = self._submit_prompt_attempt(server, turn_id)
+                        continue
+                    elif classification is not None:
+                        original = self._provider_error
+                        self._provider_error = AgentError(
+                            error_type="opencode_transient_provider_exhausted",
+                            message=(
+                                f"OpenCode transient provider failure exhausted "
+                                f"{attempt} attempts: {_safe_body(original.message)}"
+                            ),
+                            provider_payload=build_provider_payload(
+                                provider_type=PROVIDER_TYPE,
+                                payload_type="transient_provider_exhausted",
+                                data={
+                                    "classification": classification,
+                                    "attempts": attempt,
+                                    "last_error_type": original.error_type,
+                                },
+                                adapter_version=ADAPTER_VERSION,
+                            ),
+                        )
+                        self._append_event(
+                            "turn.retry_exhausted",
+                            data={
+                                "classification": classification,
+                                "attempts": attempt,
+                                "max_attempts": retry_policy.max_attempts,
+                                "session_id": self._session.session_id,
+                                "turn_id": turn_id,
+                            },
+                        )
                     self._finish(ProviderRunState.FAILED, messages=messages)
                     return
                 if self._interrupt_requested.is_set() and status == "idle":
@@ -604,6 +933,25 @@ class OpenCodeProviderRunHandle:
         except BaseException as exc:
             if not self._stop_sse.is_set() and not self._done.is_set():
                 self._append_event("stream.disconnected", data={"error_type": type(exc).__name__})
+
+    def _submit_prompt_attempt(self, server: OpenCodeServer, turn_id: str) -> str | None:
+        assert self._session is not None
+        prompt_payload = self._prompt_payload(turn_id)
+        expected_variant = _prompt_variant(prompt_payload)
+        if expected_variant is not None:
+            provider_id, model_id = _prompt_model(prompt_payload)
+            variant_key = (provider_id, model_id, expected_variant)
+            if variant_key not in server.validated_variants:
+                _require_supported_variant(
+                    server.client.list_providers(),
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    variant=expected_variant,
+                )
+                server.validated_variants.add(variant_key)
+        server.client.prompt_async(self._session.session_id, prompt_payload)
+        self._armed.set()
+        return expected_variant
 
     def _prompt_payload(self, turn_id: str) -> dict[str, object]:
         options = self.request.provider_options
@@ -927,6 +1275,55 @@ def _turn_complete(messages: list[object], turn_id: str) -> bool:
         if completed or info.get("finish") is not None or info.get("error") is not None:
             return True
     return False
+
+
+def _turn_has_tool_side_effect(messages: list[object], turn_id: str) -> bool:
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        info = message.get("info") if isinstance(message.get("info"), Mapping) else message
+        if info.get("role") != "assistant" or str(info.get("parentID") or "") != turn_id:
+            continue
+        parts = message.get("parts") if isinstance(message.get("parts"), list) else ()
+        for part in parts:
+            if not isinstance(part, Mapping) or part.get("type") != "tool":
+                continue
+            state = part.get("state") if isinstance(part.get("state"), Mapping) else {}
+            if str(state.get("status") or "unknown") != "pending":
+                return True
+    return False
+
+
+def _classify_transient_opencode_error(error: AgentError) -> str | None:
+    message = error.message.casefold()
+    non_retryable_markers = (
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "invalid model",
+        "model not found",
+        "content filter",
+        "content_filter",
+        "bad request",
+        "permission",
+        "question",
+        "mcp",
+        "tool error",
+    )
+    if any(marker in message for marker in non_retryable_markers):
+        return None
+    if "model unavailable" in message or "model is unavailable" in message:
+        return "model_unavailable"
+    if "capacity" in message or "temporarily unavailable" in message:
+        return "provider_capacity"
+    if "rate limit" in message or re.search(r"\b429\b", message):
+        return "rate_limited"
+    status = re.search(r"\b(408|409|5\d\d)\b", message)
+    if status is not None:
+        return f"provider_http_{status.group(1)}"
+    if "request timeout" in message or "timed out" in message:
+        return "provider_timeout"
+    return None
 
 
 def _prompt_model(payload: Mapping[str, object]) -> tuple[str, str]:

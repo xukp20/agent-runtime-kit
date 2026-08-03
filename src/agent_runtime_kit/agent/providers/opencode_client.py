@@ -102,6 +102,18 @@ class OpenCodeClient:
             raise OpenCodeClientError("OpenCode provider response is not an object")
         return value
 
+    def mcp_status(self) -> Mapping[str, object]:
+        value = self.request("GET", "/mcp")
+        if not isinstance(value, Mapping):
+            raise OpenCodeClientError("OpenCode MCP status response is not an object")
+        return value
+
+    def connect_mcp(self, name: str) -> bool:
+        value = self.request("POST", f"/mcp/{_segment(name)}/connect", payload={})
+        if not isinstance(value, bool):
+            raise OpenCodeClientError("OpenCode MCP connect response is not a boolean")
+        return value
+
     def prompt_async(self, session_id: str, payload: Mapping[str, object]) -> None:
         self.request("POST", f"/session/{_segment(session_id)}/prompt_async", payload=payload)
 
