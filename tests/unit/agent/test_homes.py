@@ -36,6 +36,30 @@ def test_provider_home_spec_materializes_schema_v3_codex_home(tmp_path: Path) ->
     assert service.get_home("codex", "worker").required_env == {"TOKEN"}
 
 
+def test_codex_home_preapproves_application_declared_mcp_tools(tmp_path: Path) -> None:
+    service = HomeService(tmp_path / ".agent_runtime")
+    service.create_home(
+        ProviderHomeSpec(
+            provider_type="codex",
+            home_id="worker",
+            mcp_servers=(
+                McpServerSpec(
+                    name="runtime",
+                    transport="http",
+                    url="https://mcp.example/rpc",
+                ),
+            ),
+        )
+    )
+
+    config = (
+        service.resolve_home_root("codex", "worker") / ".codex" / "config.toml"
+    ).read_text(encoding="utf-8")
+
+    assert "[mcp_servers.runtime]" in config
+    assert 'default_tools_approval_mode = "approve"' in config
+
+
 def test_home_service_requires_registered_provider_renderer(tmp_path: Path) -> None:
     service = HomeService(tmp_path / ".agent_runtime", renderers={})
 

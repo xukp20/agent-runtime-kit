@@ -463,6 +463,10 @@ def _render_mcp_servers_toml(servers: tuple["McpServerSpec", ...]) -> str:
             raise ValueError(f"duplicate MCP server name: {name}")
         seen.add(name)
         lines.append(f"[mcp_servers.{_toml_key(name)}]")
+        # ARK Homes contain only application-declared MCP servers. Codex handles
+        # their tool approval separately from the thread approval policy, so a
+        # non-interactive provider run must pre-approve this trusted surface.
+        lines.append('default_tools_approval_mode = "approve"')
         if server.transport and server.url and server.transport != "http":
             lines.append(f"transport = {_toml_value(server.transport)}")
         for field_name in (
