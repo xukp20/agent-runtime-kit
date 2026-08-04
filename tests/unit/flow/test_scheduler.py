@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
+from time import sleep
 from typing import ClassVar
 
 import pytest
@@ -605,6 +606,37 @@ def test_semantic_policy_runs_logic_to_a_created_step_and_pauses(tmp_path: Path)
     assert lease.advanced_flow_ids == [flow_id]
     assert lease.terminal_reason == "target_step_created"
     assert lease.terminal_at is not None
+
+
+def test_semantic_idle_grace_wakes_when_next_candidate_is_enqueued(tmp_path: Path) -> None:
+    pause = FakePauseController(paused=False)
+    flow_service, step_service, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+    flow_id = start_scheduler_flow(flow_service)
+    step_id = "grace-step"
+    step_service.store.create_step(SchedulerStep(step_id=step_id, flow_id=flow_id, scope_id="scope"))
+    flow_service.store.update_flow_record(flow_id, lambda flow: setattr(flow, "current_step_id", step_id))
+    scheduler.configure_semantic_run(
+        SchedulerSemanticRunPolicy(
+            name="enqueue_grace",
+            allow_flow_advance=lambda _flow: False,
+            allow_step_start=lambda step: step.step_id == step_id,
+            decide=lambda _service: SchedulerRunDecision(),
+            max_flow_advances=0,
+            max_step_starts=1,
+            idle_grace_s=0.2,
+        )
+    )
+
+    enqueue_thread = Thread(target=lambda: (sleep(0.02), scheduler.enqueue_step(step_id)))
+    enqueue_thread.start()
+    first_tick = scheduler.schedule_ready()
+    enqueue_thread.join(timeout=1)
+    tick = scheduler.schedule_ready()
+
+    assert tick.started_step_ids == [step_id]
+    assert first_tick.started_step_ids == []
+    assert first_tick.auto_paused is False
+    assert tick.auto_paused is False
 
 
 def test_semantic_lease_wait_times_out_then_wakes_on_terminal(tmp_path: Path) -> None:

@@ -12,7 +12,10 @@ class TraceReportPersistence(StrEnum):
 
 @dataclass(frozen=True)
 class AgentTraceReportPolicy:
-    persistence: TraceReportPersistence = TraceReportPersistence.LATEST_ONLY
+    # Raw provider artifacts are the canonical trace evidence.  Materialized
+    # reports are an explicit operator opt-in so report serialization does not
+    # sit on the Agent completion critical path by default.
+    persistence: TraceReportPersistence = TraceReportPersistence.DISABLED
     include_in_snapshots: bool = False
 
     def __post_init__(self) -> None:

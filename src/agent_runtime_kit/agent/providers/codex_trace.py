@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -44,6 +44,8 @@ class AgentToolCallView:
     call_index: int
     event_index: int
     tool_name: str | None
+    tool_kind: str = "other"
+    server_name: str | None = None
     display_name: str | None = None
     arguments: object | None = None
     output: object | None = None
@@ -250,6 +252,8 @@ def _parse_trace_events(events: list[dict[str, Any]]) -> _ParsedTrace:
                 call_index=len(tool_calls),
                 event_index=index,
                 tool_name=_tool_name(event, payload),
+                tool_kind=_tool_kind(event, payload, event_type, payload_type),
+                server_name=_tool_server_name(event, payload),
                 display_name=_display_name(event, payload),
                 arguments=_tool_arguments(event, payload),
                 started_at=timestamp,
@@ -261,8 +265,31 @@ def _parse_trace_events(events: list[dict[str, Any]]) -> _ParsedTrace:
                 output_index, output_event = pending_outputs.pop(call_id)
                 _attach_tool_output(call, output_index, output_event)
 
-    for call_id, (index, _event) in pending_outputs.items():
+    synthetic_calls: list[AgentToolCallView] = []
+    for call_id, (index, output_event) in pending_outputs.items():
+        output_payload = _payload(output_event)
+        output_payload_type = _payload_type(output_event)
+        if output_payload_type == "mcp_tool_call_end":
+            event_view = event_views[index]
+            call = AgentToolCallView(
+                turn_id=event_view.turn_id,
+                call_id=call_id,
+                call_index=len(tool_calls) + len(synthetic_calls),
+                event_index=index,
+                tool_name=_tool_name(output_event, output_payload),
+                tool_kind="mcp",
+                server_name=_tool_server_name(output_event, output_payload),
+                arguments=_tool_arguments(output_event, output_payload),
+            )
+            _attach_tool_output(call, index, output_event)
+            synthetic_calls.append(call)
+            continue
         warnings.append(f"tool output at event {index} has no matching call event: {call_id}")
+    if synthetic_calls:
+        tool_calls.extend(synthetic_calls)
+        tool_calls.sort(key=lambda call: call.event_index)
+        for call_index, call in enumerate(tool_calls):
+            call.call_index = call_index
     parsed_turns = [turns[turn_id] for turn_id in turn_order]
     return _ParsedTrace(
         event_views=event_views,
@@ -472,6 +499,32 @@ def _tool_name(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
     return str(value) if value is not None and str(value) else None
 
 
+def _tool_kind(
+    event: dict[str, Any],
+    payload: dict[str, Any],
+    event_type: str | None,
+    payload_type: str | None,
+) -> str:
+    type_text = " ".join(filter(None, [event_type, payload_type])).lower()
+    if "mcp" in type_text or isinstance(payload.get("invocation"), dict):
+        return "mcp"
+    if payload_type == "function_call" or "function_call" in type_text:
+        return "function"
+    if _tool_name(event, payload) is not None:
+        return "other"
+    return "other"
+
+
+def _tool_server_name(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
+    invocation = payload.get("invocation")
+    if isinstance(invocation, dict):
+        value = invocation.get("server") or invocation.get("server_name")
+        if value is not None and str(value):
+            return str(value)
+    value = payload.get("server_name") or event.get("server_name") or payload.get("server") or event.get("server")
+    return str(value) if value is not None and str(value) else None
+
+
 def _display_name(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
     value = payload.get("display_name") or event.get("display_name")
     return str(value) if value is not None and str(value) else None
@@ -511,11 +564,16 @@ def _attach_tool_output(call: AgentToolCallView, output_index: int, output_event
     if output_tool_name is not None and call.tool_name != output_tool_name:
         call.display_name = call.tool_name
         call.tool_name = output_tool_name
+    if payload_type == "mcp_tool_call_end":
+        call.tool_kind = "mcp"
+        call.server_name = call.server_name or _tool_server_name(output_event, payload)
     call.duration_ms = (
         _duration_object_ms(payload.get("duration"))
         or _int_or_none(payload.get("duration_ms") or output_event.get("duration_ms"))
         or _duration_ms(call.started_at, call.completed_at)
     )
+    if call.started_at is None and call.completed_at is not None and call.duration_ms is not None:
+        call.started_at = _subtract_duration(call.completed_at, call.duration_ms)
 
 
 def _tool_output(payload: dict[str, Any], event: dict[str, Any]) -> object | None:
@@ -595,6 +653,19 @@ def _timestamp_ms(value: object | None) -> float | None:
     return parsed.timestamp() * 1000.0
 
 
+def _subtract_duration(timestamp: object, duration_ms: int) -> object | None:
+    if not isinstance(timestamp, str):
+        return None
+    text = timestamp.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed - timedelta(milliseconds=duration_ms)).isoformat().replace("+00:00", "Z")
+
+
 def _int_or_none(value: object | None) -> int | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -605,6 +676,13 @@ def _int_or_none(value: object | None) -> int | None:
     if isinstance(value, str) and value.isdigit():
         return int(value)
     return None
+
+
+def _optional_str(value: object | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _string_from(mapping: dict[str, Any], *keys: str) -> str | None:

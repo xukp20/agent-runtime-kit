@@ -79,6 +79,7 @@ class SchedulerSemanticRunPolicy:
     decide: Callable[["RuntimeScheduleService"], SchedulerRunDecision]
     max_flow_advances: int = 1000
     max_step_starts: int = 1000
+    idle_grace_s: float = 0.0
 
 
 class SchedulerTickResult(BaseModel):
@@ -156,6 +157,8 @@ class RuntimeScheduleService:
             raise FlowStepValidationError("semantic scheduler safety caps must be non-negative")
         if policy.max_flow_advances == 0 and policy.max_step_starts == 0:
             raise FlowStepValidationError("semantic scheduler safety caps must allow at least one action")
+        if policy.idle_grace_s < 0 or policy.idle_grace_s > 1.0:
+            raise FlowStepValidationError("semantic scheduler idle grace must be between 0 and 1 second")
         with self.lock:
             if self._bounded_run_active or self._semantic_run_active:
                 raise FlowStepValidationError("a scheduler run plan is already active")
@@ -302,18 +305,20 @@ class RuntimeScheduleService:
                     self.queued_step_ids.add(step_id)
 
     def enqueue_flow(self, flow_id: str) -> None:
-        with self.lock:
+        with self._lease_condition:
             if flow_id in self.queued_flow_ids:
                 return
             self.flow_candidate_queue.append(flow_id)
             self.queued_flow_ids.add(flow_id)
+            self._lease_condition.notify_all()
 
     def enqueue_step(self, step_id: str) -> None:
-        with self.lock:
+        with self._lease_condition:
             if step_id in self.queued_step_ids:
                 return
             self.step_candidate_queue.append(step_id)
             self.queued_step_ids.add(step_id)
+            self._lease_condition.notify_all()
 
     def schedule_flow_once(self) -> str | None:
         flow_id, _ = self._schedule_flow_once_with_count()
@@ -665,6 +670,19 @@ class RuntimeScheduleService:
                     if self._semantic_run_active:
                         self._semantic_idle_retry_count += 1
                 return False
+            if retry_count == 0 and policy.idle_grace_s > 0:
+                # Flow/step creation can enqueue the next semantic candidate just
+                # after the current terminal boundary.  Wait once for the
+                # scheduler's own enqueue notification; this is intentionally
+                # bounded and does not turn the lease into a polling loop.
+                with self._lease_condition:
+                    if self._semantic_run_active:
+                        self._lease_condition.wait(timeout=policy.idle_grace_s)
+                if self._has_semantic_admitted_candidate(policy):
+                    with self.lock:
+                        if self._semantic_run_active:
+                            self._semantic_idle_retry_count += 1
+                    return False
             reason = decision.reason or "no_runnable_candidate"
 
         pause_controller = self.ark.pause_controller

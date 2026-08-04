@@ -129,6 +129,36 @@ def test_codex_standard_query_projects_rollout(tmp_path: Path) -> None:
     assert report.latest_turn.locator.turn_id == "turn-1"
     assert report.tool_calls[0].tool_name == "lean_check"
 
+    static_rollout = tmp_path / "archived-rollout.jsonl"
+    static_rollout.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-07-22T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "mcp_tool_call_end",
+                    "turn_id": "turn-static",
+                    "call_id": "call-static",
+                    "invocation": {
+                        "server": "lc_app",
+                        "tool": "diagnostics",
+                        "arguments": {"path": "Main.lean"},
+                    },
+                    "duration_ms": 200,
+                    "result": {"ok": True},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    static_report = service.build_trace_report(agent.agent_id, artifact_path=static_rollout)
+    assert static_report.latest_turn is not None
+    assert static_report.latest_turn.locator.turn_id == "turn-static"
+    assert len(static_report.tool_calls) == 1
+    assert static_report.tool_calls[0].tool_name == "diagnostics"
+    assert static_report.tool_calls[0].server_name == "lc_app"
+
 
 def test_codex_capabilities_distinguish_native_adapted_and_unavailable(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"

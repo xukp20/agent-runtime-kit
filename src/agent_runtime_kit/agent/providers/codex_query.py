@@ -38,6 +38,7 @@ class CodexQueryAdapter:
     def __init__(self, *, runtime_root: Path, provider: CodexProvider) -> None:
         self.runtime_root = Path(runtime_root)
         self.provider = provider
+        self._reader_cache: dict[str, tuple[tuple[int, int], AgentTraceReader]] = {}
 
     def list_sessions(self, query: ProviderSessionListQuery) -> Page:
         if query.home_id is None:
@@ -159,7 +160,8 @@ class CodexQueryAdapter:
                 turn_id=call.turn_id,
                 tool_name=call.tool_name or "unknown",
                 display_name=call.display_name,
-                tool_kind="other",
+                tool_kind=call.tool_kind,
+                server_name=call.server_name,
                 arguments=call.arguments,
                 result=call.output,
                 status="completed" if call.ok is not False else "failed",
@@ -213,15 +215,30 @@ class CodexQueryAdapter:
 
     def _reader(self, locator) -> AgentTraceReader:  # noqa: ANN001
         rollout_path, _ = self._rollout_path(locator)
+        if rollout_path is None or not rollout_path.exists():
+            return AgentTraceReader(events=[])
+        stat = rollout_path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+        cache_key = str(rollout_path)
+        cached = self._reader_cache.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
         events: list[dict] = []
-        if rollout_path is not None and rollout_path.exists():
-            for line in rollout_path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    events.append(json.loads(line))
-        return AgentTraceReader(events=events)
+        for line in rollout_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+        reader = AgentTraceReader(events=events)
+        self._reader_cache[cache_key] = (signature, reader)
+        return reader
 
     def _rollout_path(self, locator) -> tuple[Path | None, str | None]:  # noqa: ANN001
         native = locator.native_locator if isinstance(locator.native_locator, dict) else {}
+        explicit_path = native.get("rollout_path")
+        if explicit_path:
+            path = Path(str(explicit_path)).expanduser()
+            if not path.is_absolute():
+                path = (self.runtime_root / path).resolve()
+            return path, str(path)
         rollout_relpath = native.get("rollout_relpath")
         home_root = self.runtime_root / "homes" / "codex" / locator.home_id
         if not rollout_relpath:

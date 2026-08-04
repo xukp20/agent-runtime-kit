@@ -44,7 +44,6 @@ from .models import (
     WaitAgentsResult,
 )
 from .provider_contracts import (
-    AgentContextUsage,
     AgentEvent,
     AgentProviderBundle,
     AgentTurnResult,
@@ -509,12 +508,11 @@ class AgentService:
         session_locator = agent.session_locator
         session_start_home_commit: Callable[[], None] | None = None
         if session_locator is None:
-            session_start_home_commit = (
-                lambda: self._commit_session_start_home_materialization(
+            def session_start_home_commit() -> None:
+                self._commit_session_start_home_materialization(
                     agent.provider_type,
                     agent.home_id,
                 )
-            )
         request = ProviderRunRequest(
             agent_id=agent.agent_id,
             scope_id=agent.scope_id,
@@ -1230,8 +1228,6 @@ class AgentService:
         )
 
     def interrupt_agent(self, agent_id: str, timeout_s: float | None = None) -> bool:
-        agent = self.store.get_agent(agent_id)
-        bundle = self._provider_bundle(agent.provider_type)
         active = self._active.get(agent_id)
         if active is not None:
             deadline = None if timeout_s is None else monotonic() + timeout_s
@@ -1459,6 +1455,8 @@ class AgentService:
     def _query_bundle_and_session(
         self,
         agent_id: str,
+        *,
+        prepare_session_access: bool = True,
     ) -> tuple[AgentProviderBundle, ProviderSessionLocator]:
         agent = self.store.get_agent(agent_id)
         if agent.session_locator is None:
@@ -1466,7 +1464,7 @@ class AgentService:
         bundle = self._provider_bundle(agent.provider_type)
         if bundle.query is None:
             raise RuntimeError(f"provider does not support standard query: {agent.provider_type}")
-        if bundle.session_access is not None:
+        if prepare_session_access and bundle.session_access is not None:
             bundle.session_access.prepare_session_access(
                 agent.session_locator,
                 agent_id=agent.agent_id,
@@ -1491,14 +1489,36 @@ class AgentService:
         artifact_path: str | Path | None = None,
         slow_call_limit: int = 20,
     ) -> AgentTraceReport:
-        del artifact_path, slow_call_limit
         agent = self.store.get_agent(agent_id)
-        session = self._provider_session_locator(agent)
-        turns = tuple(self.query_turns(agent_id, limit=10_000).items)
-        events = tuple(self.query_events(agent_id, limit=100_000).items)
-        tool_calls = tuple(self.query_tool_calls(agent_id, limit=100_000).items)
+        bundle, session = self._query_bundle_and_session(
+            agent_id,
+            prepare_session_access=artifact_path is None,
+        )
+        if artifact_path is not None:
+            native = dict(session.native_locator) if isinstance(session.native_locator, dict) else {}
+            native["rollout_path"] = str(Path(artifact_path).expanduser().resolve())
+            session = replace(session, native_locator=native)
+        if bundle.query is None:
+            raise RuntimeError(f"provider does not support standard query: {agent.provider_type}")
+        turns = tuple(
+            bundle.query.list_turns(
+                ProviderTurnQuery(session=session, limit=10_000)
+            ).items
+        )
+        events = tuple(
+            bundle.query.list_events(
+                ProviderEventQuery(session=session, limit=100_000)
+            ).items
+        )
+        tool_calls = tuple(
+            bundle.query.list_tool_calls(
+                ProviderToolQuery(session=session, limit=100_000)
+            ).items
+        )
         try:
-            usage = self.query_usage(agent_id, include_session_aggregate=True)
+            usage = bundle.query.read_usage(
+                ProviderUsageQuery(session=session, include_session_aggregate=True)
+            )
         except (RuntimeError, LookupError):
             usage = None
         return AgentTraceReport(
