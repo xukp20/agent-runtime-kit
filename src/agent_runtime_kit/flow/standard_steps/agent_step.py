@@ -19,6 +19,12 @@ from agent_runtime_kit.flow.models import (
 from agent_runtime_kit.flow.rendering import RenderContext
 
 
+AGENT_STEP_RESTART_PROMPT_SUFFIX = (
+    "The previous execution of this AgentStep ended unexpectedly. "
+    "Continue the same task from the current workspace and runtime state."
+)
+
+
 class AgentStepState(BaseStepState):
     state_type: str = "agent_step"
     agent_role: str
@@ -32,6 +38,7 @@ class AgentStepState(BaseStepState):
     prompt_override: str | None = None
     continue_prompt_override: str | None = None
     followup_of_step_id: str | None = None
+    restart_of_step_id: str | None = None
     callback_dispatch_step_id: str | None = None
     max_auto_continue_turns: int = 2
     require_submission: bool = True
@@ -64,6 +71,15 @@ class AgentStepSubmissionResult(AgentStepResult):
 class AgentStepIncompleteResult(AgentStepResult):
     result_type: str = "agent_step_incomplete"
     outcome: Literal["incomplete"] = "incomplete"
+
+
+class AgentStepRestartReceipt(BaseModel):
+    failed_step_id: str
+    replacement_step_id: str
+    flow_id: str
+    agent_id: str
+    agent_reused: bool
+    enqueued: bool
 
 
 class AgentStep(BaseStep):
@@ -153,8 +169,17 @@ class AgentStep(BaseStep):
         latest = self._latest_agent_step(ctx)
         state = self._agent_step_state(latest)
         if state.prompt_mode == "callback":
-            return latest.build_callback_prompt(ctx, agent_id)
-        return state.prompt_override
+            prompt = latest.build_callback_prompt(ctx, agent_id)
+        else:
+            prompt = state.prompt_override
+        if state.restart_of_step_id is None:
+            return prompt
+        if prompt is None:
+            agent_service = self._agent_service(ctx)
+            agent = agent_service.get_agent(agent_id)
+            agent_type = agent_service.agent_types.get(agent.agent_type)
+            prompt = agent_type.render_start_prompt(state.variables)
+        return f"{prompt.rstrip()}\n\n{AGENT_STEP_RESTART_PROMPT_SUFFIX}"
 
     def prepare_agent_context_before_first_turn(
         self,

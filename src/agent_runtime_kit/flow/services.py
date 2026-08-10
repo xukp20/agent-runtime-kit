@@ -24,6 +24,7 @@ from .models import (
     utc_now_iso,
 )
 from .registry import FlowTypeRegistry, StepTypeRegistry
+from .standard_steps.agent_step import AgentStep, AgentStepRestartReceipt, AgentStepState
 from .store import FlowStepStore
 
 
@@ -145,6 +146,130 @@ class FlowService:
 
     def list_non_terminal_flows(self, *, scope_id: str | None = None) -> list[BaseFlow]:
         return self.store.list_non_terminal_flows(scope_id=scope_id)
+
+    def restart_failed_agent_step(self, step_id: str) -> AgentStepRestartReceipt:
+        """Create an operator-requested replacement for one failed AgentStep."""
+
+        with self.lock:
+            failed_step = self.store.get_step(step_id)
+            if not isinstance(failed_step, AgentStep) or not isinstance(failed_step.state, AgentStepState):
+                raise FlowStepValidationError(f"step is not an AgentStep: {step_id}")
+            if failed_step.status is not StepStatus.FAILED or failed_step.error is None:
+                raise FlowStepValidationError(f"AgentStep is not failed: {step_id}")
+            flow = self.store.get_flow(failed_step.flow_id)
+            if flow.status is not FlowStatus.FAILED or flow.error is None or flow.result is not None:
+                raise FlowStepValidationError(f"owning flow is not failed: {flow.flow_id}")
+            if flow.current_step_id is not None:
+                raise FlowStepValidationError(f"failed flow still has current step: {flow.flow_id}")
+            if not flow.step_ids or flow.step_ids[-1] != step_id:
+                raise FlowStepValidationError(f"failed AgentStep is not the owning flow's latest step: {step_id}")
+            if flow.manual_pause.active:
+                raise FlowStepValidationError(f"failed flow has an active manual pause: {flow.flow_id}")
+
+            pause_controller = self.ark.pause_controller
+            if pause_controller is None or not pause_controller.is_paused(failed_step.scope_id):
+                raise FlowStepValidationError(
+                    f"AgentStep restart requires a paused runtime scope: {failed_step.scope_id}"
+                )
+            step_service = self.ark.step_service
+            if step_service is not None and step_service.has_running_steps(failed_step.scope_id):
+                raise FlowStepValidationError(
+                    f"AgentStep restart requires no running Steps in scope: {failed_step.scope_id}"
+                )
+
+            agent_service = self.ark.agent_service
+            if agent_service is None:
+                raise FlowStepValidationError("AgentStep restart requires AgentService")
+            if hasattr(agent_service, "has_running_agents") and agent_service.has_running_agents(failed_step.scope_id):
+                raise FlowStepValidationError(
+                    f"AgentStep restart requires no running Agents in scope: {failed_step.scope_id}"
+                )
+
+            role = failed_step.state.agent_role
+            candidate_ids: list[str] = []
+            for candidate_id in (
+                failed_step.agent_bindings.get(role),
+                flow.agent_bindings.get(role),
+            ):
+                if candidate_id is not None and candidate_id not in candidate_ids:
+                    candidate_ids.append(candidate_id)
+            agent_id = None
+            replacement_agent_type = failed_step.state.agent_type
+            replacement_provider_type = failed_step.state.provider_type
+            replacement_home_id = failed_step.state.home_id
+            for candidate_id in candidate_ids:
+                try:
+                    candidate = agent_service.get_agent(candidate_id)
+                except Exception:  # noqa: BLE001 - a missing/corrupt operator binding falls back to a fresh Agent.
+                    continue
+                if candidate.status == "running":
+                    raise FlowStepValidationError(f"bound Agent is still running: {candidate_id}")
+                if candidate.status == "closed":
+                    replacement_agent_type = candidate.agent_type
+                    replacement_provider_type = candidate.provider_type
+                    replacement_home_id = candidate.home_id
+                    continue
+                agent_id = candidate_id
+                break
+
+            agent_reused = agent_id is not None
+            if agent_id is None:
+                if replacement_agent_type is None:
+                    raise FlowStepValidationError(
+                        f"failed AgentStep cannot recreate an Agent without agent_type: {step_id}"
+                    )
+                agent = agent_service.create_agent(
+                    failed_step.scope_id,
+                    replacement_agent_type,
+                    provider_type=replacement_provider_type,
+                    home_id=replacement_home_id,
+                )
+                agent_id = str(agent.agent_id)
+
+            now = utc_now_iso()
+            replacement = failed_step.model_copy(deep=True)
+            replacement.step_id = f"agent_restart_{uuid.uuid4().hex}"
+            replacement.status = StepStatus.CREATED
+            replacement.submission = None
+            replacement.result = None
+            replacement.error = None
+            replacement.created_at = now
+            replacement.updated_at = now
+            replacement.started_at = None
+            replacement.finished_at = None
+            replacement.state.restart_of_step_id = failed_step.step_id
+            replacement.agent_bindings.by_role[role] = agent_id
+
+            with self.store.edit_session(failed_step.scope_id) as tx:
+                working_flow = tx.load_flow_for_update(flow.flow_id)
+                if working_flow.status is not FlowStatus.FAILED or working_flow.current_step_id is not None:
+                    raise FlowStepValidationError(f"failed flow changed during AgentStep restart: {flow.flow_id}")
+                if not working_flow.step_ids or working_flow.step_ids[-1] != failed_step.step_id:
+                    raise FlowStepValidationError(f"failed flow step lineage changed: {flow.flow_id}")
+                tx.add_step(replacement)
+                working_flow.step_ids.append(replacement.step_id)
+                working_flow.current_step_id = replacement.step_id
+                working_flow.error = None
+                working_flow.status = FlowStatus.RUNNING
+                working_flow.finished_at = None
+                if (
+                    failed_step.state.bind_created_agent_to == "flow"
+                    or working_flow.agent_bindings.get(role) in candidate_ids
+                ):
+                    working_flow.agent_bindings.by_role[role] = agent_id
+
+            schedule_service = self.ark.schedule_service
+            enqueued = schedule_service is not None
+            if schedule_service is not None:
+                schedule_service.enqueue_step(replacement.step_id)
+            return AgentStepRestartReceipt(
+                failed_step_id=failed_step.step_id,
+                replacement_step_id=replacement.step_id,
+                flow_id=flow.flow_id,
+                agent_id=agent_id,
+                agent_reused=agent_reused,
+                enqueued=enqueued,
+            )
 
     def can_advance_flow(self, flow_id: str) -> bool:
         with self.lock:
