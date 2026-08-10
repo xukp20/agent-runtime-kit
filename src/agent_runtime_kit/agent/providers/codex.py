@@ -57,9 +57,9 @@ class CodexHomeInitializationRecord:
 class CodexTransientRetryPolicy:
     """Bounded retry policy for narrowly recognized transient Codex turn failures."""
 
-    max_attempts: int = 3
-    initial_delay_s: float = 0.25
-    max_delay_s: float = 2.0
+    max_attempts: int = 5
+    initial_delay_s: float = 30.0
+    max_delay_s: float = 180.0
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
