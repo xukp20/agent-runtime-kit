@@ -10,6 +10,7 @@ from agent_runtime_kit.agent.homes import (
     HomeService,
     McpServerSpec,
 )
+from agent_runtime_kit.agent.models import MissingProviderEnvError
 from agent_runtime_kit.agent.provider_contracts import (
     BaseConfigSource,
     ModelBackendIdentity,
@@ -96,6 +97,73 @@ def test_claude_home_materializes_settings_skills_mcp_and_isolated_env(tmp_path:
     )
     manifest_text = (root / ".ark" / "home_materialization.json").read_text()
     assert "runtime-secret" not in manifest_text
+
+
+def test_claude_required_http_mcp_omits_missing_optional_headers(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.create_home(
+        ProviderHomeSpec(
+            provider_type="claude_code",
+            home_id="worker",
+            mcp_servers=(
+                McpServerSpec(
+                    name="lc",
+                    transport="http",
+                    url="http://127.0.0.1:19000/mcp",
+                    required=True,
+                    http_headers={"x-static": "fixed"},
+                    env_http_headers={
+                        "x-ark-flow-id": "ARK_FLOW_ID",
+                        "x-ark-agent-id": "ARK_AGENT_ID",
+                        "x-ark-batch-decls": "LEAN_CONSTELLATION_BATCH_DECLS",
+                    },
+                ),
+            ),
+        )
+    )
+
+    context = service.build_execution_context(
+        "claude_code",
+        "worker",
+        run_env={"ARK_FLOW_ID": "flow-1", "ARK_AGENT_ID": "agent-1"},
+    )
+
+    resolved = context.runtime_payload["mcp_servers_resolved"]["lc"]
+    assert resolved["headers"] == {
+        "x-static": "fixed",
+        "x-ark-flow-id": "flow-1",
+        "x-ark-agent-id": "agent-1",
+    }
+
+
+def test_claude_required_http_mcp_honors_explicit_required_env(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.create_home(
+        ProviderHomeSpec(
+            provider_type="claude_code",
+            home_id="worker",
+            required_env=("LEAN_CONSTELLATION_BATCH_DECLS",),
+            mcp_servers=(
+                McpServerSpec(
+                    name="lc",
+                    transport="http",
+                    url="http://127.0.0.1:19000/mcp",
+                    required=True,
+                    env_http_headers={
+                        "x-ark-flow-id": "ARK_FLOW_ID",
+                        "x-ark-batch-decls": "LEAN_CONSTELLATION_BATCH_DECLS",
+                    },
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(MissingProviderEnvError):
+        service.build_execution_context(
+            "claude_code",
+            "worker",
+            run_env={"ARK_FLOW_ID": "flow-1"},
+        )
 
 
 def test_claude_home_rejects_file_checkpointing_and_unmappable_mcp(tmp_path: Path) -> None:

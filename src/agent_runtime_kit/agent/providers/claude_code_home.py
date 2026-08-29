@@ -470,8 +470,6 @@ def _resolve_mcp_servers(values: list[object], env: Mapping[str, str]) -> dict[s
             for header, env_name in dict(raw.get("env_http_headers") or {}).items():
                 value = env.get(str(env_name))
                 if value is None:
-                    if required:
-                        raise MissingProviderEnvError(str(env_name))
                     continue
                 headers[str(header)] = value
             bearer = raw.get("bearer_token_env_var")
