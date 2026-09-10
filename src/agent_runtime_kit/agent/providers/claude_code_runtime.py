@@ -512,9 +512,6 @@ def _build_options(
         else config.get("model")
     )
     max_turns = request.run_options.max_turns or config.get("max_turns")
-    extra_args = dict(config.get("extra_args") or {})
-    if bool(config.get("strict_mcp_config", True)):
-        extra_args["strict-mcp-config"] = None
     kwargs = {
         "cwd": request.workdir or context.workdir or str(context.home_root),
         "cli_path": config.get("cli_path"),
@@ -527,6 +524,7 @@ def _build_options(
         "disallowed_tools": list(config.get("disallowed_tools") or []),
         "permission_mode": config.get("permission_mode"),
         "mcp_servers": dict(config.get("mcp_servers_resolved") or {}),
+        "strict_mcp_config": bool(config.get("strict_mcp_config", True)),
         "skills": config.get("skills"),
         "model": model,
         "fallback_model": config.get("fallback_model"),
@@ -535,7 +533,7 @@ def _build_options(
         "max_turns": int(max_turns) if max_turns is not None else None,
         "max_budget_usd": config.get("max_budget_usd"),
         "add_dirs": list(config.get("add_dirs") or []),
-        "extra_args": extra_args,
+        "extra_args": dict(config.get("extra_args") or {}),
         "enable_file_checkpointing": False,
         "resume": session_id if resume else None,
         "session_id": None if resume else session_id,

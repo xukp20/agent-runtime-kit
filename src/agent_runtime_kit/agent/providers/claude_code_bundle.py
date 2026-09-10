@@ -169,7 +169,7 @@ def build_claude_code_provider_bundle(
             capability=key,
             status=CapabilityStatus.NATIVE,
             available=True,
-            evidence_version="claude-agent-sdk-0.2.124",
+            evidence_version="claude-agent-sdk-0.2.152",
         )
         for key in native
     }
@@ -206,7 +206,7 @@ def build_claude_code_provider_bundle(
             execution_kind=ProviderExecutionKind.SUBPROCESS_RPC,
             home_kind=ProviderHomeKind.NATIVE,
             sdk_or_cli_name="claude-agent-sdk/claude-code",
-            sdk_or_cli_version="0.2.124/2.1.216-verified",
+            sdk_or_cli_version="0.2.152/2.1.216-verified",
             supported_api_modes=("anthropic_messages",),
             static_capabilities=base,
         ),

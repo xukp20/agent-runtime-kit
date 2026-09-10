@@ -14,13 +14,12 @@ class _RecordingOptions:
 
 
 @pytest.mark.parametrize(
-    ("strict_mcp_config", "expected_strict_flag"),
-    [(True, True), (False, False)],
+    "strict_mcp_config",
+    [True, False],
 )
-def test_claude_options_route_strict_mcp_config_through_extra_args(
+def test_claude_options_use_native_strict_mcp_config(
     tmp_path: Path,
     strict_mcp_config: bool,
-    expected_strict_flag: bool,
 ) -> None:
     sdk = SimpleNamespace(ClaudeAgentOptions=_RecordingOptions)
     context = SimpleNamespace(
@@ -43,8 +42,38 @@ def test_claude_options_route_strict_mcp_config_through_extra_args(
 
     options = _build_options(sdk, request, session_id="session-1", resume=False)
 
-    assert "strict_mcp_config" not in options.kwargs
-    assert options.kwargs["extra_args"]["debug-to-stderr"] is None
-    assert ("strict-mcp-config" in options.kwargs["extra_args"]) is expected_strict_flag
-    if expected_strict_flag:
-        assert options.kwargs["extra_args"]["strict-mcp-config"] is None
+    assert options.kwargs["strict_mcp_config"] is strict_mcp_config
+    assert options.kwargs["extra_args"] == {"debug-to-stderr": None}
+
+
+@pytest.mark.parametrize("tools", [None, [], ["Read"]])
+def test_claude_options_forward_tools_tristate(tmp_path: Path, tools: list[str] | None) -> None:
+    sdk = SimpleNamespace(ClaudeAgentOptions=_RecordingOptions)
+    request = _request(tmp_path, runtime_payload={"tools": tools})
+
+    options = _build_options(sdk, request, session_id="session-1", resume=False)
+
+    assert options.kwargs["tools"] == tools
+
+
+def _request(tmp_path: Path, *, runtime_payload: dict[str, object] | None = None) -> object:
+    context = SimpleNamespace(
+        provider_type="claude_code",
+        runtime_payload=runtime_payload or {},
+        home_root=tmp_path,
+        workdir=None,
+        process_environment={},
+    )
+    return SimpleNamespace(
+        provider_type="claude_code",
+        home_id="worker",
+        execution_context=context,
+        session_locator=None,
+        model_overrides=None,
+        prompt="test",
+        system_instructions=None,
+        developer_instructions=None,
+        run_options=SimpleNamespace(max_turns=None),
+        workdir=None,
+        event_sink=None,
+    )

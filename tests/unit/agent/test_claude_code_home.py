@@ -166,6 +166,37 @@ def test_claude_required_http_mcp_honors_explicit_required_env(tmp_path: Path) -
         )
 
 
+@pytest.mark.parametrize(
+    ("provider_tools", "generic_tools", "expected_tools"),
+    [
+        (None, (), None),
+        (None, ("Read",), ["Read"]),
+        ((), ("Read",), []),
+        ([], ("Read",), []),
+        (("Bash",), ("Read",), ["Bash"]),
+    ],
+)
+def test_claude_home_preserves_tools_tristate(
+    tmp_path: Path,
+    provider_tools: tuple[str, ...] | list[str] | None,
+    generic_tools: tuple[str, ...],
+    expected_tools: list[str] | None,
+) -> None:
+    service = _service(tmp_path)
+    service.create_home(
+        ProviderHomeSpec(
+            provider_type="claude_code",
+            home_id="worker",
+            tools=generic_tools,
+            provider_options=ClaudeCodeHomeOptions(tools=provider_tools),
+        )
+    )
+
+    context = service.build_execution_context("claude_code", "worker")
+
+    assert context.runtime_payload["tools"] == expected_tools
+
+
 def test_claude_home_rejects_file_checkpointing_and_unmappable_mcp(tmp_path: Path) -> None:
     renderer = ClaudeCodeHomeRenderer(runtime_root=tmp_path)
     checkpoint = ProviderHomeSpec(

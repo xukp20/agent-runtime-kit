@@ -49,7 +49,7 @@ _PERMISSION_MODES = {"default", "acceptEdits", "bypassPermissions", "plan", "don
 class ClaudeCodeHomeOptions:
     cli_path: str | Path | None = None
     setting_sources: tuple[str, ...] | None = ("user",)
-    tools: tuple[str, ...] | None = None
+    tools: tuple[str, ...] | list[str] | None = None
     allowed_tools: tuple[str, ...] = ()
     disallowed_tools: tuple[str, ...] = ()
     permission_mode: str | None = None
@@ -139,7 +139,11 @@ class ClaudeCodeHomeRenderer:
             "setting_sources": (
                 list(options.setting_sources) if options.setting_sources is not None else None
             ),
-            "tools": list(options.tools) if options.tools is not None else _tool_names(spec.tools),
+            "tools": (
+                list(options.tools)
+                if options.tools is not None
+                else (_tool_names(spec.tools) or None)
+            ),
             "allowed_tools": list(options.allowed_tools),
             "disallowed_tools": list(options.disallowed_tools),
             "permission_mode": options.permission_mode,

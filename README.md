@@ -137,7 +137,7 @@ different semantic.
 | Provider | Integration | Snapshot/context boundary |
 | --- | --- | --- |
 | **Codex** | OpenAI Codex Python SDK and isolated Codex Home | Provider rollout JSONL, normalized queries, native compact evidence |
-| **Claude Code** | Claude Agent SDK `0.2.124` and Claude Code CLI | Declared session transcript artifacts; fork is session-only, not workspace undo |
+| **Claude Code** | Claude Agent SDK `0.2.152` and Claude Code CLI | Declared session transcript artifacts; fork is session-only, not workspace undo |
 | **Pi** | `@earendil-works/pi-coding-agent` `0.80.10` JSONL RPC | Agent-owned session artifacts and compaction; prepared Node runtime for MCP projection |
 | **OpenAI Agents** | `openai-agents` `0.18.3`, Responses or Chat Completions | Application-owned Agent factory, durable SQLite sessions, endpoint-dependent compaction |
 | **OpenCode** | External `opencode` `1.18.4` executable and isolated server | Isolated SQLite/session state and model-backed compact when supported |

@@ -117,7 +117,7 @@ materialization manifest as a required external dependency.
 
 ## Claude Code Adapter
 
-`ClaudeCodeProvider` uses `claude-agent-sdk==0.2.124` to control the Claude Code
+`ClaudeCodeProvider` uses `claude-agent-sdk==0.2.152` to control the Claude Code
 CLI. Each run handle owns one thread, asyncio loop, and SDK client so interrupt
 and terminal delivery remain on the client's native loop. The adapter exposes
 the same normalized run, query, context, usage, fork, and artifact contracts as
