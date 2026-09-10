@@ -1,5 +1,5 @@
 from pathlib import Path
-from threading import Thread
+from threading import Barrier, Event, Thread, current_thread
 
 import pytest
 
@@ -152,3 +152,67 @@ def test_recovery_agent_boundary_serializes_close_and_paused_start_fork(tmp_path
     assert "close:ok" in outcomes
     assert "start:AgentPausedError" in outcomes
     assert "fork:AgentPausedError" in outcomes
+
+
+def test_context_maintenance_admission_uses_pause_before_agent_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = AgentTypeRegistry()
+    registry.register(PauseAgentType())
+    controller = RuntimePauseController()
+    service = AgentService(
+        tmp_path / ".agent_runtime",
+        agent_types=registry,
+        ark_services=ARKServices(pause_controller=controller),
+    )
+    service.home_service.create_home(ProviderHomeSpec(provider_type="codex", home_id="pause_worker"))
+    agent = service.create_agent("scope-a", "pause_worker")
+    controller.pause("scope-a")
+    maintenance_at_agent_lookup = Barrier(2)
+    maintenance_lookup_observed = Event()
+    boundary_attempt = Barrier(2)
+    boundary_entered = Event()
+    maintenance_errors: list[type[BaseException]] = []
+    original_get_agent = service.store.get_agent
+
+    def observed_get_agent(agent_id: str):  # noqa: ANN202
+        if current_thread().name == "maintenance-admission" and not maintenance_lookup_observed.is_set():
+            maintenance_lookup_observed.set()
+            maintenance_at_agent_lookup.wait(timeout=2)
+        return original_get_agent(agent_id)
+
+    monkeypatch.setattr(service.store, "get_agent", observed_get_agent)
+
+    def begin_maintenance() -> None:
+        try:
+            active = service._begin_synchronous_maintenance(agent.agent_id)
+        except BaseException as exc:  # noqa: BLE001 - thread outcome is asserted below.
+            maintenance_errors.append(type(exc))
+        else:
+            service._finish_synchronous_maintenance(active)
+
+    def take_recovery_agent_boundary() -> None:
+        boundary_attempt.wait(timeout=2)
+        with service.hold_agent_boundary():
+            boundary_entered.set()
+
+    maintenance = Thread(target=begin_maintenance, name="maintenance-admission", daemon=True)
+    with controller.hold_paused("scope-a"):
+        maintenance.start()
+        maintenance_at_agent_lookup.wait(timeout=2)
+        recovery_boundary = Thread(target=take_recovery_agent_boundary, daemon=True)
+        recovery_boundary.start()
+        boundary_attempt.wait(timeout=2)
+        recovery_boundary.join(0.5)
+        boundary_was_blocked = recovery_boundary.is_alive()
+
+    maintenance.join(2)
+    recovery_boundary.join(2)
+
+    assert boundary_was_blocked is False
+    assert not maintenance.is_alive()
+    assert not recovery_boundary.is_alive()
+    assert boundary_entered.is_set()
+    assert maintenance_errors == [AgentPausedError]
+    assert service.get_agent(agent.agent_id).status == "idle"

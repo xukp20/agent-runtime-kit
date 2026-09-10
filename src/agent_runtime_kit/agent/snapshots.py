@@ -6,9 +6,10 @@ import shutil
 import sqlite3
 import threading
 import uuid
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import Any, Iterator
 
 from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimePauseController
 
@@ -122,15 +123,26 @@ class AgentSnapshotService:
                             status="blocked",
                             running_step_ids=tuple(pending_steps),
                         )
-                restorable_error = self._flow_restorable_error(scope_id)
-                if restorable_error is not None:
-                    return ScopeSnapshotResult(
-                        snapshot_id=None,
-                        scope_id=scope_id,
-                        status="blocked",
-                        errors={"flow_restorable": restorable_error},
-                    )
-                return self._create_scope_snapshot_unlocked(scope_id)
+                with self._hold_paused_mutation_boundary([scope_id]):
+                    running = self._running_agents(scope_id)
+                    running_steps = self._running_steps(scope_id)
+                    if running or running_steps:
+                        return ScopeSnapshotResult(
+                            snapshot_id=None,
+                            scope_id=scope_id,
+                            status="blocked",
+                            running_agent_ids=tuple(agent.agent_id for agent in running),
+                            running_step_ids=tuple(running_steps),
+                        )
+                    restorable_error = self._flow_restorable_error(scope_id)
+                    if restorable_error is not None:
+                        return ScopeSnapshotResult(
+                            snapshot_id=None,
+                            scope_id=scope_id,
+                            status="blocked",
+                            errors={"flow_restorable": restorable_error},
+                        )
+                    return self._create_scope_snapshot_unlocked(scope_id)
             finally:
                 if not was_paused:
                     self._resume(scope_id)
@@ -172,30 +184,40 @@ class AgentSnapshotService:
                             running_step_ids=tuple(pending_steps),
                             errors=dict(getattr(result, "errors", {})),
                         )
-                restorable_error = self._flow_restorable_error(None)
-                if restorable_error is not None:
-                    return RuntimeSnapshotResult(
-                        snapshot_id=None,
-                        status="blocked",
-                        errors={"flow_restorable": restorable_error},
-                    )
-                scope_snapshot_ids: dict[str, str] = {}
-                errors: dict[str, BaseException] = {}
-                for scope_id in self.store.list_scope_ids():
-                    try:
-                        scope_result = self._create_scope_snapshot_unlocked(scope_id)
-                        if scope_result.snapshot_id is not None:
-                            scope_snapshot_ids[scope_id] = scope_result.snapshot_id
-                    except BaseException as exc:
-                        errors[scope_id] = exc
-                if errors:
-                    return RuntimeSnapshotResult(
-                        snapshot_id=None,
-                        status="failed",
-                        scope_snapshot_ids=scope_snapshot_ids,
-                        errors=errors,
-                    )
-                return self._create_runtime_snapshot_unlocked(scope_snapshot_ids, status="created")
+                with self._hold_paused_mutation_boundary(None):
+                    running = self._running_agents(None)
+                    running_steps = self._running_steps(None)
+                    if running or running_steps:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=None,
+                            status="blocked",
+                            blocked_scope_ids=tuple(sorted(self._blocked_scope_ids(running, running_steps))),
+                            running_step_ids=tuple(running_steps),
+                        )
+                    restorable_error = self._flow_restorable_error(None)
+                    if restorable_error is not None:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=None,
+                            status="blocked",
+                            errors={"flow_restorable": restorable_error},
+                        )
+                    scope_snapshot_ids: dict[str, str] = {}
+                    errors: dict[str, BaseException] = {}
+                    for scope_id in self.store.list_scope_ids():
+                        try:
+                            scope_result = self._create_scope_snapshot_unlocked(scope_id)
+                            if scope_result.snapshot_id is not None:
+                                scope_snapshot_ids[scope_id] = scope_result.snapshot_id
+                        except BaseException as exc:
+                            errors[scope_id] = exc
+                    if errors:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=None,
+                            status="failed",
+                            scope_snapshot_ids=scope_snapshot_ids,
+                            errors=errors,
+                        )
+                    return self._create_runtime_snapshot_unlocked(scope_snapshot_ids, status="created")
             finally:
                 if not was_paused:
                     self._resume(None)
@@ -309,56 +331,66 @@ class AgentSnapshotService:
                             running_step_ids=tuple(pending_steps),
                         )
 
-                restorable_errors: dict[str, BaseException] = {}
-                for refresh_scope_id in refresh_scope_ids:
-                    restorable_error = self._flow_restorable_error(refresh_scope_id)
-                    if restorable_error is not None:
-                        restorable_errors[refresh_scope_id] = restorable_error
-                if restorable_errors:
-                    return RuntimeSnapshotResult(
-                        snapshot_id=None,
-                        status="blocked",
-                        blocked_scope_ids=tuple(sorted(restorable_errors)),
-                        errors=restorable_errors,
-                    )
-
-                refreshed_scope_snapshot_ids: dict[str, str] = {}
-                errors: dict[str, BaseException] = {}
-                for refresh_scope_id in refresh_scope_ids:
-                    try:
-                        scope_result = self._create_scope_snapshot_unlocked(refresh_scope_id)
-                        if scope_result.status != "created" or scope_result.snapshot_id is None:
-                            errors[refresh_scope_id] = RuntimeError(
-                                f"failed to create scope snapshot for {refresh_scope_id}: {scope_result.status}"
-                            )
-                        else:
-                            refreshed_scope_snapshot_ids[refresh_scope_id] = scope_result.snapshot_id
-                    except BaseException as exc:
-                        errors[refresh_scope_id] = exc
-                if errors:
-                    return RuntimeSnapshotResult(
-                        snapshot_id=None,
-                        status="failed",
-                        scope_snapshot_ids=refreshed_scope_snapshot_ids,
-                        errors=errors,
-                    )
-
-                if reuse_latest_for_other_scopes:
-                    scope_snapshot_ids = {
-                        selected_scope_id: (
-                            refreshed_scope_snapshot_ids[selected_scope_id]
-                            if selected_scope_id in refreshed_scope_snapshot_ids
-                            else latest_scope_snapshot_ids[selected_scope_id]
+                with self._hold_paused_mutation_boundary(refresh_scope_ids):
+                    running = self._running_agents_for_scopes(refresh_scope_ids)
+                    running_steps = self._running_steps_for_scopes(refresh_scope_ids)
+                    if running or running_steps:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=None,
+                            status="blocked",
+                            blocked_scope_ids=tuple(sorted(self._blocked_scope_ids(running, running_steps))),
+                            running_step_ids=tuple(running_steps),
                         )
-                        for selected_scope_id in selected_scope_ids
-                    }
-                else:
-                    scope_snapshot_ids = {
-                        selected_scope_id: refreshed_scope_snapshot_ids[selected_scope_id]
-                        for selected_scope_id in selected_scope_ids
-                        if selected_scope_id in refreshed_scope_snapshot_ids
-                    }
-                return self._create_runtime_snapshot_unlocked(scope_snapshot_ids, status="created")
+                    restorable_errors: dict[str, BaseException] = {}
+                    for refresh_scope_id in refresh_scope_ids:
+                        restorable_error = self._flow_restorable_error(refresh_scope_id)
+                        if restorable_error is not None:
+                            restorable_errors[refresh_scope_id] = restorable_error
+                    if restorable_errors:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=None,
+                            status="blocked",
+                            blocked_scope_ids=tuple(sorted(restorable_errors)),
+                            errors=restorable_errors,
+                        )
+
+                    refreshed_scope_snapshot_ids: dict[str, str] = {}
+                    errors: dict[str, BaseException] = {}
+                    for refresh_scope_id in refresh_scope_ids:
+                        try:
+                            scope_result = self._create_scope_snapshot_unlocked(refresh_scope_id)
+                            if scope_result.status != "created" or scope_result.snapshot_id is None:
+                                errors[refresh_scope_id] = RuntimeError(
+                                    f"failed to create scope snapshot for {refresh_scope_id}: {scope_result.status}"
+                                )
+                            else:
+                                refreshed_scope_snapshot_ids[refresh_scope_id] = scope_result.snapshot_id
+                        except BaseException as exc:
+                            errors[refresh_scope_id] = exc
+                    if errors:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=None,
+                            status="failed",
+                            scope_snapshot_ids=refreshed_scope_snapshot_ids,
+                            errors=errors,
+                        )
+
+                    if reuse_latest_for_other_scopes:
+                        scope_snapshot_ids = {
+                            selected_scope_id: (
+                                refreshed_scope_snapshot_ids[selected_scope_id]
+                                if selected_scope_id in refreshed_scope_snapshot_ids
+                                else latest_scope_snapshot_ids[selected_scope_id]
+                            )
+                            for selected_scope_id in selected_scope_ids
+                        }
+                    else:
+                        scope_snapshot_ids = {
+                            selected_scope_id: refreshed_scope_snapshot_ids[selected_scope_id]
+                            for selected_scope_id in selected_scope_ids
+                            if selected_scope_id in refreshed_scope_snapshot_ids
+                        }
+                    return self._create_runtime_snapshot_unlocked(scope_snapshot_ids, status="created")
             finally:
                 for refresh_scope_id in refresh_scope_ids:
                     if not was_directly_paused[refresh_scope_id]:
@@ -390,37 +422,48 @@ class AgentSnapshotService:
                         running_agent_ids=tuple(agent.agent_id for agent in running),
                         running_step_ids=tuple(running_steps),
                     )
-                files_root = self._scope_snapshot_dir(snapshot_id) / "files"
-                scope_key = str(manifest["scope_key"])
-                restored_scope_dir = files_root / "scopes" / scope_key
-                current_scope_dir = self.runtime_root / "scopes" / scope_key
-                old_agents = list(self.store.list_agents(scope_id=scope_id))
-                self._remove_report_files_for_agents(old_agents)
-                self._prepare_provider_artifacts(old_agents)
-                if current_scope_dir.exists():
-                    shutil.rmtree(current_scope_dir)
-                if restored_scope_dir.exists():
-                    shutil.copytree(restored_scope_dir, current_scope_dir)
-                self._restore_report_files(files_root)
-                self._restore_provider_artifacts(manifest, files_root)
-                self.store.rebuild_scope_index(scope_id)
-                self.store.rebuild_global_index()
-                self._rebuild_flow_indexes(scope_id)
-                restorable_error = self._flow_restorable_error(scope_id)
-                if restorable_error is not None:
+                with self._hold_paused_mutation_boundary([scope_id]):
+                    running = self._running_agents(scope_id)
+                    running_steps = self._running_steps(scope_id)
+                    if running or running_steps:
+                        return ScopeSnapshotResult(
+                            snapshot_id=snapshot_id,
+                            scope_id=scope_id,
+                            status="blocked",
+                            running_agent_ids=tuple(agent.agent_id for agent in running),
+                            running_step_ids=tuple(running_steps),
+                        )
+                    files_root = self._scope_snapshot_dir(snapshot_id) / "files"
+                    scope_key = str(manifest["scope_key"])
+                    restored_scope_dir = files_root / "scopes" / scope_key
+                    current_scope_dir = self.runtime_root / "scopes" / scope_key
+                    old_agents = list(self.store.list_agents(scope_id=scope_id))
+                    self._remove_report_files_for_agents(old_agents)
+                    self._prepare_provider_artifacts(old_agents)
+                    if current_scope_dir.exists():
+                        shutil.rmtree(current_scope_dir)
+                    if restored_scope_dir.exists():
+                        shutil.copytree(restored_scope_dir, current_scope_dir)
+                    self._restore_report_files(files_root)
+                    self._restore_provider_artifacts(manifest, files_root)
+                    self.store.rebuild_scope_index(scope_id)
+                    self.store.rebuild_global_index()
+                    self._rebuild_flow_indexes(scope_id)
+                    restorable_error = self._flow_restorable_error(scope_id)
+                    if restorable_error is not None:
+                        return ScopeSnapshotResult(
+                            snapshot_id=snapshot_id,
+                            scope_id=scope_id,
+                            status="failed",
+                            errors={"flow_restorable": restorable_error},
+                        )
+                    self._rebuild_scheduler_queues()
                     return ScopeSnapshotResult(
                         snapshot_id=snapshot_id,
                         scope_id=scope_id,
-                        status="failed",
-                        errors={"flow_restorable": restorable_error},
+                        status="created",
+                        snapshot_relpath=str(self._scope_snapshot_dir(snapshot_id).relative_to(self.runtime_root)),
                     )
-                self._rebuild_scheduler_queues()
-                return ScopeSnapshotResult(
-                    snapshot_id=snapshot_id,
-                    scope_id=scope_id,
-                    status="created",
-                    snapshot_relpath=str(self._scope_snapshot_dir(snapshot_id).relative_to(self.runtime_root)),
-                )
             finally:
                 if not leave_paused and not was_paused:
                     self._resume(scope_id)
@@ -466,65 +509,75 @@ class AgentSnapshotService:
                         blocked_scope_ids=tuple(sorted(self._blocked_scope_ids(running, running_steps))),
                         running_step_ids=tuple(running_steps),
                     )
-                errors: dict[str, BaseException] = {}
-                pruned_scope_ids: list[str] = []
-                if prune_extra_scopes:
-                    extra_scope_ids = sorted(set(self.store.list_scope_ids()) - set(scope_snapshot_ids))
-                    for scope_id in extra_scope_ids:
+                with self._hold_paused_mutation_boundary(None):
+                    running = self._running_agents(None)
+                    running_steps = self._running_steps(None)
+                    if running or running_steps:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=snapshot_id,
+                            status="blocked",
+                            blocked_scope_ids=tuple(sorted(self._blocked_scope_ids(running, running_steps))),
+                            running_step_ids=tuple(running_steps),
+                        )
+                    errors: dict[str, BaseException] = {}
+                    pruned_scope_ids: list[str] = []
+                    if prune_extra_scopes:
+                        extra_scope_ids = sorted(set(self.store.list_scope_ids()) - set(scope_snapshot_ids))
+                        for scope_id in extra_scope_ids:
+                            try:
+                                old_agents = list(self.store.list_agents(scope_id=scope_id))
+                                self._remove_report_files_for_agents(old_agents)
+                                self._prepare_provider_artifacts(old_agents)
+                                scope_dir = self.runtime_root / "scopes" / encode_scope_id(scope_id)
+                                if scope_dir.exists():
+                                    shutil.rmtree(scope_dir)
+                                pruned_scope_ids.append(scope_id)
+                            except BaseException as exc:
+                                errors[f"prune:{scope_id}"] = exc
+                    for scope_id, scope_snapshot_id in scope_snapshot_ids.items():
                         try:
+                            scope_manifest = self._read_scope_manifest(str(scope_snapshot_id))
+                            files_root = self._scope_snapshot_dir(str(scope_snapshot_id)) / "files"
+                            scope_key = str(scope_manifest["scope_key"])
+                            current_scope_dir = self.runtime_root / "scopes" / scope_key
+                            restored_scope_dir = files_root / "scopes" / scope_key
                             old_agents = list(self.store.list_agents(scope_id=scope_id))
                             self._remove_report_files_for_agents(old_agents)
                             self._prepare_provider_artifacts(old_agents)
-                            scope_dir = self.runtime_root / "scopes" / encode_scope_id(scope_id)
-                            if scope_dir.exists():
-                                shutil.rmtree(scope_dir)
-                            pruned_scope_ids.append(scope_id)
+                            if current_scope_dir.exists():
+                                shutil.rmtree(current_scope_dir)
+                            if restored_scope_dir.exists():
+                                shutil.copytree(restored_scope_dir, current_scope_dir)
+                            self._restore_report_files(files_root)
+                            self._restore_provider_artifacts(scope_manifest, files_root)
                         except BaseException as exc:
-                            errors[f"prune:{scope_id}"] = exc
-                for scope_id, scope_snapshot_id in scope_snapshot_ids.items():
-                    try:
-                        scope_manifest = self._read_scope_manifest(str(scope_snapshot_id))
-                        files_root = self._scope_snapshot_dir(str(scope_snapshot_id)) / "files"
-                        scope_key = str(scope_manifest["scope_key"])
-                        current_scope_dir = self.runtime_root / "scopes" / scope_key
-                        restored_scope_dir = files_root / "scopes" / scope_key
-                        old_agents = list(self.store.list_agents(scope_id=scope_id))
-                        self._remove_report_files_for_agents(old_agents)
-                        self._prepare_provider_artifacts(old_agents)
-                        if current_scope_dir.exists():
-                            shutil.rmtree(current_scope_dir)
-                        if restored_scope_dir.exists():
-                            shutil.copytree(restored_scope_dir, current_scope_dir)
-                        self._restore_report_files(files_root)
-                        self._restore_provider_artifacts(scope_manifest, files_root)
-                    except BaseException as exc:
-                        errors[scope_id] = exc
-                self.store.rebuild_global_index()
-                for scope_id in scope_snapshot_ids:
-                    try:
-                        self.store.rebuild_scope_index(scope_id)
-                    except BaseException:
-                        pass
-                self._rebuild_flow_indexes(None)
-                restorable_error = self._flow_restorable_error(None)
-                if restorable_error is not None:
-                    errors["flow_restorable"] = restorable_error
-                self._rebuild_scheduler_queues()
-                if errors:
+                            errors[scope_id] = exc
+                    self.store.rebuild_global_index()
+                    for scope_id in scope_snapshot_ids:
+                        try:
+                            self.store.rebuild_scope_index(scope_id)
+                        except BaseException:
+                            pass
+                    self._rebuild_flow_indexes(None)
+                    restorable_error = self._flow_restorable_error(None)
+                    if restorable_error is not None:
+                        errors["flow_restorable"] = restorable_error
+                    self._rebuild_scheduler_queues()
+                    if errors:
+                        return RuntimeSnapshotResult(
+                            snapshot_id=snapshot_id,
+                            status="failed",
+                            scope_snapshot_ids=scope_snapshot_ids,
+                            errors=errors,
+                            pruned_scope_ids=tuple(pruned_scope_ids),
+                        )
                     return RuntimeSnapshotResult(
                         snapshot_id=snapshot_id,
-                        status="failed",
+                        status="created",
                         scope_snapshot_ids=scope_snapshot_ids,
-                        errors=errors,
+                        snapshot_relpath=str(self._runtime_snapshot_dir(snapshot_id).relative_to(self.runtime_root)),
                         pruned_scope_ids=tuple(pruned_scope_ids),
                     )
-                return RuntimeSnapshotResult(
-                    snapshot_id=snapshot_id,
-                    status="created",
-                    scope_snapshot_ids=scope_snapshot_ids,
-                    snapshot_relpath=str(self._runtime_snapshot_dir(snapshot_id).relative_to(self.runtime_root)),
-                    pruned_scope_ids=tuple(pruned_scope_ids),
-                )
             finally:
                 if not leave_paused and not was_paused:
                     self._resume(None)
@@ -964,6 +1017,20 @@ class AgentSnapshotService:
         if pause_controller is not None and hasattr(pause_controller, "is_scope_directly_paused"):
             return bool(pause_controller.is_scope_directly_paused(scope_id))
         return self._is_paused(scope_id)
+
+    @contextmanager
+    def _hold_paused_mutation_boundary(self, scope_ids: list[str] | None) -> Iterator[None]:
+        pause_controller = self.ark.pause_controller
+        if pause_controller is None or not hasattr(pause_controller, "hold_paused"):
+            yield
+            return
+        with ExitStack() as stack:
+            if scope_ids is None:
+                stack.enter_context(pause_controller.hold_paused(None))
+            else:
+                for scope_id in sorted(set(scope_ids)):
+                    stack.enter_context(pause_controller.hold_paused(scope_id))
+            yield
 
     def _running_agents(self, scope_id: str | None) -> list[Any]:
         if self.agent_service is not None and hasattr(self.agent_service, "list_running_agents"):

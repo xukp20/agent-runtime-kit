@@ -1,8 +1,9 @@
 from pathlib import Path
 from contextlib import contextmanager
-from threading import Event, Timer
+from threading import Barrier, Event, Thread, Timer
 from typing import ClassVar
 
+import pytest
 from pydantic import BaseModel
 
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
@@ -120,6 +121,68 @@ def make_services(
         app_services=AppServices(),
     )
     return flow_service, step_service, scheduler, snapshot_service, ark
+
+
+class RecoveryAgents:
+    def __init__(self, source: Agent) -> None:
+        self.agents = {source.agent_id: source}
+
+    @contextmanager
+    def hold_agent_boundary(self):
+        yield
+
+    def get_agent(self, agent_id):  # noqa: ANN001, ANN201
+        return self.agents[agent_id]
+
+    def list_running_agents(self, _scope_id=None):  # noqa: ANN001, ANN201
+        return []
+
+    def query_turn(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN201
+        return None
+
+    def create_agent(self, scope_id, agent_type, provider_type=None, home_id=None):  # noqa: ANN001, ANN201
+        created = Agent(f"fresh-{len(self.agents)}", scope_id, agent_type, provider_type, home_id)
+        self.agents[created.agent_id] = created
+        return created
+
+
+def seed_recoverable_agent_step(
+    flow_service: FlowService,
+    step_service: StepService,
+    ark: ARKServices,
+    *,
+    scope_id: str = "scope",
+) -> str:
+    flow_id = flow_service.start_flow(
+        FlowRequest(flow_type="snapshot_flow", scope_id=scope_id, params={}),
+        enqueue=False,
+    )
+    source = Agent("source-agent", scope_id, "ReviewerAgent", "codex", "ReviewerAgent")
+    step = SnapshotAgentStep(
+        step_id="suspended-agent-step",
+        flow_id=flow_id,
+        scope_id=scope_id,
+        status=StepStatus.SUSPENDED,
+        state=AgentStepState(
+            agent_role="reviewer",
+            agent_type="ReviewerAgent",
+            provider_type="codex",
+            home_id="ReviewerAgent",
+        ),
+        error=BaseStepError(error_type="agent_provider_turn_failed", message="offline"),
+        agent_bindings=AgentRoleBindings(by_role={"reviewer": source.agent_id}),
+    )
+    step_service.create_step(step, enqueue=False)
+
+    def attach(flow):  # noqa: ANN001
+        flow.status = FlowStatus.RUNNING
+        flow.step_ids.append(step.step_id)
+        flow.current_step_id = step.step_id
+        flow.agent_bindings.by_role["reviewer"] = source.agent_id
+
+    flow_service.store.update_flow_record(flow_id, attach)
+    ark.agent_service = RecoveryAgents(source)
+    return step.step_id
 
 
 def test_scope_snapshot_blocks_when_scope_has_running_step(tmp_path: Path) -> None:
@@ -434,3 +497,238 @@ def test_selective_runtime_snapshot_does_not_block_on_unrefreshed_running_step(t
     assert runtime_snapshot.status == "created"
     assert runtime_snapshot.scope_snapshot_ids["scope-a"] != initial_a.snapshot_id
     assert runtime_snapshot.scope_snapshot_ids["scope-b"] == initial_b.snapshot_id
+
+
+def test_scope_snapshot_serializes_copy_with_agent_step_recovery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    flow_service, step_service, _, snapshot_service, ark = make_services(tmp_path / ".agent_runtime")
+    step_id = seed_recoverable_agent_step(flow_service, step_service, ark)
+    preview = flow_service.inspect_agent_step_recovery(step_id)
+    assert ark.pause_controller is not None
+    ark.pause_controller.pause("scope")
+    mutation_entered = Event()
+    release_mutation = Event()
+    recovery_attempt = Barrier(2)
+    recovery_done = Event()
+    snapshot_results = []
+    recovery_results = []
+    recovery_errors = []
+    original_create = snapshot_service._create_scope_snapshot_unlocked
+
+    def blocked_create(scope_id: str):  # noqa: ANN202
+        mutation_entered.set()
+        assert release_mutation.wait(timeout=2)
+        return original_create(scope_id)
+
+    monkeypatch.setattr(snapshot_service, "_create_scope_snapshot_unlocked", blocked_create)
+
+    def recover() -> None:
+        recovery_attempt.wait(timeout=2)
+        try:
+            recovery_results.append(
+                flow_service.recover_agent_step(
+                    step_id=step_id,
+                    expected_status=StepStatus.SUSPENDED,
+                    expected_recovery_token=preview.recovery_token,
+                    action="resume_suspended",
+                    agent_mode="fresh",
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - thread outcome is asserted below.
+            recovery_errors.append(exc)
+        finally:
+            recovery_done.set()
+
+    snapshot_thread = Thread(
+        target=lambda: snapshot_results.append(snapshot_service.create_scope_snapshot("scope")),
+        daemon=True,
+    )
+    recovery_thread = Thread(target=recover, daemon=True)
+    snapshot_thread.start()
+    assert mutation_entered.wait(timeout=2)
+    recovery_thread.start()
+    recovery_attempt.wait(timeout=2)
+    recovery_completed_inside_snapshot = recovery_done.wait(timeout=0.2)
+    release_mutation.set()
+    snapshot_thread.join(2)
+    recovery_thread.join(2)
+
+    assert recovery_completed_inside_snapshot is False
+    assert not snapshot_thread.is_alive()
+    assert not recovery_thread.is_alive()
+    assert recovery_errors == []
+    assert snapshot_results[0].status == "created", snapshot_results[0].errors
+    assert recovery_results[0].replacement_step_id is not None
+
+
+def test_scope_restore_serializes_mutation_with_agent_step_recovery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    flow_service, step_service, _, snapshot_service, ark = make_services(tmp_path / ".agent_runtime")
+    step_id = seed_recoverable_agent_step(flow_service, step_service, ark)
+    snapshot = snapshot_service.create_scope_snapshot("scope")
+    assert snapshot.snapshot_id is not None
+    preview = flow_service.inspect_agent_step_recovery(step_id)
+    mutation_entered = Event()
+    release_mutation = Event()
+    recovery_attempt = Barrier(2)
+    recovery_done = Event()
+    restore_results = []
+    recovery_results = []
+    recovery_errors = []
+    original_remove = snapshot_service._remove_report_files_for_agents
+
+    def blocked_remove(agents):  # noqa: ANN001, ANN202
+        mutation_entered.set()
+        assert release_mutation.wait(timeout=2)
+        return original_remove(agents)
+
+    monkeypatch.setattr(snapshot_service, "_remove_report_files_for_agents", blocked_remove)
+
+    def recover() -> None:
+        recovery_attempt.wait(timeout=2)
+        try:
+            recovery_results.append(
+                flow_service.recover_agent_step(
+                    step_id=step_id,
+                    expected_status=StepStatus.SUSPENDED,
+                    expected_recovery_token=preview.recovery_token,
+                    action="resume_suspended",
+                    agent_mode="fresh",
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - thread outcome is asserted below.
+            recovery_errors.append(exc)
+        finally:
+            recovery_done.set()
+
+    restore_thread = Thread(
+        target=lambda: restore_results.append(snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)),
+        daemon=True,
+    )
+    recovery_thread = Thread(target=recover, daemon=True)
+    restore_thread.start()
+    assert mutation_entered.wait(timeout=2)
+    recovery_thread.start()
+    recovery_attempt.wait(timeout=2)
+    recovery_completed_inside_restore = recovery_done.wait(timeout=0.2)
+    release_mutation.set()
+    restore_thread.join(2)
+    recovery_thread.join(2)
+
+    assert recovery_completed_inside_restore is False
+    assert not restore_thread.is_alive()
+    assert not recovery_thread.is_alive()
+    assert recovery_errors == []
+    assert restore_results[0].status == "created"
+    assert recovery_results[0].replacement_step_id is not None
+
+
+@pytest.mark.parametrize("snapshot_kind", ["synchronized", "selected", "restore"])
+def test_runtime_snapshot_mutation_holds_shared_paused_boundary(
+    tmp_path: Path,
+    monkeypatch,
+    snapshot_kind: str,
+) -> None:  # noqa: ANN001
+    flow_service, _, _, snapshot_service, ark = make_services(tmp_path / ".agent_runtime")
+    flow_service.start_flow(
+        FlowRequest(flow_type="snapshot_flow", scope_id="scope", params={}),
+        enqueue=False,
+    )
+    flow_service.start_flow(
+        FlowRequest(flow_type="snapshot_flow", scope_id="scope-b", params={}),
+        enqueue=False,
+    )
+    restore_snapshot_id = None
+    if snapshot_kind == "restore":
+        restore_source = snapshot_service.create_runtime_snapshot_synchronized()
+        assert restore_source.snapshot_id is not None
+        restore_snapshot_id = restore_source.snapshot_id
+    mutation_entered = Event()
+    release_mutation = Event()
+    contender_attempt = Barrier(2)
+    contender_entered = Event()
+    contender_errors = []
+    snapshot_results = []
+    original_create = snapshot_service._create_scope_snapshot_unlocked
+    original_remove = snapshot_service._remove_report_files_for_agents
+    hold_order = []
+
+    assert ark.pause_controller is not None
+    original_hold = ark.pause_controller.hold_paused
+
+    @contextmanager
+    def observed_hold(scope_id: str | None):
+        hold_order.append(scope_id)
+        with original_hold(scope_id):
+            yield
+
+    monkeypatch.setattr(ark.pause_controller, "hold_paused", observed_hold)
+    if snapshot_kind == "synchronized":
+        ark.pause_controller.pause(None)
+    elif snapshot_kind == "selected":
+        ark.pause_controller.pause("scope")
+        ark.pause_controller.pause("scope-b")
+
+    def blocked_create(scope_id: str):  # noqa: ANN202
+        mutation_entered.set()
+        assert release_mutation.wait(timeout=2)
+        return original_create(scope_id)
+
+    def blocked_remove(agents):  # noqa: ANN001, ANN202
+        mutation_entered.set()
+        assert release_mutation.wait(timeout=2)
+        return original_remove(agents)
+
+    if snapshot_kind == "restore":
+        monkeypatch.setattr(snapshot_service, "_remove_report_files_for_agents", blocked_remove)
+    else:
+        monkeypatch.setattr(snapshot_service, "_create_scope_snapshot_unlocked", blocked_create)
+
+    def create_snapshot() -> None:
+        if snapshot_kind == "synchronized":
+            snapshot_results.append(snapshot_service.create_runtime_snapshot_synchronized())
+        elif snapshot_kind == "selected":
+            snapshot_results.append(
+                snapshot_service.create_runtime_snapshot_for_scopes(
+                    refresh_scope_ids=["scope-b", "scope"],
+                    scope_ids=["scope-b", "scope"],
+                    reuse_latest_for_other_scopes=False,
+                )
+            )
+        else:
+            assert restore_snapshot_id is not None
+            snapshot_results.append(snapshot_service.restore_runtime_snapshot(restore_snapshot_id))
+
+    def contend_for_recovery_boundary() -> None:
+        assert ark.pause_controller is not None
+        contender_attempt.wait(timeout=2)
+        try:
+            with ark.pause_controller.hold_paused("scope"):
+                contender_entered.set()
+        except BaseException as exc:  # noqa: BLE001 - thread outcome is asserted below.
+            contender_errors.append(exc)
+
+    snapshot_thread = Thread(target=create_snapshot, daemon=True)
+    snapshot_thread.start()
+    assert mutation_entered.wait(timeout=2)
+    contender = Thread(target=contend_for_recovery_boundary, daemon=True)
+    contender.start()
+    contender_attempt.wait(timeout=2)
+    contender_completed_inside_snapshot = contender_entered.wait(timeout=0.2)
+    release_mutation.set()
+    snapshot_thread.join(2)
+    contender.join(2)
+
+    assert contender_completed_inside_snapshot is False
+    assert not snapshot_thread.is_alive()
+    assert not contender.is_alive()
+    assert contender_errors == []
+    assert snapshot_results[0].status == "created", snapshot_results[0].errors
+    if snapshot_kind == "selected":
+        assert hold_order[:2] == ["scope", "scope-b"]
+    else:
+        assert hold_order[0] is None

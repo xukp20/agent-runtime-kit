@@ -916,25 +916,35 @@ class AgentService:
         require_resolved: bool = True,
         respect_pause: bool = True,
     ) -> _ActiveAgentRun:
-        with self._status_condition:
+        pause_guard = None
+        if respect_pause:
             agent = self.store.get_agent(agent_id)
-            if agent.status == "closed":
-                raise AgentClosedError(agent_id)
-            if agent.status == "running" or agent_id in self._active:
-                raise AgentAlreadyRunningError(agent_id)
-            if require_resolved:
-                self._assert_context_maintenance_resolved(agent_id)
-            if respect_pause:
-                self._assert_agent_can_start(agent.scope_id)
-            self.store.patch_agent(agent_id, status="running")
-            active = _ActiveAgentRun(
-                agent_id=agent_id,
-                worker=threading.current_thread(),
-                done_event=threading.Event(),
-            )
-            self._active[agent_id] = active
-            self._status_condition.notify_all()
-            return active
+            try:
+                pause_guard = self.pause_controller.hold_unpaused(agent.scope_id)
+                pause_guard.__enter__()
+            except RuntimePausedError as exc:
+                raise AgentPausedError(f"agent runs are paused for scope: {agent.scope_id}") from exc
+        try:
+            with self._status_condition:
+                agent = self.store.get_agent(agent_id)
+                if agent.status == "closed":
+                    raise AgentClosedError(agent_id)
+                if agent.status == "running" or agent_id in self._active:
+                    raise AgentAlreadyRunningError(agent_id)
+                if require_resolved:
+                    self._assert_context_maintenance_resolved(agent_id)
+                self.store.patch_agent(agent_id, status="running")
+                active = _ActiveAgentRun(
+                    agent_id=agent_id,
+                    worker=threading.current_thread(),
+                    done_event=threading.Event(),
+                )
+                self._active[agent_id] = active
+                self._status_condition.notify_all()
+                return active
+        finally:
+            if pause_guard is not None:
+                pause_guard.__exit__(None, None, None)
 
     def _finish_synchronous_maintenance(self, active: _ActiveAgentRun) -> None:
         with self._status_condition:
