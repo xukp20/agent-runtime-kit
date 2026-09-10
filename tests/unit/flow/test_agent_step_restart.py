@@ -268,6 +268,55 @@ def test_recover_failed_agent_step_preserves_complete_source_preimage(tmp_path: 
     assert prompt == f"Review the current declaration batch.\n\n{AGENT_STEP_RESTART_PROMPT_SUFFIX}"
 
 
+def test_restart_prompt_appends_persisted_operator_instruction_after_restart_suffix(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        agent_id="reviewer-agent",
+        scope_id="scope",
+        agent_type="ReviewerAgent",
+        provider_type="codex",
+        home_id="ReviewerAgent",
+    )
+    service, ark, _, _ = _service(tmp_path, agent=agent)
+    flow_id, failed_step_id = _failed_step(service, agent_id=agent.agent_id)
+    service.store.update_step_record(
+        failed_step_id,
+        lambda step: setattr(
+            step.state,
+            "operator_instruction",
+            "Use the current workspace truth.",
+        ),
+    )
+    preview = service.inspect_agent_step_recovery(failed_step_id)
+
+    receipt = service.recover_agent_step(
+        step_id=failed_step_id,
+        expected_status=StepStatus.FAILED,
+        expected_recovery_token=preview.recovery_token,
+        action="restart",
+        agent_mode="reuse",
+    )
+    replacement = service.get_step(receipt.replacement_step_id)
+    prompt = replacement.build_start_prompt(
+        StepRunContext(
+            ark=ark,
+            app=AppServices(),
+            step_id=replacement.step_id,
+            flow_id=flow_id,
+            scope_id="scope",
+        ),
+        agent.agent_id,
+    )
+
+    assert replacement.state.operator_instruction == "Use the current workspace truth."
+    assert prompt.endswith("Use the current workspace truth.")
+    assert prompt.count("Use the current workspace truth.") == 1
+    assert prompt.index(AGENT_STEP_RESTART_PROMPT_SUFFIX) < prompt.index(
+        "Use the current workspace truth."
+    )
+
+
 def test_recover_failed_agent_step_auto_replaces_closed_agent(tmp_path: Path) -> None:
     agent = Agent(
         agent_id="closed-reviewer",

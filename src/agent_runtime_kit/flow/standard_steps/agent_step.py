@@ -30,6 +30,11 @@ AGENT_STEP_RESTART_PROMPT_SUFFIX = (
     "The previous execution of this AgentStep ended unexpectedly. "
     "Continue the same task from the current workspace and runtime state."
 )
+AGENT_STEP_OPERATOR_INSTRUCTION_HEADING = "Operator instruction for this AgentStep:"
+AGENT_STEP_OPERATOR_INSTRUCTION_CONTEXT = (
+    "Treat current runtime and business truth, including direct tool queries, as authoritative "
+    "over older summaries. This instruction does not itself modify runtime or business truth."
+)
 
 
 class AgentStepState(BaseStepState):
@@ -47,6 +52,7 @@ class AgentStepState(BaseStepState):
     followup_of_step_id: str | None = None
     restart_of_step_id: str | None = None
     callback_dispatch_step_id: str | None = None
+    operator_instruction: str | None = None
     max_auto_continue_turns: int = 2
     require_submission: bool = True
     env_overrides: dict[str, str] = Field(default_factory=dict)
@@ -171,14 +177,20 @@ class AgentStep(BaseStep):
             prompt = latest.build_callback_prompt(ctx, agent_id)
         else:
             prompt = state.prompt_override
-        if state.restart_of_step_id is None:
-            return prompt
-        if prompt is None:
+        if (state.restart_of_step_id is not None or state.operator_instruction is not None) and prompt is None:
             agent_service = self._agent_service(ctx)
             agent = agent_service.get_agent(agent_id)
             agent_type = agent_service.agent_types.get(agent.agent_type)
             prompt = agent_type.render_start_prompt(state.variables)
-        return f"{prompt.rstrip()}\n\n{AGENT_STEP_RESTART_PROMPT_SUFFIX}"
+        if state.restart_of_step_id is not None:
+            prompt = f"{prompt.rstrip()}\n\n{AGENT_STEP_RESTART_PROMPT_SUFFIX}"
+        if state.operator_instruction is not None:
+            prompt = (
+                f"{prompt.rstrip()}\n\n{AGENT_STEP_OPERATOR_INSTRUCTION_HEADING}\n"
+                f"{AGENT_STEP_OPERATOR_INSTRUCTION_CONTEXT}\n\n"
+                f"{state.operator_instruction}"
+            )
+        return prompt
 
     def prepare_agent_context_before_first_turn(
         self,

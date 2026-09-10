@@ -27,6 +27,7 @@ from .models import (
     FlowStatus,
     FlowStepValidationError,
     LostStepSubmissionFinalizeUnavailableError,
+    SetAgentStepOperatorInstructionReceipt,
     StepStatus,
     StepSuspensionReceipt,
     StepTerminalReceipt,
@@ -166,6 +167,78 @@ class FlowService:
 
     def list_non_terminal_flows(self, *, scope_id: str | None = None) -> list[BaseFlow]:
         return self.store.list_non_terminal_flows(scope_id=scope_id)
+
+    def set_agent_step_operator_instruction(
+        self,
+        *,
+        step_id: str,
+        expected_step_updated_at: str,
+        expected_flow_updated_at: str,
+        instruction: str | None,
+    ) -> SetAgentStepOperatorInstructionReceipt:
+        if instruction is not None and not instruction.strip():
+            raise FlowStepValidationError("AgentStep operator instruction must not be blank")
+        initial = self.store.get_step(step_id)
+        pause_controller = self.ark.pause_controller
+        agent_service = self.ark.agent_service
+        if pause_controller is None or agent_service is None:
+            raise FlowStepValidationError(
+                "AgentStep operator instruction requires PauseController and AgentService"
+            )
+        agent_guard = getattr(agent_service, "hold_agent_boundary", nullcontext)
+        with pause_controller.hold_paused(initial.scope_id), agent_guard(), self.lock:
+            with self.store.edit_session(initial.scope_id) as tx:
+                step = tx.load_step_for_update(step_id)
+                flow = self.store.get_flow(step.flow_id)
+                if not isinstance(step, AgentStep) or not isinstance(step.state, AgentStepState):
+                    raise FlowStepValidationError(f"step is not an AgentStep: {step_id}")
+                if step.scope_id != flow.scope_id:
+                    raise FlowStepValidationError("AgentStep and owning Flow scope do not match")
+                if step.updated_at != expected_step_updated_at:
+                    raise FlowStepValidationError("AgentStep updated_at changed")
+                if flow.updated_at != expected_flow_updated_at:
+                    raise FlowStepValidationError("owning Flow updated_at changed")
+                if flow.current_step_id != step_id:
+                    raise FlowStepValidationError("AgentStep is not the owning Flow current step")
+                if flow.status in {FlowStatus.COMPLETED, FlowStatus.FAILED}:
+                    raise FlowStepValidationError("terminal Flow AgentStep instruction cannot be changed")
+                if step.status is not StepStatus.CREATED:
+                    raise FlowStepValidationError("AgentStep instruction can only be changed before start")
+                if any(
+                    value is not None
+                    for value in (
+                        step.submission,
+                        step.result,
+                        step.error,
+                        step.started_at,
+                        step.finished_at,
+                    )
+                ):
+                    raise FlowStepValidationError("AgentStep has already started or produced execution truth")
+                self._assert_scope_quiescent(step.scope_id)
+                if not pause_controller.is_paused(step.scope_id):
+                    raise FlowStepValidationError("runtime pause changed during AgentStep instruction update")
+                instruction_before = step.state.operator_instruction
+                step_updated_at_before = step.updated_at
+                flow_updated_at = flow.updated_at
+                step.state.operator_instruction = instruction
+            return SetAgentStepOperatorInstructionReceipt(
+                step_id=step.step_id,
+                flow_id=step.flow_id,
+                scope_id=step.scope_id,
+                instruction_before=instruction_before,
+                instruction_after=instruction,
+                instruction_present=instruction is not None,
+                step_updated_at_before=step_updated_at_before,
+                step_updated_at_after=step.updated_at,
+                flow_updated_at_before=flow_updated_at,
+                flow_updated_at_after=flow_updated_at,
+                summary=(
+                    "Set AgentStep operator instruction."
+                    if instruction is not None
+                    else "Cleared AgentStep operator instruction."
+                ),
+            )
 
     def replace_bound_agent(
         self,

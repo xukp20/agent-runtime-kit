@@ -253,6 +253,20 @@ class BoundAgentReplacementReceipt(StrictModel):
     step_id: str | None = None
 
 
+class SetAgentStepOperatorInstructionReceipt(StrictModel):
+    step_id: str
+    flow_id: str
+    scope_id: str
+    instruction_before: str | None = None
+    instruction_after: str | None = None
+    instruction_present: bool
+    step_updated_at_before: str
+    step_updated_at_after: str
+    flow_updated_at_before: str
+    flow_updated_at_after: str
+    summary: str
+
+
 class AgentStepRecoveryReceipt(StrictModel):
     source_step_id: str
     replacement_step_id: str | None = None

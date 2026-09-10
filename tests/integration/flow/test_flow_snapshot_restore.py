@@ -242,6 +242,47 @@ def test_scope_snapshot_restore_preserves_suspended_step(tmp_path: Path) -> None
     assert flow_service.get_flow(flow_id).current_step_id == step.step_id
 
 
+def test_scope_snapshot_restore_preserves_agent_step_operator_instruction(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    flow_service, step_service, _, snapshot_service, _ = make_services(runtime_root)
+    flow_id = flow_service.start_flow(
+        FlowRequest(flow_type="snapshot_flow", scope_id="scope", params={}),
+        enqueue=False,
+    )
+    step = SnapshotAgentStep(
+        step_id="operator-agent-step",
+        flow_id=flow_id,
+        scope_id="scope",
+        state=AgentStepState(
+            agent_role="reviewer",
+            operator_instruction="Inspect the current snapshot truth.",
+        ),
+    )
+    step_service.create_step(step, enqueue=False)
+    flow_service.store.update_flow_record(
+        flow_id,
+        lambda flow: (
+            setattr(flow, "status", FlowStatus.RUNNING),
+            flow.step_ids.append(step.step_id),
+            setattr(flow, "current_step_id", step.step_id),
+        ),
+    )
+
+    snapshot = snapshot_service.create_scope_snapshot("scope")
+    assert snapshot.status == "created"
+    flow_service.store.update_step_record(
+        step.step_id,
+        lambda target: setattr(target.state, "operator_instruction", None),
+    )
+    restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    assert (
+        flow_service.get_step(step.step_id).state.operator_instruction
+        == "Inspect the current snapshot truth."
+    )
+
+
 def test_scope_snapshot_restore_then_fresh_resume_suspended_agent_step(tmp_path: Path) -> None:
     runtime_root = tmp_path / ".agent_runtime"
     flow_service, step_service, _, snapshot_service, ark = make_services(runtime_root)

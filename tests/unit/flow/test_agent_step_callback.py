@@ -166,6 +166,35 @@ def make_callback_step(flow_id: str, dispatch_step_id: str) -> AgentStep:
     )
 
 
+def test_callback_prompt_appends_operator_instruction_after_child_result(tmp_path: Path) -> None:
+    flow_service = make_service(tmp_path / ".agent_runtime")
+    parent_id = start_parent(flow_service)
+    child_id = start_child(flow_service, title="current source", result_text="current result")
+    dispatch = FakeDispatchStep(
+        step_id="dispatch-step",
+        flow_id=parent_id,
+        scope_id="scope",
+        state=FakeDispatchStepState(
+            created_children=[CreatedChildFlow(request_index=0, child_flow_id=child_id)]
+        ),
+    )
+    attach_step(flow_service, parent_id, dispatch)
+    callback = make_callback_step(parent_id, dispatch.step_id)
+    callback.state.operator_instruction = "Use the current result, not an older summary."
+    attach_step(flow_service, parent_id, callback)
+
+    prompt = callback.build_start_prompt(
+        make_ctx(flow_service, parent_id, callback.step_id),
+        "agent-1",
+    )
+
+    assert prompt.endswith("Use the current result, not an older summary.")
+    assert prompt.count("Use the current result, not an older summary.") == 1
+    assert prompt.index("Result: current result") < prompt.index(
+        "Use the current result, not an older summary."
+    )
+
+
 def make_ctx(flow_service: FlowService, flow_id: str, step_id: str) -> StepRunContext:
     return StepRunContext(ark=flow_service.ark, app=AppServices(), step_id=step_id, flow_id=flow_id, scope_id="scope")
 
@@ -280,6 +309,7 @@ def test_build_followup_agent_step_from_dispatch_reuses_source_agent_binding(tmp
             env_overrides={"CUSTOM": "1"},
             workdir_override="/tmp/work",
             max_auto_continue_turns=3,
+            operator_instruction="Do not inherit this one-time instruction.",
         ),
     )
     source.agent_bindings.by_role["planner"] = "agent-source"
@@ -311,3 +341,4 @@ def test_build_followup_agent_step_from_dispatch_reuses_source_agent_binding(tmp
     assert followup.state.env_overrides == {"CUSTOM": "1"}
     assert followup.state.workdir_override == "/tmp/work"
     assert followup.state.max_auto_continue_turns == 3
+    assert followup.state.operator_instruction is None
