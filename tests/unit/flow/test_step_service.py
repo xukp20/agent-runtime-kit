@@ -418,6 +418,29 @@ def test_wait_step_terminal_reports_persisted_running_without_runner_as_lost(tmp
     assert result.warning == "persisted running step has no active runner in this process"
 
 
+def test_wait_step_terminal_returns_suspended_as_settled_nonterminal_boundary(tmp_path: Path) -> None:
+    flow_service, step_service = make_services(tmp_path / ".agent_runtime")
+    flow_id = start_flow(flow_service)
+    step = CompleteStep(
+        step_id="suspended-step",
+        flow_id=flow_id,
+        scope_id="scope",
+        status=StepStatus.SUSPENDED,
+    )
+    step_service.create_step(step, enqueue=False)
+    flow_service.store.update_flow_record(
+        flow_id,
+        lambda flow: (flow.step_ids.append(step.step_id), setattr(flow, "current_step_id", step.step_id)),
+    )
+
+    result = step_service.wait_step_terminal(step.step_id, timeout_s=0)
+
+    assert result.terminal is False
+    assert result.timed_out is False
+    assert result.runner_state == "settled"
+    assert step_service.has_running_steps("scope") is False
+
+
 def test_wait_step_terminal_wakes_multiple_waiters(tmp_path: Path) -> None:
     BlockingStep.release_event = Event()
     BlockingStep.started_events = {"shared": Event()}

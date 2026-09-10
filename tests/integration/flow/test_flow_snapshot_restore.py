@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import contextmanager
 from threading import Event, Timer
 from typing import ClassVar
 
@@ -6,11 +7,13 @@ from pydantic import BaseModel
 
 from agent_runtime_kit.agent.snapshots import AgentSnapshotService
 from agent_runtime_kit.agent.store import AgentStoreService
+from agent_runtime_kit.agent.models import Agent
 from agent_runtime_kit.flow import (
     BaseFlow,
     BaseFlowResult,
     BaseFlowState,
     BaseStep,
+    BaseStepError,
     BaseStepResult,
     BaseStepState,
     FlowBuildContext,
@@ -25,6 +28,9 @@ from agent_runtime_kit.flow import (
     StepTerminalReceipt,
     StepTypeRegistry,
     FlowTypeRegistry,
+    AgentRoleBindings,
+    AgentStep,
+    AgentStepState,
 )
 from agent_runtime_kit.runtime import ARKServices, AppServices
 
@@ -61,6 +67,10 @@ class BlockingSnapshotStep(BaseStep):
         return ctx.complete_step(BaseStepResult(result_type="blocking_snapshot_step_done", summary="step done"))
 
 
+class SnapshotAgentStep(AgentStep):
+    step_type: ClassVar[str] = "snapshot_agent_step"
+
+
 class SnapshotFlow(BaseFlow):
     flow_type: ClassVar[str] = "snapshot_flow"
     Params: ClassVar[type[BaseModel]] = SnapshotFlowParams
@@ -92,6 +102,7 @@ def make_services(
     flow_registry.register(SnapshotFlow)
     step_registry.register(SnapshotStep)
     step_registry.register(BlockingSnapshotStep)
+    step_registry.register(SnapshotAgentStep)
     ark = ARKServices()
     flow_service = FlowService(
         runtime_root,
@@ -131,6 +142,115 @@ def test_scope_snapshot_blocks_when_scope_has_running_step(tmp_path: Path) -> No
 
     assert result.status == "blocked"
     assert result.running_step_ids == ("running-step",)
+
+
+def test_scope_snapshot_restore_preserves_suspended_step(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    flow_service, step_service, _, snapshot_service, _ = make_services(runtime_root)
+    flow_id = flow_service.start_flow(
+        FlowRequest(flow_type="snapshot_flow", scope_id="scope", params={}),
+        enqueue=False,
+    )
+    step = SnapshotStep(
+        step_id="suspended-step",
+        flow_id=flow_id,
+        scope_id="scope",
+        status=StepStatus.SUSPENDED,
+        state=SnapshotStepState(),
+        error=BaseStepError(error_type="agent_provider_failure", message="offline"),
+    )
+    step_service.create_step(step, enqueue=False)
+    flow_service.store.update_flow_record(
+        flow_id,
+        lambda flow: (
+            setattr(flow, "status", FlowStatus.RUNNING),
+            flow.step_ids.append(step.step_id),
+            setattr(flow, "current_step_id", step.step_id),
+        ),
+    )
+
+    snapshot = snapshot_service.create_scope_snapshot("scope")
+    assert snapshot.status == "created"
+    flow_service.store.update_step_record(step.step_id, lambda target: setattr(target, "status", StepStatus.FAILED))
+    restored = snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    assert restored.status == "created"
+    assert flow_service.get_step(step.step_id).status is StepStatus.SUSPENDED
+    assert flow_service.get_flow(flow_id).current_step_id == step.step_id
+
+
+def test_scope_snapshot_restore_then_fresh_resume_suspended_agent_step(tmp_path: Path) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    flow_service, step_service, _, snapshot_service, ark = make_services(runtime_root)
+    flow_id = flow_service.start_flow(
+        FlowRequest(flow_type="snapshot_flow", scope_id="scope", params={}),
+        enqueue=False,
+    )
+    source = Agent("source-agent", "scope", "ReviewerAgent", "codex", "ReviewerAgent")
+    step = SnapshotAgentStep(
+        step_id="suspended-agent-step",
+        flow_id=flow_id,
+        scope_id="scope",
+        status=StepStatus.SUSPENDED,
+        state=AgentStepState(
+            agent_role="reviewer",
+            agent_type="ReviewerAgent",
+            provider_type="codex",
+            home_id="ReviewerAgent",
+        ),
+        error=BaseStepError(error_type="agent_provider_turn_failed", message="offline"),
+        agent_bindings=AgentRoleBindings(by_role={"reviewer": source.agent_id}),
+    )
+    step_service.create_step(step, enqueue=False)
+
+    def attach(flow):  # noqa: ANN001
+        flow.status = FlowStatus.RUNNING
+        flow.step_ids.append(step.step_id)
+        flow.current_step_id = step.step_id
+        flow.agent_bindings.by_role["reviewer"] = source.agent_id
+
+    flow_service.store.update_flow_record(flow_id, attach)
+    snapshot = snapshot_service.create_scope_snapshot("scope")
+    assert snapshot.snapshot_id is not None
+    flow_service.store.update_step_record(step.step_id, lambda target: setattr(target, "status", StepStatus.FAILED))
+    snapshot_service.restore_scope_snapshot(snapshot.snapshot_id)
+
+    class RecoveryAgents:
+        def __init__(self) -> None:
+            self.agents = {source.agent_id: source}
+
+        @contextmanager
+        def hold_agent_boundary(self):
+            yield
+
+        def get_agent(self, agent_id):  # noqa: ANN001, ANN201
+            return self.agents[agent_id]
+
+        def list_running_agents(self, _scope_id=None):  # noqa: ANN001, ANN201
+            return []
+
+        def query_turn(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN201
+            return None
+
+        def create_agent(self, scope_id, agent_type, provider_type=None, home_id=None):  # noqa: ANN001, ANN201
+            created = Agent("fresh-agent", scope_id, agent_type, provider_type, home_id)
+            self.agents[created.agent_id] = created
+            return created
+
+    ark.agent_service = RecoveryAgents()
+    preview = flow_service.inspect_agent_step_recovery(step.step_id)
+    receipt = flow_service.recover_agent_step(
+        step_id=step.step_id,
+        expected_status=StepStatus.SUSPENDED,
+        expected_recovery_token=preview.recovery_token,
+        action="resume_suspended",
+        agent_mode="fresh",
+    )
+
+    assert receipt.replacement_agent_id == "fresh-agent"
+    assert flow_service.get_step(step.step_id).status is StepStatus.SUSPENDED
+    assert flow_service.get_step(receipt.replacement_step_id).status is StepStatus.CREATED
+    assert flow_service.get_flow(flow_id).current_step_id == receipt.replacement_step_id
 
 
 def test_scope_restore_rebuilds_flow_step_indexes_queue_and_leaves_paused(tmp_path: Path) -> None:

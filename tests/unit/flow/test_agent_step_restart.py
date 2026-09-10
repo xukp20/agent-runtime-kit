@@ -1,4 +1,8 @@
 from pathlib import Path
+from contextlib import contextmanager
+from dataclasses import replace
+from threading import RLock
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -17,7 +21,6 @@ from agent_runtime_kit.flow import (
     FlowRequest,
     FlowService,
     FlowStatus,
-    FlowStepValidationError,
     FlowTypeRegistry,
     StepRunContext,
     StepStatus,
@@ -53,20 +56,36 @@ class RestartAgentStep(AgentStep):
 class FakeScheduleService:
     def __init__(self) -> None:
         self.step_ids: list[str] = []
+        self.flow_ids: list[str] = []
 
     def enqueue_step(self, step_id: str) -> None:
         self.step_ids.append(step_id)
+
+    def enqueue_flow(self, flow_id: str) -> None:
+        self.flow_ids.append(flow_id)
 
 
 class FakeAgentService:
     def __init__(self, agents: list[Agent]) -> None:
         self.agents = {agent.agent_id: agent for agent in agents}
         self.created: list[Agent] = []
+        self.lock = RLock()
+        self.provider_turn = None
+
+    @contextmanager
+    def hold_agent_boundary(self):
+        with self.lock:
+            yield
 
     def get_agent(self, agent_id: str) -> Agent:
         if agent_id not in self.agents:
             raise FileNotFoundError(agent_id)
         return self.agents[agent_id]
+
+    def close_agent(self, agent_id: str) -> Agent:
+        with self.lock:
+            self.agents[agent_id].status = "closed"
+            return self.agents[agent_id]
 
     def create_agent(
         self,
@@ -86,11 +105,43 @@ class FakeAgentService:
         self.created.append(agent)
         return agent
 
+    def fork_agent_for_recovery(self, source_agent_id: str, *, target_scope_id: str | None = None) -> Agent:
+        source = self.get_agent(source_agent_id)
+        agent = replace(
+            source,
+            agent_id=f"fork-{len(self.created) + 1}",
+            scope_id=target_scope_id or source.scope_id,
+            status="idle",
+        )
+        self.agents[agent.agent_id] = agent
+        self.created.append(agent)
+        return agent
+
     def has_running_agents(self, scope_id: str | None = None) -> bool:
         return any(
             agent.status == "running" and (scope_id is None or agent.scope_id == scope_id)
             for agent in self.agents.values()
         )
+
+    def list_running_agents(self, scope_id: str | None = None) -> list[Agent]:
+        return [
+            agent
+            for agent in self.agents.values()
+            if agent.status == "running" and (scope_id is None or agent.scope_id == scope_id)
+        ]
+
+    def audit_running_agents(self, scope_id: str | None = None):  # noqa: ANN201
+        return [
+            SimpleNamespace(agent_id=agent.agent_id, classification="safe_to_mark_idle")
+            for agent in self.list_running_agents(scope_id)
+        ]
+
+    def repair_running_agent(self, agent_id: str, **_kwargs):  # noqa: ANN003, ANN201
+        self.agents[agent_id].status = "idle"
+        return SimpleNamespace(repaired=True)
+
+    def query_turn(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN201
+        return self.provider_turn
 
 
 def _service(tmp_path: Path, *, agent: Agent) -> tuple[FlowService, ARKServices, FakeScheduleService, FakeAgentService]:
@@ -153,7 +204,7 @@ def _failed_step(service: FlowService, *, agent_id: str) -> tuple[str, str]:
     return flow_id, step_id
 
 
-def test_restart_failed_agent_step_reuses_agent_and_preserves_failed_evidence(tmp_path: Path) -> None:
+def test_recover_failed_agent_step_preserves_complete_source_preimage(tmp_path: Path) -> None:
     agent = Agent(
         agent_id="reviewer-agent",
         scope_id="scope",
@@ -164,11 +215,19 @@ def test_restart_failed_agent_step_reuses_agent_and_preserves_failed_evidence(tm
     service, ark, schedule, agents = _service(tmp_path, agent=agent)
     flow_id, failed_step_id = _failed_step(service, agent_id=agent.agent_id)
 
-    receipt = service.restart_failed_agent_step(failed_step_id)
+    source_preimage = service.get_step(failed_step_id).model_dump(mode="json")
+    preview = service.inspect_agent_step_recovery(failed_step_id)
+    receipt = service.recover_agent_step(
+        step_id=failed_step_id,
+        expected_status=StepStatus.FAILED,
+        expected_recovery_token=preview.recovery_token,
+        action="restart",
+        agent_mode="reuse",
+    )
 
-    assert receipt.failed_step_id == failed_step_id
+    assert receipt.source_step_id == failed_step_id
     assert receipt.flow_id == flow_id
-    assert receipt.agent_id == agent.agent_id
+    assert receipt.replacement_agent_id == agent.agent_id
     assert receipt.agent_reused is True
     assert receipt.enqueued is True
     assert agents.created == []
@@ -177,7 +236,7 @@ def test_restart_failed_agent_step_reuses_agent_and_preserves_failed_evidence(tm
     old_step = service.get_step(failed_step_id)
     replacement = service.get_step(receipt.replacement_step_id)
     flow = service.get_flow(flow_id)
-    assert old_step.status is StepStatus.FAILED
+    assert old_step.model_dump(mode="json") == source_preimage
     assert old_step.error is not None
     assert isinstance(replacement, RestartAgentStep)
     assert replacement.status is StepStatus.CREATED
@@ -209,7 +268,7 @@ def test_restart_failed_agent_step_reuses_agent_and_preserves_failed_evidence(tm
     assert prompt == f"Review the current declaration batch.\n\n{AGENT_STEP_RESTART_PROMPT_SUFFIX}"
 
 
-def test_restart_failed_agent_step_replaces_closed_agent(tmp_path: Path) -> None:
+def test_recover_failed_agent_step_auto_replaces_closed_agent(tmp_path: Path) -> None:
     agent = Agent(
         agent_id="closed-reviewer",
         scope_id="scope",
@@ -221,10 +280,16 @@ def test_restart_failed_agent_step_replaces_closed_agent(tmp_path: Path) -> None
     service, _, _, agents = _service(tmp_path, agent=agent)
     flow_id, failed_step_id = _failed_step(service, agent_id=agent.agent_id)
 
-    receipt = service.restart_failed_agent_step(failed_step_id)
+    preview = service.inspect_agent_step_recovery(failed_step_id)
+    receipt = service.recover_agent_step(
+        step_id=failed_step_id,
+        expected_status=StepStatus.FAILED,
+        expected_recovery_token=preview.recovery_token,
+        action="restart",
+    )
 
     assert receipt.agent_reused is False
-    assert receipt.agent_id == "fresh-1"
+    assert receipt.replacement_agent_id == "fresh-1"
     assert len(agents.created) == 1
     assert agents.created[0].agent_type == "ReviewerAgent"
     assert agents.created[0].provider_type == "opencode"
@@ -233,7 +298,7 @@ def test_restart_failed_agent_step_replaces_closed_agent(tmp_path: Path) -> None
     assert service.get_flow(flow_id).agent_bindings.get("reviewer") == "fresh-1"
 
 
-def test_restart_failed_agent_step_requires_paused_scope(tmp_path: Path) -> None:
+def test_recover_failed_agent_step_requires_paused_scope(tmp_path: Path) -> None:
     agent = Agent(
         agent_id="reviewer-agent",
         scope_id="scope",
@@ -246,5 +311,11 @@ def test_restart_failed_agent_step_requires_paused_scope(tmp_path: Path) -> None
     assert isinstance(ark.pause_controller, RuntimePauseController)
     ark.pause_controller.resume()
 
-    with pytest.raises(FlowStepValidationError, match="requires a paused runtime scope"):
-        service.restart_failed_agent_step(failed_step_id)
+    preview = service.inspect_agent_step_recovery(failed_step_id)
+    with pytest.raises(RuntimeError, match="not paused"):
+        service.recover_agent_step(
+            step_id=failed_step_id,
+            expected_status=StepStatus.FAILED,
+            expected_recovery_token=preview.recovery_token,
+            action="restart",
+        )

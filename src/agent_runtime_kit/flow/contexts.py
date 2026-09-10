@@ -19,6 +19,7 @@ from .models import (
     FlowRequest,
     FlowStepValidationError,
     StepStatus,
+    StepSuspensionReceipt,
     StepTerminalReceipt,
     utc_now_iso,
 )
@@ -182,6 +183,29 @@ class StepRunContext(RuntimeContext):
             status="failed",
             error_type=error.error_type,
             finished_at=updated.finished_at or finished_at,
+        )
+
+    def suspend_step(self, error: BaseStepError) -> StepSuspensionReceipt:
+        suspended_at = utc_now_iso()
+
+        def write_error(step: BaseStep) -> None:
+            self._validate_step_identity(step)
+            if step.status is not StepStatus.RUNNING:
+                raise FlowStepValidationError(f"step {step.step_id} is not running")
+            if step.result is not None or step.error is not None:
+                raise FlowStepValidationError(f"step {step.step_id} already has outcome evidence")
+            step.error = error
+            step.status = StepStatus.SUSPENDED
+            step.finished_at = suspended_at
+            step.updated_at = suspended_at
+
+        updated = self._store().update_step_record(self.step_id, write_error)
+        return StepSuspensionReceipt(
+            step_id=updated.step_id,
+            flow_id=updated.flow_id,
+            scope_id=updated.scope_id,
+            error_type=error.error_type,
+            finished_at=updated.finished_at or suspended_at,
         )
 
     def _store(self) -> FlowStepStore:

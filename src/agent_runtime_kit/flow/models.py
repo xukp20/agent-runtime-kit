@@ -27,9 +27,14 @@ class FlowStepTypeError(FlowStepError):
     """Raised when Flow / Step type lookup or parsing fails."""
 
 
+class LostStepSubmissionFinalizeUnavailableError(FlowStepError):
+    error_type = "lost_step_submission_finalize_unavailable"
+
+
 class StepStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
+    SUSPENDED = "suspended"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -156,6 +161,15 @@ class StepTerminalReceipt(StrictModel):
     finished_at: str
 
 
+class StepSuspensionReceipt(StrictModel):
+    step_id: str
+    flow_id: str
+    scope_id: str
+    status: Literal["suspended"] = "suspended"
+    error_type: str
+    finished_at: str
+
+
 class BaseStep(StrictModel):
     Result: ClassVar[type[BaseStepResult]] = BaseStepResult
     Results: ClassVar[dict[str, type[BaseStepResult]]] = {}
@@ -210,6 +224,54 @@ class StepTerminalWaitResult(StrictModel):
     runner_state: StepRunnerState
     observed_at: str = Field(default_factory=utc_now_iso)
     warning: str | None = None
+
+
+AgentStepRecoveryAction = Literal[
+    "restart",
+    "resume_suspended",
+    "finalize_submission",
+    "settle_runner_lost",
+]
+AgentRecoveryMode = Literal["auto", "reuse", "fresh", "fork_current"]
+
+
+class AgentStepRecoveryView(StrictModel):
+    step_id: str
+    flow_id: str
+    step_status: StepStatus
+    runner_state: StepRunnerState
+    available_actions: list[AgentStepRecoveryAction] = Field(default_factory=list)
+    recovery_token: str
+
+
+class BoundAgentReplacementReceipt(StrictModel):
+    flow_id: str
+    role: str
+    previous_agent_id: str
+    replacement_agent_id: str
+    replacement_mode: Literal["fresh", "fork_current"]
+    step_id: str | None = None
+
+
+class AgentStepRecoveryReceipt(StrictModel):
+    source_step_id: str
+    replacement_step_id: str | None = None
+    flow_id: str
+    scope_id: str
+    action: AgentStepRecoveryAction
+    previous_status: str
+    previous_agent_id: str | None = None
+    replacement_agent_id: str | None = None
+    agent_mode: AgentRecoveryMode
+    agent_reused: bool
+    submission_disposition: str
+    flow_status_before: str
+    flow_current_step_id_before: str | None = None
+    flow_updated_at_before: str
+    flow_status_after: str
+    flow_current_step_id_after: str | None = None
+    flow_updated_at_after: str
+    enqueued: bool
 
 
 class BaseFlow(StrictModel):

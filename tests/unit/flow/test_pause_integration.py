@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import Event, Thread
 from typing import ClassVar
 
 import pytest
@@ -138,3 +139,64 @@ def test_step_service_bypass_pause_starts_one_step_without_resuming_runtime(tmp_
 
     assert pause.is_paused()
     assert step_service.wait_step(step_id).status is StepStatus.COMPLETED
+
+
+def test_pause_waits_for_step_start_validation_and_registration_boundary(tmp_path: Path) -> None:
+    flow_service, step_service, _, pause = make_services(tmp_path / ".agent_runtime")
+    flow_id = flow_service.start_flow(FlowRequest(flow_type="pause_flow", scope_id="scope", params={}), enqueue=False)
+    step_id = flow_service.advance_flow(flow_id)
+    assert step_id is not None
+    entered = Event()
+    release = Event()
+    original = step_service.can_run_step
+
+    def blocked_can_run(candidate: str) -> bool:
+        entered.set()
+        assert release.wait(2)
+        return original(candidate)
+
+    step_service.can_run_step = blocked_can_run
+    starter = Thread(target=lambda: step_service.start_step(step_id))
+    starter.start()
+    assert entered.wait(2)
+    pauser = Thread(target=lambda: pause.pause("scope"))
+    pauser.start()
+    pauser.join(0.05)
+    assert pauser.is_alive()
+    release.set()
+    starter.join(2)
+    pauser.join(2)
+    assert not starter.is_alive() and not pauser.is_alive()
+    assert pause.is_paused("scope")
+    assert step_service.wait_step(step_id).status is StepStatus.COMPLETED
+
+
+def test_pause_waits_for_flow_advance_mutation_boundary(tmp_path: Path) -> None:
+    flow_service, _, _, pause = make_services(tmp_path / ".agent_runtime")
+    flow_id = flow_service.start_flow(FlowRequest(flow_type="pause_flow", scope_id="scope", params={}), enqueue=False)
+    entered = Event()
+    release = Event()
+    original = PauseFlow.create_next_step
+
+    def blocked_create(self, ctx):  # noqa: ANN001
+        entered.set()
+        assert release.wait(2)
+        return original(self, ctx)
+
+    PauseFlow.create_next_step = blocked_create
+    try:
+        advancer = Thread(target=lambda: flow_service.advance_flow(flow_id))
+        advancer.start()
+        assert entered.wait(2)
+        pauser = Thread(target=lambda: pause.pause("scope"))
+        pauser.start()
+        pauser.join(0.05)
+        assert pauser.is_alive()
+        release.set()
+        advancer.join(2)
+        pauser.join(2)
+        assert not advancer.is_alive() and not pauser.is_alive()
+    finally:
+        PauseFlow.create_next_step = original
+    assert pause.is_paused("scope")
+    assert flow_service.get_flow(flow_id).current_step_id is not None

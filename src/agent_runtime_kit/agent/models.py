@@ -78,6 +78,38 @@ class MissingProviderEnvError(AgentRuntimeKitError):
         self.name = name
 
 
+class AgentProviderFailure(AgentRuntimeKitError):
+    """Typed provider boundary failure safe to persist on a suspended Step."""
+
+    def __init__(
+        self,
+        *,
+        provider_type: str,
+        provider_error_type: str,
+        code: str | None = None,
+        retryable: bool | None = None,
+        run_id: str | None = None,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
+        super().__init__(f"{provider_type} provider failure: {provider_error_type}")
+        self.provider_type = provider_type
+        self.provider_error_type = provider_error_type
+        self.code = code
+        self.retryable = retryable
+        self.run_id = run_id
+        self.session_id = session_id
+        self.turn_id = turn_id
+
+
+class AgentProviderTurnFailed(AgentProviderFailure):
+    """A provider returned a standardized failed terminal turn."""
+
+
+class AgentProviderUnavailable(AgentProviderFailure):
+    """A known provider startup/configuration boundary is unavailable."""
+
+
 @dataclass(frozen=True)
 class CompletionDecision:
     complete: bool

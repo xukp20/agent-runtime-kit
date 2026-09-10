@@ -50,6 +50,26 @@ class RuntimePauseController:
             raise RuntimePausedError(f"runtime is paused for scope: {scope_id}")
 
     @contextmanager
+    def hold_paused(self, scope_id: str) -> Iterator[None]:
+        """Hold the pause lock while validating an operator-only mutation."""
+
+        with self._lock:
+            if not self.global_paused and scope_id not in self.paused_scopes:
+                raise RuntimePausedError(f"runtime is not paused for scope: {scope_id}")
+            yield
+
+    @contextmanager
+    def hold_unpaused(self, *scope_ids: str) -> Iterator[None]:
+        """Hold the pause lock while committing a new run or ordinary fork."""
+
+        with self._lock:
+            if self._bypass_depth() <= 0:
+                for scope_id in scope_ids:
+                    if self.global_paused or scope_id in self.paused_scopes:
+                        raise RuntimePausedError(f"runtime is paused for scope: {scope_id}")
+            yield
+
+    @contextmanager
     def bypass_current_thread(self) -> Iterator[None]:
         depth = self._bypass_depth()
         self._thread_local.pause_bypass_depth = depth + 1

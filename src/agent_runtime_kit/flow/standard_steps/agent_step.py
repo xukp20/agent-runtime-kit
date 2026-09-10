@@ -5,9 +5,15 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, Field
 
 from agent_runtime_kit.agent.context import AgentContextMaintenancePolicy
+from agent_runtime_kit.agent.models import (
+    AgentProviderFailure,
+    AgentProviderTurnFailed,
+    AgentProviderUnavailable,
+)
 from agent_runtime_kit.flow.contexts import StepRunContext
 from agent_runtime_kit.flow.models import (
     BaseStep,
+    BaseStepError,
     BaseStepResult,
     BaseStepState,
     BaseSubmission,
@@ -15,6 +21,7 @@ from agent_runtime_kit.flow.models import (
     FlowStatus,
     FlowStepValidationError,
     StepTerminalReceipt,
+    StepSuspensionReceipt,
 )
 from agent_runtime_kit.flow.rendering import RenderContext
 
@@ -73,15 +80,6 @@ class AgentStepIncompleteResult(AgentStepResult):
     outcome: Literal["incomplete"] = "incomplete"
 
 
-class AgentStepRestartReceipt(BaseModel):
-    failed_step_id: str
-    replacement_step_id: str
-    flow_id: str
-    agent_id: str
-    agent_reused: bool
-    enqueued: bool
-
-
 class AgentStep(BaseStep):
     step_type: ClassVar[str] = "agent_step"
     State: ClassVar[type[BaseStepState]] = AgentStepState
@@ -92,6 +90,7 @@ class AgentStep(BaseStep):
         "agent_step_incomplete": AgentStepIncompleteResult,
     }
     Submission: ClassVar[type[BaseSubmission] | None] = BaseSubmission
+    offline_submission_finalize_supported: ClassVar[bool] = False
     Submissions: ClassVar[dict[str, type[BaseSubmission]]] = {
         "child_flow_dispatch": ChildFlowDispatchSubmission,
     }
@@ -315,7 +314,7 @@ class AgentStep(BaseStep):
             reason=reason,
         )
 
-    def run(self, ctx: StepRunContext) -> StepTerminalReceipt:
+    def run(self, ctx: StepRunContext) -> StepTerminalReceipt | StepSuspensionReceipt:
         agent_id = self.prepare_agent(ctx)
         prompt = self.build_start_prompt(ctx, agent_id)
         latest = self._latest_agent_step(ctx)
@@ -339,11 +338,35 @@ class AgentStep(BaseStep):
             }
             if auto_continue_count == 0 and context_maintenance_policy is not None:
                 start_kwargs["context_maintenance_policy"] = context_maintenance_policy
-            agent_service.start_agent(agent_id, **start_kwargs)
-            if state.agent_wait_timeout_s is None:
-                turn_result = agent_service.wait_agent(agent_id)
-            else:
-                turn_result = agent_service.wait_agent(agent_id, timeout_s=state.agent_wait_timeout_s)
+            try:
+                agent_service.start_agent(agent_id, **start_kwargs)
+                if state.agent_wait_timeout_s is None:
+                    turn_result = agent_service.wait_agent(agent_id)
+                else:
+                    turn_result = agent_service.wait_agent(agent_id, timeout_s=state.agent_wait_timeout_s)
+            except AgentProviderFailure as exc:
+                if isinstance(exc, AgentProviderTurnFailed):
+                    error_type = "agent_provider_turn_failed"
+                elif isinstance(exc, AgentProviderUnavailable):
+                    error_type = "agent_provider_unavailable"
+                else:
+                    error_type = "agent_provider_failure"
+                return ctx.suspend_step(
+                    BaseStepError(
+                        error_type=error_type,
+                        message="Agent provider execution suspended before business completion.",
+                        code=exc.code,
+                        details={
+                            "provider_type": exc.provider_type,
+                            "provider_error_type": exc.provider_error_type,
+                            "retryable": exc.retryable,
+                            "operator_action_required": exc.retryable is not True,
+                            "run_id": exc.run_id,
+                            "session_id": exc.session_id,
+                            "turn_id": exc.turn_id,
+                        },
+                    )
+                )
 
             latest = self._latest_agent_step(ctx)
             decision = latest.check_completion(

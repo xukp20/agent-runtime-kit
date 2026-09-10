@@ -1,3 +1,4 @@
+import pytest
 from pydantic import ValidationError
 
 from agent_runtime_kit.flow import (
@@ -11,12 +12,19 @@ from agent_runtime_kit.flow import (
     ManualPauseState,
     StepStatus,
     StepTerminalReceipt,
+    StepSuspensionReceipt,
 )
 from agent_runtime_kit.flow.standard_steps import DispatchStepResult, DispatchStepState
 
 
 def test_status_enum_values_match_design() -> None:
-    assert [item.value for item in StepStatus] == ["created", "running", "completed", "failed"]
+    assert [item.value for item in StepStatus] == [
+        "created",
+        "running",
+        "suspended",
+        "completed",
+        "failed",
+    ]
     assert [item.value for item in FlowStatus] == ["created", "running", "waiting", "completed", "failed"]
 
 
@@ -119,6 +127,27 @@ def test_step_terminal_receipt_allows_completed_and_failed_statuses() -> None:
 
     assert completed.result_type == "worker"
     assert failed.error_type == "runtime"
+
+
+def test_step_suspension_receipt_is_strict_and_status_fixed() -> None:
+    receipt = StepSuspensionReceipt(
+        step_id="step-1",
+        flow_id="flow-1",
+        scope_id="scope",
+        error_type="agent_provider_failure",
+        finished_at="2026-09-10T00:00:00Z",
+    )
+
+    assert receipt.status == "suspended"
+    with pytest.raises(ValidationError):
+        StepSuspensionReceipt(
+            step_id="step-1",
+            flow_id="flow-1",
+            scope_id="scope",
+            status="failed",
+            error_type="agent_provider_failure",
+            finished_at="2026-09-10T00:00:00Z",
+        )
 
 
 def test_step_terminal_receipt_rejects_waiting_status() -> None:

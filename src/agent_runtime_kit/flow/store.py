@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import sqlite3
 from pathlib import Path
 from threading import RLock
@@ -331,9 +332,10 @@ class FlowStepStore:
                     )
                 if flow.status in {FlowStatus.COMPLETED, FlowStatus.FAILED}:
                     raise FlowStepStoreError(f"terminal flow {flow.flow_id} still has current_step_id {current.step_id}")
-                if current.status is not StepStatus.CREATED:
+                if current.status not in {StepStatus.CREATED, StepStatus.SUSPENDED}:
                     raise FlowStepStoreError(
-                        f"flow {flow.flow_id} current step {current.step_id} is {current.status}, expected created"
+                        f"flow {flow.flow_id} current step {current.step_id} is {current.status}, "
+                        "expected created or suspended"
                     )
 
     def _query_rows(
@@ -778,27 +780,87 @@ class FlowStepMutationSession:
 
     def flush(self) -> None:
         self._assert_active()
-        for flow in self.new_flows.values():
-            self.store._ensure_scope(flow.scope_id)
-            self.store._write_flow(flow)
-            self.store._upsert_flow_scope_index(flow)
-            self.store._upsert_flow_global_index(flow)
-        for flow in self.working_flows.values():
-            flow.updated_at = utc_now_iso()
-            self.store._write_flow(flow)
-            self.store._upsert_flow_scope_index(flow)
-            self.store._upsert_flow_global_index(flow)
+        working_preimages = {
+            self.store._flow_json_path(flow): read_json(self.store._flow_json_path(flow))
+            for flow in self.working_flows.values()
+        }
+        working_preimages.update(
+            {
+                self.store._step_json_path(step): read_json(self.store._step_json_path(step))
+                for step in self.working_steps.values()
+            }
+        )
+        affected_scopes = {
+            item.scope_id
+            for collection in (
+                self.new_flows.values(),
+                self.working_flows.values(),
+                self.new_steps.values(),
+                self.working_steps.values(),
+            )
+            for item in collection
+        }
+        existing_scope_roots = {
+            scope_id: (self.store.scopes_root / encode_scope_id(scope_id)).exists()
+            for scope_id in affected_scopes
+        }
+        try:
+            for flow in self.new_flows.values():
+                self.store._ensure_scope(flow.scope_id)
+                self.store._write_flow(flow)
+                self.store._upsert_flow_scope_index(flow)
+                self.store._upsert_flow_global_index(flow)
+            for flow in self.working_flows.values():
+                flow.updated_at = utc_now_iso()
+                self.store._write_flow(flow)
+                self.store._upsert_flow_scope_index(flow)
+                self.store._upsert_flow_global_index(flow)
+            for step in self.new_steps.values():
+                flow = self._flow_for_step(step)
+                self.store._write_step(step)
+                self.store._upsert_step_scope_index(step, flow)
+                self.store._upsert_step_global_index(step, flow)
+            for step in self.working_steps.values():
+                step.updated_at = utc_now_iso()
+                flow = self._flow_for_step(step)
+                self.store._write_step(step)
+                self.store._upsert_step_scope_index(step, flow)
+                self.store._upsert_step_global_index(step, flow)
+        except BaseException:
+            self._rollback_flush(
+                working_preimages=working_preimages,
+                affected_scopes=affected_scopes,
+                existing_scope_roots=existing_scope_roots,
+            )
+            raise
+
+    def _rollback_flush(
+        self,
+        *,
+        working_preimages: dict[Path, dict[str, Any]],
+        affected_scopes: set[str],
+        existing_scope_roots: dict[str, bool],
+    ) -> None:
         for step in self.new_steps.values():
-            flow = self._flow_for_step(step)
-            self.store._write_step(step)
-            self.store._upsert_step_scope_index(step, flow)
-            self.store._upsert_step_global_index(step, flow)
-        for step in self.working_steps.values():
-            step.updated_at = utc_now_iso()
-            flow = self._flow_for_step(step)
-            self.store._write_step(step)
-            self.store._upsert_step_scope_index(step, flow)
-            self.store._upsert_step_global_index(step, flow)
+            step_dir = self.store._step_json_path(step).parent
+            if step_dir.exists():
+                shutil.rmtree(step_dir)
+            steps_dir = step_dir.parent
+            if steps_dir.exists() and not any(steps_dir.iterdir()):
+                steps_dir.rmdir()
+        for flow in self.new_flows.values():
+            flow_dir = self.store._flow_json_path(flow).parent
+            if flow_dir.exists():
+                shutil.rmtree(flow_dir)
+        for path, payload in working_preimages.items():
+            write_json_atomic(path, payload)
+        for scope_id in affected_scopes:
+            scope_root = self.store.scopes_root / encode_scope_id(scope_id)
+            if existing_scope_roots[scope_id]:
+                self.store.rebuild_scope_index(scope_id)
+            elif scope_root.exists():
+                shutil.rmtree(scope_root)
+        self.store.rebuild_global_index()
 
     def _flow_for_step(self, step: BaseStep) -> BaseFlow:
         flow = self.new_flows.get(step.flow_id) or self.working_flows.get(step.flow_id)

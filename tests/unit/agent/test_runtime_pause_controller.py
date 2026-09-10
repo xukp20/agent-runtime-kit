@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -109,3 +110,45 @@ def test_agent_service_start_paused_sets_shared_global_pause(tmp_path: Path) -> 
     assert isinstance(service.pause_controller, RuntimePauseController)
     assert ark.pause_controller is service.pause_controller
     assert service.is_paused(None) is True
+
+
+def test_recovery_agent_boundary_serializes_close_and_paused_start_fork(tmp_path: Path) -> None:
+    registry = AgentTypeRegistry()
+    registry.register(PauseAgentType())
+    controller = RuntimePauseController()
+    service = AgentService(
+        tmp_path / ".agent_runtime",
+        agent_types=registry,
+        ark_services=ARKServices(pause_controller=controller),
+    )
+    service.home_service.create_home(ProviderHomeSpec(provider_type="codex", home_id="pause_worker"))
+    agent = service.create_agent("scope-a", "pause_worker")
+    controller.pause("scope-a")
+    outcomes: list[str] = []
+
+    def record(name, operation):  # noqa: ANN001
+        try:
+            operation()
+        except Exception as exc:  # noqa: BLE001
+            outcomes.append(f"{name}:{type(exc).__name__}")
+        else:
+            outcomes.append(f"{name}:ok")
+
+    with controller.hold_paused("scope-a"), service.hold_agent_boundary():
+        threads = [
+            Thread(target=record, args=("close", lambda: service.close_agent(agent.agent_id))),
+            Thread(target=record, args=("start", lambda: service.start_agent(agent.agent_id))),
+            Thread(target=record, args=("fork", lambda: service.fork_agent(agent.agent_id))),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(0.05)
+            assert thread.is_alive()
+
+    for thread in threads:
+        thread.join(2)
+        assert not thread.is_alive()
+    assert "close:ok" in outcomes
+    assert "start:AgentPausedError" in outcomes
+    assert "fork:AgentPausedError" in outcomes

@@ -69,6 +69,16 @@ class SchedulerStep(BaseStep):
         return ctx.complete_step(BaseStepResult(result_type="scheduler_step_done", summary="done"))
 
 
+class SuspendingSchedulerStep(BaseStep):
+    step_type: ClassVar[str] = "suspending_scheduler_step"
+    State: ClassVar[type[BaseStepState]] = SchedulerStepState
+
+    def run(self, ctx: StepRunContext):  # noqa: ANN201
+        return ctx.suspend_step(
+            BaseStepError(error_type="agent_provider_failure", message="provider unavailable")
+        )
+
+
 class SchedulerFlow(BaseFlow):
     flow_type: ClassVar[str] = "scheduler_flow"
     Params: ClassVar[type[BaseModel]] = SchedulerFlowParams
@@ -139,6 +149,7 @@ def make_services(
     step_registry = StepTypeRegistry()
     flow_registry.register(SchedulerFlow)
     step_registry.register(SchedulerStep)
+    step_registry.register(SuspendingSchedulerStep)
     ark = ARKServices(pause_controller=pause)
     flow_service = FlowService(
         runtime_root,
@@ -272,6 +283,41 @@ def test_schedule_step_once_runs_step_and_requeues_parent_flow(tmp_path: Path) -
     assert isinstance(flow.state, SchedulerFlowState)
     assert flow.state.terminal_seen_count == 1
     assert flow_id in scheduler.queued_flow_ids
+
+
+def test_semantic_lease_settles_after_suspended_step_without_advancing_flow(tmp_path: Path) -> None:
+    pause = FakePauseController()
+    flow_service, step_service, scheduler = make_services(
+        tmp_path / ".agent_runtime",
+        pause=pause,
+    )
+    flow_id = start_scheduler_flow(flow_service, status="running")
+    step = SuspendingSchedulerStep(step_id="suspend", flow_id=flow_id, scope_id="scope")
+    step_service.create_step(step, enqueue=False)
+    flow_service.store.update_flow_record(
+        flow_id,
+        lambda flow: (flow.step_ids.append(step.step_id), setattr(flow, "current_step_id", step.step_id)),
+    )
+    scheduler.enqueue_step(step.step_id)
+    control = scheduler.configure_semantic_run(
+        SchedulerSemanticRunPolicy(
+            name="stop-at-suspension",
+            allow_flow_advance=lambda _flow: True,
+            allow_step_start=lambda _step: True,
+            decide=lambda _service: SchedulerRunDecision(action="pause", reason="suspended"),
+        )
+    )
+
+    scheduler.schedule_ready()
+    step_service.wait_step(step.step_id, timeout_s=2)
+    scheduler.schedule_ready()
+
+    persisted = flow_service.get_flow(flow_id)
+    assert step_service.wait_step_terminal(step.step_id, timeout_s=0).runner_state == "settled"
+    assert persisted.status is FlowStatus.RUNNING
+    assert persisted.current_step_id == step.step_id
+    assert persisted.state.terminal_seen_count == 0
+    assert scheduler.get_run_lease(control.lease_id).status == "terminal"
 
 
 def test_pause_gate_keeps_flow_and_step_candidates(tmp_path: Path) -> None:

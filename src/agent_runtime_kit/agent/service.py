@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Callable
 import json
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
@@ -39,8 +40,11 @@ from .models import (
     AgentHasNoCompletedTurn,
     AgentIncompleteError,
     AgentPausedError,
+    AgentProviderTurnFailed,
+    AgentProviderUnavailable,
     AgentStatusWaitResult,
     CompletionDecision,
+    MissingProviderEnvError,
     WaitAgentsResult,
 )
 from .provider_contracts import (
@@ -227,6 +231,7 @@ class AgentService:
         self._status_condition = threading.Condition(self._lock)
         self._active: dict[str, _ActiveAgentRun] = {}
         self._latest_results: dict[str, AgentTurnResult] = {}
+        self._latest_errors: dict[str, BaseException] = {}
         self.trace_report_errors: list[dict[str, str]] = []
 
     def create_agent(
@@ -303,6 +308,13 @@ class AgentService:
             self._status_condition.notify_all()
             return closed
 
+    @contextmanager
+    def hold_agent_boundary(self):
+        """Hold Agent identity stable beneath an already-held pause boundary."""
+
+        with self._status_condition:
+            yield
+
     def start_agent(
         self,
         agent_id: str,
@@ -317,53 +329,63 @@ class AgentService:
         context_maintenance_policy: AgentContextMaintenancePolicy | None = None,
     ) -> Agent:
         variables = dict(variables or {})
-        with self._status_condition:
-            agent = self.store.get_agent(agent_id)
-            if agent.status == "closed":
-                raise AgentClosedError(agent_id)
-            if agent.status == "running" or agent_id in self._active:
-                raise AgentAlreadyRunningError(agent_id)
-            self._assert_context_maintenance_resolved(agent_id)
-            self._assert_agent_can_start(agent.scope_id)
-            agent_type = self.agent_types.get(agent.agent_type)
-            developer_instructions = _render_developer_instructions(
-                agent_type,
-                variables,
-                developer_instructions_template_override,
-            )
-            overwrite_developer_instructions = developer_instructions_template_override is not None
-            current_prompt = (
-                prompt
-                if prompt is not None
-                else _render_start_prompt(agent_type, variables, start_prompt_template_override)
-            )
-            self.store.patch_agent(agent_id, status="running")
-            done_event = threading.Event()
-            active = _ActiveAgentRun(
-                agent_id=agent_id,
-                worker=threading.Thread(target=lambda: None),
-                done_event=done_event,
-            )
-            worker = threading.Thread(
-                target=self._run_agent_worker,
-                kwargs={
-                    "active": active,
-                    "variables": variables,
-                    "current_prompt": current_prompt,
-                    "developer_instructions": developer_instructions,
-                    "overwrite_developer_instructions": overwrite_developer_instructions,
-                    "continue_prompt_template_override": continue_prompt_template_override,
-                    "env": env,
-                    "workdir": workdir,
-                    "context_maintenance_policy": context_maintenance_policy,
-                },
-                daemon=True,
-            )
-            active.worker = worker
-            self._active[agent_id] = active
-            self._status_condition.notify_all()
-            worker.start()
-            return self.store.get_agent(agent_id)
+        agent = self.store.get_agent(agent_id)
+        try:
+            pause_guard = self.pause_controller.hold_unpaused(agent.scope_id)
+            pause_guard.__enter__()
+        except RuntimePausedError as exc:
+            raise AgentPausedError(f"agent runs are paused for scope: {agent.scope_id}") from exc
+        try:
+            with self._status_condition:
+                agent = self.store.get_agent(agent_id)
+                if agent.status == "closed":
+                    raise AgentClosedError(agent_id)
+                if agent.status == "running" or agent_id in self._active:
+                    raise AgentAlreadyRunningError(agent_id)
+                self._assert_context_maintenance_resolved(agent_id)
+                self._latest_results.pop(agent_id, None)
+                self._latest_errors.pop(agent_id, None)
+                agent_type = self.agent_types.get(agent.agent_type)
+                developer_instructions = _render_developer_instructions(
+                    agent_type,
+                    variables,
+                    developer_instructions_template_override,
+                )
+                overwrite_developer_instructions = developer_instructions_template_override is not None
+                current_prompt = (
+                    prompt
+                    if prompt is not None
+                    else _render_start_prompt(agent_type, variables, start_prompt_template_override)
+                )
+                self.store.patch_agent(agent_id, status="running")
+                done_event = threading.Event()
+                active = _ActiveAgentRun(
+                    agent_id=agent_id,
+                    worker=threading.Thread(target=lambda: None),
+                    done_event=done_event,
+                )
+                worker = threading.Thread(
+                    target=self._run_agent_worker,
+                    kwargs={
+                        "active": active,
+                        "variables": variables,
+                        "current_prompt": current_prompt,
+                        "developer_instructions": developer_instructions,
+                        "overwrite_developer_instructions": overwrite_developer_instructions,
+                        "continue_prompt_template_override": continue_prompt_template_override,
+                        "env": env,
+                        "workdir": workdir,
+                        "context_maintenance_policy": context_maintenance_policy,
+                    },
+                    daemon=True,
+                )
+                active.worker = worker
+                self._active[agent_id] = active
+                self._status_condition.notify_all()
+                worker.start()
+                return self.store.get_agent(agent_id)
+        finally:
+            pause_guard.__exit__(None, None, None)
 
     def _run_agent_worker(
         self,
@@ -411,6 +433,9 @@ class AgentService:
                     latest_turn_locator=turn_result.turn_locator,
                     artifact_locator=turn_result.provider_result.artifact_locator,
                 )
+                provider_failure = _provider_failure_from_turn(turn_result)
+                if provider_failure is not None:
+                    raise provider_failure
                 agent = self.store.get_agent(agent_id)
                 ctx = AgentCompletionContext(
                     ark=self.ark_services,
@@ -478,6 +503,11 @@ class AgentService:
                 finally:
                     active.handle_ready.set()
                     self._active.pop(agent_id, None)
+                    if active.error is None:
+                        self._latest_errors.pop(agent_id, None)
+                    else:
+                        self._latest_results.pop(agent_id, None)
+                        self._latest_errors[agent_id] = active.error
                     active.done_event.set()
                     self._status_condition.notify_all()
 
@@ -492,13 +522,21 @@ class AgentService:
         env: dict[str, str] | None,
         workdir: str | None,
     ) -> AgentTurnResult:
-        bundle = self._provider_bundle(agent.provider_type)
-        self.ensure_provider_home_initialized(
-            agent.provider_type,
-            agent.home_id,
-            env=env,
-            workdir=workdir,
-        )
+        try:
+            bundle = self._provider_bundle(agent.provider_type)
+            self.ensure_provider_home_initialized(
+                agent.provider_type,
+                agent.home_id,
+                env=env,
+                workdir=workdir,
+            )
+        except (MissingProviderEnvError, ProviderCapabilityUnavailable) as exc:
+            raise AgentProviderUnavailable(
+                provider_type=agent.provider_type,
+                provider_error_type=type(exc).__name__,
+                code=None,
+                retryable=False,
+            ) from exc
         execution_context = self.home_service.build_execution_context(
             agent.provider_type,
             agent.home_id,
@@ -532,7 +570,19 @@ class AgentService:
             execution_context=execution_context,
         )
         active.handle_ready.clear()
-        handle = bundle.runtime.resume(request) if session_locator is not None else bundle.runtime.start(request)
+        try:
+            handle = (
+                bundle.runtime.resume(request)
+                if session_locator is not None
+                else bundle.runtime.start(request)
+            )
+        except (MissingProviderEnvError, ProviderCapabilityUnavailable) as exc:
+            raise AgentProviderUnavailable(
+                provider_type=agent.provider_type,
+                provider_error_type=type(exc).__name__,
+                code=None,
+                retryable=False,
+            ) from exc
         active.provider_handle = handle
         active.handle_ready.set()
         locator = handle.session_locator()
@@ -590,7 +640,10 @@ class AgentService:
         )
 
     def wait_agent(self, agent_id: str, timeout_s: float | None = None) -> AgentTurnResult:
-        active = self._active.get(agent_id)
+        with self._status_condition:
+            active = self._active.get(agent_id)
+            cached_error = self._latest_errors.get(agent_id) if active is None else None
+            cached_result = self._latest_results.get(agent_id) if active is None else None
         if active is not None:
             if not active.done_event.wait(timeout_s):
                 raise TimeoutError(agent_id)
@@ -598,20 +651,25 @@ class AgentService:
                 raise active.error
             if active.latest_result is not None:
                 return active.latest_result
+        if cached_error is not None:
+            raise cached_error
         agent = self.store.get_agent(agent_id)
         if agent.last_completion is not None:
             if agent.last_completion.status == "incomplete":
                 raise AgentIncompleteError(agent_id, agent.last_completion)
             if agent.last_completion.status == "checker_failed":
                 raise AgentCompletionCheckError(agent.last_completion.error_message or agent_id)
-        result = self._latest_results.get(agent_id)
+        result = cached_result
         if result is not None:
+            provider_failure = _provider_failure_from_turn(result)
+            if provider_failure is not None:
+                raise provider_failure
             return result
         view = self.query_turn(agent_id, latest=True)
         provider_result = getattr(view, "result", None)
         if provider_result is None:
             raise AgentHasNoCompletedTurn(agent_id)
-        return AgentTurnResult(
+        result = AgentTurnResult(
             agent_id=agent.agent_id,
             scope_id=agent.scope_id,
             agent_type=agent.agent_type,
@@ -619,6 +677,10 @@ class AgentService:
             provider_result=provider_result,
             completion=agent.last_completion,
         )
+        provider_failure = _provider_failure_from_turn(result)
+        if provider_failure is not None:
+            raise provider_failure
+        return result
 
     def wait_agent_status_change(
         self,
@@ -1247,12 +1309,10 @@ class AgentService:
         return False
 
     def pause_runs(self, scope_id: str | None = None) -> None:
-        with self._lock:
-            self.pause_controller.pause(scope_id)
+        self.pause_controller.pause(scope_id)
 
     def resume_runs(self, scope_id: str | None = None) -> None:
-        with self._lock:
-            self.pause_controller.resume(scope_id)
+        self.pause_controller.resume(scope_id)
 
     def is_paused(self, scope_id: str | None = None) -> bool:
         return self.pause_controller.is_paused(scope_id)
@@ -1290,15 +1350,38 @@ class AgentService:
         )
 
     def fork_agent(self, source_agent_id: str, *, target_scope_id: str | None = None) -> Agent:
-        with self._lock:
-            source = self.store.get_agent(source_agent_id)
-            if source.status != "idle":
-                raise AgentAlreadyRunningError(source_agent_id)
-            if source.session_locator is None:
-                raise AgentHasNoCompletedTurn(source_agent_id)
-            target_scope = target_scope_id or source.scope_id
-            self._assert_agent_can_start(source.scope_id)
-            self._assert_agent_can_start(target_scope)
+        source = self.store.get_agent(source_agent_id)
+        target_scope = target_scope_id or source.scope_id
+        try:
+            pause_guard = self.pause_controller.hold_unpaused(source.scope_id, target_scope)
+            pause_guard.__enter__()
+        except RuntimePausedError as exc:
+            raise AgentPausedError(f"agent runs are paused for scope: {source.scope_id}") from exc
+        try:
+            with self._lock:
+                return self._fork_agent_locked(source_agent_id, target_scope)
+        finally:
+            pause_guard.__exit__(None, None, None)
+
+    def fork_agent_for_recovery(
+        self,
+        source_agent_id: str,
+        *,
+        target_scope_id: str | None = None,
+    ) -> Agent:
+        source = self.store.get_agent(source_agent_id)
+        target_scope = target_scope_id or source.scope_id
+        with self.pause_controller.hold_paused(source.scope_id), self._lock:
+            if target_scope != source.scope_id:
+                raise ValueError("recovery fork must remain in the source scope")
+            return self._fork_agent_locked(source_agent_id, target_scope)
+
+    def _fork_agent_locked(self, source_agent_id: str, target_scope: str) -> Agent:
+        source = self.store.get_agent(source_agent_id)
+        if source.status != "idle":
+            raise AgentAlreadyRunningError(source_agent_id)
+        if source.session_locator is None:
+            raise AgentHasNoCompletedTurn(source_agent_id)
         bundle = self._provider_bundle(source.provider_type)
         target_agent_id = f"a_{uuid.uuid4().hex}"
         source_session = source.session_locator
@@ -1384,8 +1467,12 @@ class AgentService:
         *,
         turn_id: str | None = None,
         latest: bool = False,
+        prepare_session_access: bool = True,
     ) -> object | None:
-        bundle, session = self._query_bundle_and_session(agent_id)
+        bundle, session = self._query_bundle_and_session(
+            agent_id,
+            prepare_session_access=prepare_session_access,
+        )
         turn = ProviderTurnLocator(session=session, turn_id=turn_id) if turn_id is not None else None
         return bundle.query.read_turn(
             ProviderTurnQuery(session=session, turn=turn, latest=latest)
@@ -1637,6 +1724,23 @@ def _turn_id(turn_result: AgentTurnResult) -> str:
     if turn_result.turn_locator is not None:
         return turn_result.turn_locator.turn_id
     return f"turn_{uuid.uuid4().hex}"
+
+
+def _provider_failure_from_turn(turn_result: AgentTurnResult) -> AgentProviderTurnFailed | None:
+    if turn_result.status.value != "failed":
+        return None
+    error = turn_result.provider_result.error
+    if error is None:
+        raise RuntimeError("failed provider turn has no standardized error")
+    return AgentProviderTurnFailed(
+        provider_type=turn_result.provider_type,
+        provider_error_type=error.error_type,
+        code=error.code,
+        retryable=error.retryable,
+        run_id=turn_result.run_id,
+        session_id=turn_result.session_locator.session_id,
+        turn_id=(turn_result.turn_locator.turn_id if turn_result.turn_locator is not None else None),
+    )
 
 
 def _render_developer_instructions(
