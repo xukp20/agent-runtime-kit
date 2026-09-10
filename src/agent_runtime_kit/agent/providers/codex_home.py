@@ -85,7 +85,9 @@ class CodexHomeRenderer:
             config_path.write_text(config_text, encoding="utf-8")
 
         if options.auth_json_path is not None:
-            shutil.copyfile(options.auth_json_path, codex_root / "auth.json")
+            auth_path = codex_root / "auth.json"
+            shutil.copyfile(options.auth_json_path, auth_path)
+            auth_path.chmod(0o600)
         _materialize_skills(options, skills_root)
 
         generated_files = _describe_generated_files(resolved_home_root)

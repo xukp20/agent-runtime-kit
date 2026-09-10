@@ -36,6 +36,40 @@ def test_provider_home_spec_materializes_schema_v3_codex_home(tmp_path: Path) ->
     assert service.get_home("codex", "worker").required_env == {"TOKEN"}
 
 
+def test_codex_home_materializes_auth_as_owner_only_secret_and_repairs_mode(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / ".agent_runtime"
+    auth_source = tmp_path / "auth.json"
+    auth_source.write_text("{}\n", encoding="utf-8")
+    auth_source.chmod(0o600)
+    service = HomeService(runtime_root)
+    spec = ProviderHomeSpec(
+        provider_type="codex",
+        home_id="worker",
+        provider_options=CodexHomeOptions(auth_json_path=auth_source),
+    )
+
+    service.create_home(spec)
+
+    auth_target = service.resolve_home_root("codex", "worker") / ".codex" / "auth.json"
+    assert auth_target.stat().st_mode & 0o777 == 0o600
+    context = service.build_execution_context("codex", "worker")
+    assert context.materialization_manifest is not None
+    auth_entry = next(
+        item
+        for item in context.materialization_manifest.generated_files
+        if item.relpath == ".codex/auth.json"
+    )
+    assert auth_entry.secret is True
+
+    auth_target.chmod(0o644)
+    auth_source.chmod(0o644)
+    service.create_home(spec)
+
+    assert auth_target.stat().st_mode & 0o777 == 0o600
+
+
 def test_codex_home_preapproves_application_declared_mcp_tools(tmp_path: Path) -> None:
     service = HomeService(tmp_path / ".agent_runtime")
     service.create_home(
