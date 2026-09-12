@@ -116,5 +116,15 @@ class AgentContextMaintenanceJournal:
         }
 
 
+@dataclass(frozen=True)
+class AgentContextMaintenanceView:
+    agent_id: str
+    provider_type: str
+    session_id: str | None
+    status: AgentContextMaintenanceJournalStatus
+    unresolved: bool
+    reconciliation_token: str
+
+
 def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)

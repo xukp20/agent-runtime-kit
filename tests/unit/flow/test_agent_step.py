@@ -14,6 +14,7 @@ from agent_runtime_kit.flow import (
     FlowBuildContext,
     FlowRequest,
     FlowService,
+    FlowStatus,
     FlowTypeRegistry,
     FlowStepValidationError,
     StepRunContext,
@@ -505,12 +506,16 @@ def test_run_passes_agent_wait_timeout_to_agent_service(tmp_path: Path) -> None:
     assert agent_service.wait_calls == [{"agent_id": "agent-1", "timeout_s": 1.25}]
 
 
-def test_run_timeout_marks_step_failed(tmp_path: Path) -> None:
+def test_run_timeout_suspends_step_without_advancing_flow(tmp_path: Path) -> None:
     flow_service, step_service, _agent_service = make_services(
         tmp_path / ".agent_runtime",
         timeout_on_wait=True,
     )
     flow_id = create_flow(flow_service)
+    flow_service.store.update_flow_record(
+        flow_id,
+        lambda flow: setattr(flow, "status", FlowStatus.RUNNING),
+    )
     step = AgentStep(
         step_id="agent-step",
         flow_id=flow_id,
@@ -527,7 +532,10 @@ def test_run_timeout_marks_step_failed(tmp_path: Path) -> None:
     step_service.run_step(step_id)
 
     latest = step_service.wait_step(step_id)
-    assert latest.status is StepStatus.FAILED
+    assert latest.status is StepStatus.SUSPENDED
     assert latest.error is not None
-    assert latest.error.error_type == "step_run_exception"
+    assert latest.error.error_type == "agent_step_unexpected_exception"
     assert latest.error.details["exception_type"] == "TimeoutError"
+    flow = flow_service.get_flow(flow_id)
+    assert flow.status is FlowStatus.RUNNING
+    assert flow.current_step_id == step_id

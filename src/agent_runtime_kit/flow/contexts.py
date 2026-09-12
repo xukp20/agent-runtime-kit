@@ -185,7 +185,12 @@ class StepRunContext(RuntimeContext):
             finished_at=updated.finished_at or finished_at,
         )
 
-    def suspend_step(self, error: BaseStepError) -> StepSuspensionReceipt:
+    def suspend_step(
+        self,
+        error: BaseStepError,
+        *,
+        require_no_submission: bool = False,
+    ) -> StepSuspensionReceipt:
         suspended_at = utc_now_iso()
 
         def write_error(step: BaseStep) -> None:
@@ -194,6 +199,8 @@ class StepRunContext(RuntimeContext):
                 raise FlowStepValidationError(f"step {step.step_id} is not running")
             if step.result is not None or step.error is not None:
                 raise FlowStepValidationError(f"step {step.step_id} already has outcome evidence")
+            if require_no_submission and step.submission is not None:
+                raise FlowStepValidationError(f"step {step.step_id} already has accepted submission")
             step.error = error
             step.status = StepStatus.SUSPENDED
             step.finished_at = suspended_at

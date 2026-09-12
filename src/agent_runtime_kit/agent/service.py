@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 import uuid
 from collections.abc import Callable
@@ -24,6 +25,7 @@ from .context import (
     AgentContextMaintenanceJournal,
     AgentContextMaintenanceJournalStatus,
     AgentContextMaintenancePolicy,
+    AgentContextMaintenanceView,
     AgentContextUsage,
 )
 from .homes import HomeRecord, HomeService
@@ -45,6 +47,7 @@ from .models import (
     AgentStatusWaitResult,
     CompletionDecision,
     MissingProviderEnvError,
+    to_jsonable,
     WaitAgentsResult,
 )
 from .provider_contracts import (
@@ -841,27 +844,61 @@ class AgentService:
         finally:
             self._finish_synchronous_maintenance(active)
 
+    def inspect_agent_context_maintenance(
+        self,
+        agent_id: str,
+    ) -> AgentContextMaintenanceView | None:
+        with self._status_condition:
+            agent = self.store.get_agent(agent_id)
+            journal = self.store.read_context_maintenance(agent_id)
+            if journal is None:
+                return None
+            return AgentContextMaintenanceView(
+                agent_id=agent.agent_id,
+                provider_type=agent.provider_type,
+                session_id=journal.session_id,
+                status=journal.status,
+                unresolved=journal.unresolved,
+                reconciliation_token=self._context_maintenance_token(agent, journal),
+            )
+
     def reconcile_agent_context_maintenance(
         self,
         agent_id: str,
         *,
+        expected_reconciliation_token: str,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
     ) -> AgentContextMaintenanceJournal | None:
-        journal = self.store.read_context_maintenance(agent_id)
-        if journal is None or not journal.unresolved:
-            return journal
-        if not journal.session_id or not journal.baseline:
-            raise AgentContextMaintenanceBlocked(
-                f"context maintenance cannot be reconciled without session baseline: {agent_id}"
-            )
+        admitted: list[tuple[Agent, AgentContextMaintenanceJournal]] = []
+
+        def validate_preimage(agent: Agent) -> None:
+            journal = self.store.read_context_maintenance(agent_id)
+            if journal is None:
+                raise AgentContextMaintenanceBlocked(
+                    f"context maintenance journal is unavailable: {agent_id}"
+                )
+            if self._context_maintenance_token(agent, journal) != expected_reconciliation_token:
+                raise AgentContextMaintenanceBlocked(
+                    f"context maintenance reconciliation token changed: {agent_id}"
+                )
+            if journal.unresolved and (not journal.session_id or not journal.baseline):
+                raise AgentContextMaintenanceBlocked(
+                    f"context maintenance cannot be reconciled without session baseline: {agent_id}"
+                )
+            admitted.append((agent, journal))
+
         active = self._begin_synchronous_maintenance(
             agent_id,
             require_resolved=False,
             respect_pause=False,
+            admission_check=validate_preimage,
         )
         try:
-            agent = self.store.get_agent(agent_id)
+            agent, journal = admitted[0]
+            if not journal.unresolved:
+                active.latest_result = journal
+                return journal
             bundle = self._provider_bundle(agent.provider_type)
             context_adapter = bundle.context
             if context_adapter is None:
@@ -888,6 +925,14 @@ class AgentService:
                 )
             if not isinstance(provider_result, ProviderContextCompactionResult):
                 raise TypeError(f"provider returned invalid reconciliation result: {agent.provider_type}")
+            if provider_result.status not in {"compacted", "completed"}:
+                raise AgentContextMaintenanceBlocked(
+                    f"provider has not confirmed context maintenance terminal state: {agent_id}"
+                )
+            if provider_result.session_id != journal.session_id:
+                raise AgentContextMaintenanceBlocked(
+                    f"provider context reconciliation session changed: {agent_id}"
+                )
             confirmed = AgentContextMaintenanceJournal(
                 agent_id=agent.agent_id,
                 provider_type=agent.provider_type,
@@ -909,12 +954,31 @@ class AgentService:
         finally:
             self._finish_synchronous_maintenance(active)
 
+    @staticmethod
+    def _context_maintenance_token(
+        agent: Agent,
+        journal: AgentContextMaintenanceJournal,
+    ) -> str:
+        payload = {
+            "journal": journal.to_dict(),
+            "agent": {
+                "agent_id": agent.agent_id,
+                "provider_type": agent.provider_type,
+                "home_id": agent.home_id,
+                "session_locator": to_jsonable(agent.session_locator),
+            },
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
     def _begin_synchronous_maintenance(
         self,
         agent_id: str,
         *,
         require_resolved: bool = True,
         respect_pause: bool = True,
+        admission_check: Callable[[Agent], None] | None = None,
     ) -> _ActiveAgentRun:
         pause_guard = None
         if respect_pause:
@@ -931,6 +995,8 @@ class AgentService:
                     raise AgentClosedError(agent_id)
                 if agent.status == "running" or agent_id in self._active:
                     raise AgentAlreadyRunningError(agent_id)
+                if admission_check is not None:
+                    admission_check(agent)
                 if require_resolved:
                     self._assert_context_maintenance_resolved(agent_id)
                 self.store.patch_agent(agent_id, status="running")

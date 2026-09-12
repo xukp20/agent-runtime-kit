@@ -377,7 +377,8 @@ class AgentStep(BaseStep):
                             "session_id": exc.session_id,
                             "turn_id": exc.turn_id,
                         },
-                    )
+                    ),
+                    require_no_submission=True,
                 )
 
             latest = self._latest_agent_step(ctx)

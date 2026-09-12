@@ -69,6 +69,9 @@ class FakeAgentService:
     def __init__(self, agents: list[Agent]) -> None:
         self.agents = {agent.agent_id: agent for agent in agents}
         self.created: list[Agent] = []
+        self.unresolved_agent_ids: set[str] = set()
+        self.confirmed_agent_ids: set[str] = set()
+        self.reconcile_calls: list[dict[str, object]] = []
         self.lock = RLock()
         self.provider_turn = None
 
@@ -142,6 +145,30 @@ class FakeAgentService:
 
     def query_turn(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN201
         return self.provider_turn
+
+    def inspect_agent_context_maintenance(self, agent_id: str):  # noqa: ANN201
+        if agent_id not in self.unresolved_agent_ids | self.confirmed_agent_ids:
+            return None
+        return SimpleNamespace(
+            unresolved=agent_id in self.unresolved_agent_ids,
+            reconciliation_token="a" * 64,
+        )
+
+    def reconcile_agent_context_maintenance(
+        self,
+        agent_id: str,
+        *,
+        expected_reconciliation_token: str,
+        env: dict[str, str],
+        workdir: str | None,
+    ) -> None:
+        if expected_reconciliation_token != "a" * 64:
+            raise ValueError("context maintenance reconciliation token changed")
+        self.reconcile_calls.append(
+            {"agent_id": agent_id, "env": env, "workdir": workdir}
+        )
+        self.unresolved_agent_ids.remove(agent_id)
+        self.confirmed_agent_ids.add(agent_id)
 
 
 def _service(tmp_path: Path, *, agent: Agent) -> tuple[FlowService, ARKServices, FakeScheduleService, FakeAgentService]:

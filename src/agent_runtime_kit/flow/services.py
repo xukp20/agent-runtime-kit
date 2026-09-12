@@ -11,6 +11,17 @@ from time import monotonic, sleep
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict
+
+from agent_runtime_kit.agent.models import (
+    AgentCompletionCheckError,
+    AgentContextCompactionTimeout,
+    AgentContextMaintenanceBlocked,
+    AgentContextMaintenanceError,
+    AgentProviderFailure,
+    AgentProviderTurnFailed,
+    AgentProviderUnavailable,
+)
+from agent_runtime_kit.agent.context import AgentContextMaintenanceView
 from agent_runtime_kit.runtime import ARKServices, AppServices, RuntimePausedError
 
 from .contexts import FlowBuildContext, FlowContext, FlowReadContext, FlowStepContext, StableStepTerminalContext, StepRunContext
@@ -319,6 +330,103 @@ class FlowService:
     def inspect_agent_step_recovery(self, step_id: str) -> AgentStepRecoveryView:
         return self._assess_agent_step_recovery(step_id).view
 
+    def inspect_agent_step_context_maintenance(
+        self,
+        step_id: str,
+    ) -> AgentContextMaintenanceView | None:
+        step = self.store.get_step(step_id)
+        if not isinstance(step, AgentStep) or not isinstance(step.state, AgentStepState):
+            raise FlowStepValidationError(f"step is not an AgentStep: {step_id}")
+        flow = self.store.get_flow(step.flow_id)
+        role = step.state.agent_role
+        agent_id = step.agent_bindings.get(role) or flow.agent_bindings.get(role)
+        if agent_id is None:
+            return None
+        agent_service = self.ark.agent_service
+        inspect_maintenance = getattr(agent_service, "inspect_agent_context_maintenance", None)
+        if not callable(inspect_maintenance):
+            return None
+        return inspect_maintenance(agent_id)
+
+    def reconcile_agent_step_context_maintenance(
+        self,
+        *,
+        step_id: str,
+        expected_reconciliation_token: str,
+    ) -> AgentContextMaintenanceView:
+        step, _, agent_id = self._agent_step_context_target(
+            step_id,
+            require_suspended_current=True,
+        )
+        pause_controller = self.ark.pause_controller
+        agent_service = self.ark.agent_service
+        if pause_controller is None or agent_service is None:
+            raise FlowStepValidationError(
+                "AgentStep context reconciliation requires PauseController and AgentService"
+            )
+        agent_guard = getattr(agent_service, "hold_agent_boundary", nullcontext)
+        with pause_controller.hold_paused(step.scope_id), agent_guard(), self.lock:
+            if not pause_controller.is_paused(None):
+                raise FlowStepValidationError(
+                    "AgentStep context reconciliation requires global runtime pause"
+                )
+            current_step, _, current_agent_id = self._agent_step_context_target(
+                step_id,
+                require_suspended_current=True,
+            )
+            if current_agent_id != agent_id:
+                raise FlowStepValidationError(
+                    "AgentStep bound Agent changed during context reconciliation"
+                )
+            self._assert_scope_quiescent(current_step.scope_id)
+            ctx = StepRunContext(
+                ark=self.ark,
+                app=self.app,
+                step_id=current_step.step_id,
+                flow_id=current_step.flow_id,
+                scope_id=current_step.scope_id,
+            )
+            reconcile = getattr(agent_service, "reconcile_agent_context_maintenance", None)
+            if not callable(reconcile):
+                raise FlowStepValidationError("AgentService context reconciliation is unavailable")
+            reconcile(
+                current_agent_id,
+                expected_reconciliation_token=expected_reconciliation_token,
+                env=current_step.build_agent_env(ctx, current_agent_id),
+                workdir=current_step.resolve_workdir(ctx, current_agent_id),
+            )
+            inspected = agent_service.inspect_agent_context_maintenance(current_agent_id)
+            if inspected is None:
+                raise FlowStepValidationError(
+                    "Agent context maintenance journal disappeared during reconciliation"
+                )
+            return inspected
+
+    def _agent_step_context_target(
+        self,
+        step_id: str,
+        *,
+        require_suspended_current: bool = False,
+    ) -> tuple[AgentStep, BaseFlow, str]:
+        step = self.store.get_step(step_id)
+        if not isinstance(step, AgentStep) or not isinstance(step.state, AgentStepState):
+            raise FlowStepValidationError(f"step is not an AgentStep: {step_id}")
+        flow = self.store.get_flow(step.flow_id)
+        if require_suspended_current and (
+            step.status is not StepStatus.SUSPENDED
+            or step.submission is not None
+            or flow.status is not FlowStatus.RUNNING
+            or flow.current_step_id != step.step_id
+        ):
+            raise FlowStepValidationError(
+                "AgentStep is not the current resumable suspended Step"
+            )
+        role = step.state.agent_role
+        agent_id = step.agent_bindings.get(role) or flow.agent_bindings.get(role)
+        if agent_id is None:
+            raise FlowStepValidationError("AgentStep has no bound Agent for context maintenance")
+        return step, flow, agent_id
+
     def recover_agent_step(
         self,
         *,
@@ -370,15 +478,32 @@ class FlowService:
                         else None
                     ),
                 )
-                current = self._repair_lost_agent_if_needed(current)
                 if action == "finalize_submission":
+                    current = self._repair_lost_agent_if_needed(current)
                     return self._finalize_lost_submission(current)
                 if action == "settle_runner_lost":
+                    current = self._repair_lost_agent_if_needed(current)
                     return self._settle_lost_runner(current)
+
+                context_maintenance_unresolved = (
+                    self._recovery_context_maintenance_unresolved(
+                        current,
+                        agent_mode=agent_mode,
+                    )
+                )
+                if context_maintenance_unresolved and agent_mode in {
+                    "reuse",
+                    "fork_current",
+                }:
+                    raise FlowStepValidationError(
+                        "bound Agent context maintenance is unresolved"
+                    )
+                current = self._repair_lost_agent_if_needed(current)
 
                 replacement_agent_id, agent_reused = self._select_recovery_agent(
                     current,
                     agent_mode=agent_mode,
+                    context_maintenance_unresolved=context_maintenance_unresolved,
                 )
                 replacement = self._build_replacement_step(
                     current.step,
@@ -593,12 +718,17 @@ class FlowService:
         assessment: _AgentStepRecoveryAssessment,
         *,
         agent_mode: Literal["auto", "reuse", "fresh", "fork_current"],
+        context_maintenance_unresolved: bool,
     ) -> tuple[str, bool]:
         agent_service = self.ark.agent_service
         if agent_service is None:
             raise FlowStepValidationError("AgentStep recovery requires AgentService")
         source_agent = assessment.agent
-        reusable = source_agent is not None and source_agent.status == "idle"
+        reusable = (
+            source_agent is not None
+            and source_agent.status == "idle"
+            and not context_maintenance_unresolved
+        )
         resolved_mode = "reuse" if agent_mode == "auto" and reusable else agent_mode
         if resolved_mode == "auto":
             resolved_mode = "fresh"
@@ -632,6 +762,25 @@ class FlowService:
             home_id=home_id,
         )
         return created.agent_id, False
+
+    def _recovery_context_maintenance_unresolved(
+        self,
+        assessment: _AgentStepRecoveryAssessment,
+        *,
+        agent_mode: Literal["auto", "reuse", "fresh", "fork_current"],
+    ) -> bool:
+        if agent_mode == "fresh" or assessment.agent is None:
+            return False
+        agent_service = self.ark.agent_service
+        inspect_maintenance = getattr(
+            agent_service,
+            "inspect_agent_context_maintenance",
+            None,
+        )
+        if not callable(inspect_maintenance):
+            return False
+        maintenance = inspect_maintenance(assessment.agent.agent_id)
+        return bool(maintenance is not None and maintenance.unresolved)
 
     def _build_replacement_step(
         self,
@@ -1188,6 +1337,16 @@ class StepService:
         try:
             receipt = step_impl.run(ctx)
         except Exception as exc:
+            if isinstance(step_impl, AgentStep):
+                receipt = ctx.suspend_step(
+                    _agent_step_exception_error(exc),
+                    require_no_submission=True,
+                )
+                if not self._suspension_receipt_matches(receipt, step):
+                    raise FlowStepValidationError(
+                        f"AgentStep {step_id} did not persist matching suspension evidence"
+                    )
+                return
             receipt = ctx.fail_step(
                 BaseStepError(
                     error_type="step_run_exception",
@@ -1378,6 +1537,59 @@ class StepService:
             error_type=error.error_type,
             finished_at=failed.finished_at or finished_at,
         )
+
+def _agent_step_exception_error(exc: Exception) -> BaseStepError:
+    if isinstance(exc, AgentProviderFailure):
+        if isinstance(exc, AgentProviderTurnFailed):
+            error_type = "agent_provider_turn_failed"
+        elif isinstance(exc, AgentProviderUnavailable):
+            error_type = "agent_provider_unavailable"
+        else:
+            error_type = "agent_provider_failure"
+        return BaseStepError(
+            error_type=error_type,
+            message="Agent provider execution suspended before business completion.",
+            code=exc.code,
+            details={
+                "provider_type": exc.provider_type,
+                "provider_error_type": exc.provider_error_type,
+                "retryable": exc.retryable,
+                "operator_action_required": exc.retryable is not True,
+                "run_id": exc.run_id,
+                "session_id": exc.session_id,
+                "turn_id": exc.turn_id,
+            },
+        )
+    if isinstance(exc, AgentContextCompactionTimeout):
+        error_type = "agent_context_compaction_timeout"
+        message = "Agent context compaction did not reach confirmed completion."
+        category = "context_maintenance"
+    elif isinstance(exc, AgentContextMaintenanceBlocked):
+        error_type = "agent_context_maintenance_blocked"
+        message = "Agent context maintenance remains unresolved."
+        category = "context_maintenance"
+    elif isinstance(exc, AgentContextMaintenanceError):
+        error_type = "agent_context_maintenance_error"
+        message = "Agent context maintenance interrupted execution."
+        category = "context_maintenance"
+    elif isinstance(exc, AgentCompletionCheckError):
+        error_type = "agent_completion_check_error"
+        message = "Agent completion checking interrupted execution."
+        category = "completion_check"
+    else:
+        error_type = "agent_step_unexpected_exception"
+        message = "AgentStep execution stopped on an unexpected internal exception."
+        category = "unexpected_exception"
+    return BaseStepError(
+        error_type=error_type,
+        message=message,
+        details={
+            "exception_type": type(exc).__name__,
+            "category": category,
+            "retryable": None,
+            "operator_action_required": True,
+        },
+    )
 
 
 def _jsonable(value: object) -> object:

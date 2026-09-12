@@ -6,6 +6,7 @@ from .context import (
     AgentContextMaintenanceJournal,
     AgentContextMaintenanceJournalStatus,
     AgentContextMaintenancePolicy,
+    AgentContextMaintenanceView,
 )
 from .instructions import InstructionService, TextFragment
 from .models import (
@@ -50,6 +51,7 @@ __all__ = [
     "AgentContextMaintenanceJournal",
     "AgentContextMaintenanceJournalStatus",
     "AgentContextMaintenancePolicy",
+    "AgentContextMaintenanceView",
     "AgentContextMaintenanceUnsupported",
     "AgentContextUsage",
     "AgentContextUsageUnavailable",
