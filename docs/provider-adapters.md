@@ -5,8 +5,8 @@ ARK separates an application's Agent role from the harness that executes it.
 Codex-, CLI-, subprocess-, or library-backed agent is configured, run,
 queried, controlled, and snapshotted.
 
-The bundled adapters are `codex`, `claude_code`, `pi`, `openai_agents`, and
-`opencode`. Additional providers can be registered without
+The bundled adapters are `codex`, `claude_code`, `pi`, `grok`, `openai_agents`,
+and `opencode`. Additional providers can be registered without
 changing Flow, Step, or snapshot orchestration.
 
 ## Public Contract Namespace
@@ -174,6 +174,102 @@ approval/input boundaries, but ARK 0.3 does not expose a complete
 `AgentService`/Flow `NEEDS_INPUT` lifecycle. Applications using those layers
 must configure non-interactive operation; direct handle controls remain an
 extension point for a later common lifecycle.
+
+## Grok Adapter
+
+The Grok adapter targets the pinned Grok Build CLI 1.0.30 binary and its ACP
+v1 stdio protocol. Register it explicitly:
+
+```python
+from pathlib import Path
+
+from agent_runtime_kit.agent.provider_contracts import ProviderRegistry
+from agent_runtime_kit.agent.providers import build_grok_provider_bundle
+
+runtime_root = Path(".agent_runtime")
+grok = build_grok_provider_bundle(
+    runtime_root=runtime_root,
+    binary_path="/root/.grok/bin/grok",
+)
+registry = ProviderRegistry((grok,))
+```
+
+`GrokHomeOptions` selects the native auth reference, pinned binary, model,
+reasoning effort, and curated tool set. The default auth reference is
+`/root/.grok/auth.json`; ARK creates a symlink from the isolated native Home
+and never copies, prints, or modifies the source secret. Both `HOME` and
+`GROK_HOME` point inside the managed ARK Home and automatic updates are
+disabled. Initialization verifies the 1.0.30 binary hash.
+
+Tool selection is fail-closed. `GrokHomeOptions.tools=None` uses non-empty
+string tools from `ProviderHomeSpec.tools`, or defaults to the read-only
+`read_file`, `list_dir`, and `grep` set. An explicitly empty tuple is rejected.
+Declaring tools in both places is ambiguous and rejected. The additional
+verified tools are `run_terminal_cmd` and `search_replace`. A declared tool is
+preauthorized only for its corresponding read/search, execute, or edit
+permission kind; unknown permission kinds and incoming interactive requests
+are denied.
+
+Home instructions are written into the isolated agent profile. Per-run system
+and developer instructions are added to the ACP prompt. Skill discovery,
+inherited skills, native subagents, background work, plugins, extensions, raw
+config overrides, and project executable configuration are not supported.
+Before launch, the adapter scans the canonical cwd through its Git worktree
+root (or all filesystem ancestors when no reliable Git boundary exists) and
+rejects known Grok, MCP, Claude, Cursor, hook, plugin, and env configuration
+markers.
+
+Native MCP uses `ProviderHomeSpec.mcp_servers`. Grok 1.0.30 stdio and
+streamable HTTP servers are supported. MCP Homes add the hidden
+`search_tool`/`use_tool` pair to the curated profile and disable inherited
+Claude, Cursor, marketplace, and managed gateway connectors. Required servers
+must pass `grok mcp doctor --json` before a model prompt. MCP tool targets are
+restricted to declared `server__tool` namespaces. Legacy SSE transport is
+rejected: the validated 1.0.30 client attempted streamable HTTP semantics
+against an SSE endpoint and could not establish the data plane.
+
+Each turn owns a new process group. Completion follows the ACP
+`session/prompt` stop reason: `end_turn` completes, `cancelled` cancels or
+interrupts, and refusal/token/turn limits fail the turn. Cancel escalates from
+the ACP notification through TERM and KILL, and success requires the complete
+managed process group—including native tools and stdio MCP children—to be
+gone. `run_options.max_turns` is rejected because this adapter has no verified
+native mapping.
+
+The adapter exposes live normalized text, tool, permission, terminal events,
+and prompt-level aggregate token usage. Grok's `usage.modelCalls` is the turn
+request count, but the CLI does not expose per-model-request records, so
+`request_usages` and `AgentTurnUsage.requests` remain empty. Native
+`costUsdTicks` is retained only in sanitized provider payload; it is not
+converted into a fabricated currency amount.
+
+Snapshot captures the complete stable native session directory while
+excluding transient locks. Auth, caches, logs, cwd-level prompt history,
+`session_search.sqlite`, and workspace files are not captured. Capture and
+restore require no active or uncertain process group and are limited to the
+same Home, canonical cwd, and session identity. Restore rewinds conversation
+state only; it does not roll back workspace changes. Fork, steer, follow-up,
+compact, and interactive input are explicitly unsupported.
+
+The opt-in real acceptance entrypoint is not collected by normal pytest runs:
+
+```bash
+ARK_RUN_REAL_GROK=1 PYTHONPATH=src \
+  /root/miniconda3/envs/benchmark/bin/python \
+  tests/real/grok/run_acceptance.py MODE
+```
+
+The HTTP MCP mode requires its fixture process to be started separately on
+the default port 18976:
+
+```bash
+ARK_MCP_TRANSPORT=streamable-http \
+  /root/miniconda3/envs/benchmark/bin/python tests/real/grok/mcp_fixture.py
+```
+
+The acceptance modes cover fresh/resume, Home and run
+instructions, curated tools, stdio/HTTP MCP, cancellation and process-group
+cleanup, and capture/advance/restore/resume behavior.
 
 ## OpenCode Adapter
 

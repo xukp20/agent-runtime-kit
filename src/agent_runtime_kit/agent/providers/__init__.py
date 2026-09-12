@@ -14,6 +14,9 @@ from .openai_agents import (
 from .pi_bundle import build_pi_provider_bundle
 from .pi_home import PiHomeOptions, PiHomeRenderer
 from .pi_runtime import PiProviderRunHandle, PiRuntimeAdapter
+from .grok_bundle import build_grok_provider_bundle
+from .grok_home import GrokHomeOptions, GrokHomeRenderer
+from .grok_runtime import GrokProviderRunHandle, GrokRuntimeAdapter
 from .opencode_bundle import build_opencode_provider_bundle
 from .opencode_home import OpenCodeHomeRenderer
 from .opencode_models import OpenCodeHomeOptions, OpenCodeRunOptions
@@ -35,6 +38,11 @@ __all__ = [
     "PiHomeRenderer",
     "PiProviderRunHandle",
     "PiRuntimeAdapter",
+    "GrokHomeOptions",
+    "GrokHomeRenderer",
+    "GrokProviderRunHandle",
+    "GrokRuntimeAdapter",
+    "build_grok_provider_bundle",
     "build_pi_provider_bundle",
     "OpenCodeHomeOptions",
     "OpenCodeHomeRenderer",
