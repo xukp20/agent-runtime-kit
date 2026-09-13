@@ -39,7 +39,7 @@ GROK_BINARY_SHA256 = "504dd6546ab991b75d36698242875ce461489cd1f8cd84285873cb55bd
 DEFAULT_GROK_TOOLS = ("read_file", "list_dir", "grep")
 MCP_GROK_TOOLS = ("search_tool", "use_tool")
 SUPPORTED_GROK_TOOLS = frozenset(
-    (*DEFAULT_GROK_TOOLS, "run_terminal_cmd", "search_replace", *MCP_GROK_TOOLS)
+    (*DEFAULT_GROK_TOOLS, "run_terminal_cmd", "search_replace", "web_search", "web_fetch", *MCP_GROK_TOOLS)
 )
 _PROJECT_CONFIG_MARKERS = (
     ".grok/config.toml",
@@ -138,8 +138,10 @@ class GrokHomeRenderer:
 
         mcp_servers = tuple(spec.mcp_servers)
         config_text = _render_mcp_config(mcp_servers)
+        if "web_fetch" in _resolve_tools(spec, options, []):
+            config_text += "\n[features]\nweb_fetch = true\n"
         if spec.skills:
-            skills_root = ark_root / "grok-skills"
+            skills_root = grok_root / "skills"
             for skill in spec.skills:
                 write_skill_spec(skill, skills_root / skill.name)
             config_text += "\n[skills]\npaths = [" + json.dumps(str(skills_root)) + "]\n"
@@ -412,8 +414,7 @@ def _validate_mcp_servers(servers: tuple[object, ...]) -> None:
             raise ValueError("Grok MCP cwd is not supported by native config")
         if getattr(server, "enabled_tools", None) is not None or getattr(server, "disabled_tools", None) is not None:
             raise ValueError("Grok MCP per-server tool filters are not verified")
-        if getattr(server, "env_vars", None) or getattr(server, "env_http_headers", None):
-            raise ValueError("Grok MCP dynamic env/header maps are unsupported; use ${ENV_NAME} references")
+        _mcp_environment_maps(server)
         if getattr(server, "bearer_token_env_var", None):
             raise ValueError("Grok MCP bearer_token_env_var is unsupported; use an Authorization ${ENV_NAME} header")
 
@@ -447,14 +448,32 @@ def _render_mcp_config(servers: tuple[object, ...]) -> str:
             value = getattr(server, field, None)
             if value is not None:
                 lines.append(f"{field} = {_toml_value(value)}")
-        env = dict(getattr(server, "env", {}) or {})
-        headers = dict(getattr(server, "http_headers", {}) or {})
+        env, headers = _mcp_environment_maps(server)
         if env:
             lines.append(f"env = {_toml_value(env)}")
         if headers:
             lines.append(f"headers = {_toml_value(headers)}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _mcp_environment_maps(server: object) -> tuple[dict[str, str], dict[str, str]]:
+    env = dict(getattr(server, "env", {}) or {})
+    headers = dict(getattr(server, "http_headers", {}) or {})
+    for target, names, insensitive in (
+        (env, {name: name for name in getattr(server, "env_vars", ()) or ()}, False),
+        (headers, dict(getattr(server, "env_http_headers", {}) or {}), True),
+    ):
+        existing = {key.lower() if insensitive else key for key in target}
+        for key, name in names.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError(f"invalid Grok MCP environment variable name: {name}")
+            normalized = key.lower() if insensitive else key
+            if normalized in existing:
+                raise ValueError(f"conflicting Grok MCP fixed/dynamic mapping: {key}")
+            existing.add(normalized)
+            target[key] = "${" + name + ":-}"
+    return env, headers
 
 
 def _toml_value(value: object) -> str:
@@ -487,14 +506,15 @@ def _describe_generated_files(root: Path) -> tuple[HomeMaterializedFile, ...]:
         path = root / relpath
         if path.is_file():
             files.append(HomeMaterializedFile(relpath=relpath, sha256=_sha256(path)))
-    skills_root = root / ".ark" / "grok-skills"
-    if skills_root.is_symlink():
-        raise ValueError("Grok managed skill root must not be a symlink")
-    for path in sorted(skills_root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError("Grok managed skills must not contain symlinks")
-        if path.is_file():
-            files.append(HomeMaterializedFile(relpath=str(path.relative_to(root)), sha256=_sha256(path)))
+    # Existing Homes retain their original sealed location; new Homes use the native path.
+    for skills_root in (root / ".grok" / "skills", root / ".ark" / "grok-skills"):
+        if skills_root.is_symlink():
+            raise ValueError("Grok managed skill root must not be a symlink")
+        for path in sorted(skills_root.rglob("*")):
+            if path.is_symlink():
+                raise ValueError("Grok managed skills must not contain symlinks")
+            if path.is_file():
+                files.append(HomeMaterializedFile(relpath=str(path.relative_to(root)), sha256=_sha256(path)))
     return tuple(files)
 
 

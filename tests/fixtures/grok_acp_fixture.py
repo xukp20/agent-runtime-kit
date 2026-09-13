@@ -166,7 +166,8 @@ def main() -> int:
             cwd_by_session[session_id] = str(params["cwd"])
             _response(request, {})
         elif method == "_x.ai/commands/list":
-            _response(request, {"tools": _profile_tools()})
+            extra = os.environ.get("GROK_FIXTURE_DISCOVERED_TOOL")
+            _response(request, {"tools": [*_profile_tools(), *([extra] if extra else [])]})
         elif method == "_x.ai/interject":
             _steers[str(params["sessionId"])] = str(params["text"])
             _response(request, {"result": {"status": "queued"}})

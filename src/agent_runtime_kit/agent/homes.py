@@ -345,6 +345,28 @@ class HomeService:
     def resolve_home_root(self, provider_type: str, home_id: str) -> Path:
         return self.store.resolve_home_root(provider_type, home_id)
 
+    def get_skill_paths(self, provider_type: str, home_id: str) -> dict[str, Path]:
+        """Return skill directories recorded by the renderer, without provider path guesses."""
+        home = self.get_home(provider_type, home_id)
+        if home.materialization_manifest_ref is None:
+            return {}
+        root = self.resolve_home_root(provider_type, home_id).resolve()
+        manifest_path = (self.store.runtime_root / home.materialization_manifest_ref).resolve()
+        manifest_path.relative_to(root)
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        paths: dict[str, Path] = {}
+        for item in payload.get("generated_files", ()):
+            relpath = Path(item["relpath"])
+            if relpath.name != "SKILL.md":
+                continue
+            path = (root / relpath).resolve()
+            path.relative_to(root)
+            name = path.parent.name
+            if name in paths and paths[name] != path.parent:
+                raise ValueError(f"ambiguous materialized skill: {name}")
+            paths[name] = path.parent
+        return paths
+
     def build_execution_context(
         self,
         provider_type: str,

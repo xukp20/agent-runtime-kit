@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,58 @@ from agent_runtime_kit.agent.providers import GrokHomeOptions, build_grok_provid
 from agent_runtime_kit.agent.providers.grok_runtime import build_grok_command
 from agent_runtime_kit.agent.skills import SkillSpec
 from agent_runtime_kit.agent.providers.grok_home import validate_grok_workdir
+
+
+def test_standard_mcp_dynamic_maps_and_skill_query(tmp_path: Path) -> None:
+    binary = tmp_path / "grok"
+    binary.write_text("fixture")
+    bundle = build_grok_provider_bundle(runtime_root=tmp_path, binary_path=binary)
+    service = HomeService(tmp_path, renderers={"grok": bundle.home_renderer})
+    service.create_home(ProviderHomeSpec(
+        provider_type="grok", home_id="dynamic",
+        skills=(SkillSpec(name="receipt", description="receipt", body="Read me"),),
+        mcp_servers=(
+            McpServerSpec(name="http", url="http://localhost/mcp", env_http_headers={"x-step": "ARK_STEP_ID"}, result_profile="content_only"),
+            McpServerSpec(name="stdio", transport="stdio", command="fixture", env_vars=["ARK_STEP_ID"], result_profile="content_only"),
+        ),
+        provider_options=GrokHomeOptions(auth_json_path=None),
+    ))
+    root = service.resolve_home_root("grok", "dynamic")
+    config = tomllib.loads((root / ".grok/config.toml").read_text())
+    assert config["mcp_servers"]["http"]["headers"] == {"x-step": "${ARK_STEP_ID:-}", "x-ark-mcp-result-profile": "content_only"}
+    assert config["mcp_servers"]["stdio"]["env"] == {"ARK_STEP_ID": "${ARK_STEP_ID:-}", "ARK_MCP_RESULT_PROFILE": "content_only"}
+    assert service.get_skill_paths("grok", "dynamic") == {"receipt": root / ".grok/skills/receipt"}
+    for value in ("step-a", "step-b"):
+        ctx = service.build_execution_context("grok", "dynamic", run_env={"ARK_STEP_ID": value})
+        assert ctx.process_environment["ARK_STEP_ID"] == value
+    for server in (
+        McpServerSpec(name="bad", url="http://localhost/mcp", http_headers={"X-Step": "fixed"}, env_http_headers={"x-step": "ARK_STEP_ID"}),
+        McpServerSpec(name="bad", command="fixture", transport="stdio", env={"ID": "fixed"}, env_vars=["ID"]),
+    ):
+        validation = bundle.home_renderer.validate(ProviderHomeSpec(provider_type="grok", home_id="bad", mcp_servers=(server,), provider_options=GrokHomeOptions(auth_json_path=None)))
+        assert not validation.valid
+        assert "conflicting" in str(validation.errors)
+
+
+def test_old_skill_home_remains_valid_and_query_rejects_escape(tmp_path: Path) -> None:
+    binary = tmp_path / "grok"
+    binary.write_text("fixture")
+    bundle = build_grok_provider_bundle(runtime_root=tmp_path, binary_path=binary)
+    service = HomeService(tmp_path, renderers={"grok": bundle.home_renderer})
+    service.create_home(ProviderHomeSpec(provider_type="grok", home_id="legacy",
+        skills=(SkillSpec(name="receipt", description="receipt", body="Read me"),),
+        provider_options=GrokHomeOptions(auth_json_path=None)))
+    root = service.resolve_home_root("grok", "legacy")
+    (root / ".grok/skills").rename(root / ".ark/grok-skills")
+    service.seal_home_materialization("grok", "legacy")
+    service.build_execution_context("grok", "legacy")
+    assert service.get_skill_paths("grok", "legacy")["receipt"] == root / ".ark/grok-skills/receipt"
+    manifest = root / ".ark/home_materialization.json"
+    payload = json.loads(manifest.read_text())
+    payload["generated_files"].append({"relpath": "../../escape/SKILL.md", "sha256": "unused"})
+    manifest.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        service.get_skill_paths("grok", "legacy")
 
 
 def test_grok_home_materializes_isolated_profile_auth_and_instructions(tmp_path: Path) -> None:
@@ -165,7 +218,7 @@ def test_managed_skills_are_sealed_and_only_explicit_specs_are_accepted(tmp_path
     service.create_home(ProviderHomeSpec(provider_type="grok", home_id="skills", skills=(skill,), provider_options=options))
     root = service.resolve_home_root("grok", "skills")
     service.build_execution_context("grok", "skills")
-    resource = root / ".ark/grok-skills/receipt/resource.txt"
+    resource = root / ".grok/skills/receipt/resource.txt"
     resource.write_text("changed")
     with pytest.raises(RuntimeError, match="changed"):
         service.build_execution_context("grok", "skills")

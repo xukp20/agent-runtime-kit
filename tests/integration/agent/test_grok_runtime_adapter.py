@@ -87,6 +87,19 @@ def _request(context, workdir: Path, *, prompt: str, session=None, max_turns=Non
     )
 
 
+@pytest.mark.parametrize("tool,allowed", [("lc__probe", True), ("other__probe", False), ("run_terminal_cmd", False)])
+def test_catalog_accepts_only_declared_mcp_discovery(tmp_path: Path, tool: str, allowed: bool) -> None:
+    bundle, context, workdir = _setup(tmp_path)
+    context.runtime_payload["mcp_server_names"] = ["lc"]
+    context = replace(context, process_environment={**context.process_environment, "GROK_FIXTURE_DISCOVERED_TOOL": tool})
+    handle = bundle.runtime.start(_request(context, workdir, prompt="hello"))
+    if allowed:
+        assert handle.wait_terminal().status is ProviderRunState.COMPLETED
+    else:
+        with pytest.raises(Exception, match="tool profile mismatch"):
+            handle.wait_terminal()
+
+
 def test_grok_runtime_fresh_resume_events_usage_and_artifact_restore(tmp_path: Path) -> None:
     bundle, context, workdir = _setup(tmp_path)
     first = bundle.runtime.start(_request(context, workdir, prompt="first")).wait_terminal(20)

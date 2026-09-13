@@ -355,11 +355,13 @@ class GrokProviderRunHandle:
             )
             observed = catalog.get("tools")
             expected = tuple(str(item) for item in runtime.get("tools") or ())
+            mcp_prefixes = tuple(f"{name}__" for name in runtime.get("mcp_server_names") or ())
             if (
                 not isinstance(observed, list)
                 or any(not isinstance(item, str) for item in observed)
                 or len(observed) != len(set(observed))
-                or set(observed) != set(expected)
+                or not set(expected).issubset(observed)
+                or any(item not in expected and not item.startswith(mcp_prefixes) for item in observed)
             ):
                 raise GrokAcpError(f"Grok tool profile mismatch: expected {list(expected)!r}, observed {observed!r}")
             with self._lock:
@@ -581,11 +583,13 @@ class GrokProviderRunHandle:
         tools = set(str(item) for item in runtime.get("tools", ())) if isinstance(runtime, Mapping) else set()
         mcp_servers = set(str(item) for item in runtime.get("mcp_server_names", ())) if isinstance(runtime, Mapping) else set()
         if kind in {"read", "search"}:
-            allowed = allowed and bool(tools & {"read_file", "list_dir", "grep", "search_tool"})
+            allowed = allowed and bool(tools & {"read_file", "list_dir", "grep", "search_tool", "web_search", "web_fetch"})
         elif kind == "execute":
             allowed = allowed and "run_terminal_cmd" in tools
         elif kind == "edit":
             allowed = allowed and "search_replace" in tools
+        elif kind == "fetch":
+            allowed = allowed and "web_fetch" in tools
         elif kind == "other":
             raw = _mapping_or_empty(tool_call.get("rawInput"))
             target = str(raw.get("tool_name") or "")

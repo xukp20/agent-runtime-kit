@@ -205,7 +205,9 @@ Tool selection is fail-closed. `GrokHomeOptions.tools=None` uses non-empty
 string tools from `ProviderHomeSpec.tools`, or defaults to the read-only
 `read_file`, `list_dir`, and `grep` set. An explicitly empty tuple is rejected.
 Declaring tools in both places is ambiguous and rejected. The additional
-verified tools are `run_terminal_cmd` and `search_replace`. A declared tool is
+verified tools are `run_terminal_cmd`, `search_replace`, `web_search`, and
+`web_fetch`. Web fetching enables the native feature and its `fetch` permission.
+A declared tool is
 preauthorized only for its corresponding read/search, execute, or edit
 permission kind; unknown permission kinds and incoming interactive requests
 are denied.
@@ -228,6 +230,9 @@ When managed skills are enabled, project `.grok/skills`, `.grok/commands`,
 project discovery from overriding the declared skill set. Compatibility skill
 discovery remains disabled. Changes or additions to managed skill files fail
 Home validation; native `skills-reload` responses are not ARK request responses.
+New Homes use `.grok/skills`; previously materialized `.ark/grok-skills` remains
+supported. Applications can query `HomeService.get_skill_paths()` for directories
+listed in the materialization manifest without guessing provider paths.
 
 Native MCP uses `ProviderHomeSpec.mcp_servers`. Grok 1.0.30 stdio and
 streamable HTTP servers are supported. MCP Homes add the hidden
@@ -237,6 +242,11 @@ must pass `grok mcp doctor --json` before a model prompt. MCP tool targets are
 restricted to declared `server__tool` namespaces. Legacy SSE transport is
 rejected: the validated 1.0.30 client attempted streamable HTTP semantics
 against an SSE endpoint and could not establish the data plane.
+Standard `env_vars` and `env_http_headers` are translated to native `${VAR:-}`
+references. Every process loads its own turn environment; absent optional fields
+become empty, and conflicting fixed/dynamic mappings are rejected. Standard
+`result_profile` markers are preserved. Resumed catalogs may include previously
+discovered tools, but only within the declared MCP namespaces.
 
 Each turn owns a new process group. Completion follows the ACP
 `session/prompt` stop reason: `end_turn` completes, `cancelled` cancels or
