@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import shutil
 import sys
 import threading
 import time
@@ -14,6 +15,7 @@ from urllib.parse import quote
 _write_lock = threading.Lock()
 _sessions: dict[str, str] = {}
 _cancelled: set[str] = set()
+_steers: dict[str, str] = {}
 
 
 def _write(value: object) -> None:
@@ -53,6 +55,9 @@ def _persist(cwd: str, session_id: str, prompt: str) -> None:
 
 
 def _run_prompt(request: dict[str, object], session_id: str, prompt: str, cwd: str) -> None:
+    _write({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session_id, "update": {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": prompt}},
+    }})
     if "permission" in prompt:
         _write(
             {
@@ -78,7 +83,16 @@ def _run_prompt(request: dict[str, object], session_id: str, prompt: str, cwd: s
         _response(request, {"stopReason": "cancelled", "_meta": {"promptId": "cancel-turn"}})
         return
     stop = "refusal" if "refuse" in prompt else "end_turn"
+    if "steer-test" in prompt:
+        deadline = time.monotonic() + 3
+        while session_id not in _steers and time.monotonic() < deadline:
+            time.sleep(0.01)
     _persist(cwd, session_id, prompt)
+    turn_id = f"turn-{uuid.uuid4().hex}"
+    with (_session_dir(cwd, session_id) / "updates.jsonl").open("a") as stream:
+        stream.write(json.dumps({"params": {"sessionId": session_id, "_meta": {"promptId": turn_id}}}) + "\n")
+    for _ in range(2):
+        _write({"jsonrpc": "2.0", "id": "skills-reload", "result": {}})
     _write(
         {
             "jsonrpc": "2.0",
@@ -87,7 +101,7 @@ def _run_prompt(request: dict[str, object], session_id: str, prompt: str, cwd: s
                 "sessionId": session_id,
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "ARK_GROK_DONE"},
+                    "content": {"type": "text", "text": _steers.get(session_id, "ARK_GROK_DONE")},
                 },
             },
         }
@@ -98,7 +112,7 @@ def _run_prompt(request: dict[str, object], session_id: str, prompt: str, cwd: s
             "stopReason": stop,
             "_meta": {
                 "requestId": "request-1",
-                "promptId": f"turn-{uuid.uuid4().hex}",
+                "promptId": turn_id,
                 "modelId": "grok-fixture",
                 "usage": {
                     "inputTokens": 7,
@@ -153,6 +167,24 @@ def main() -> int:
             _response(request, {})
         elif method == "_x.ai/commands/list":
             _response(request, {"tools": _profile_tools()})
+        elif method == "_x.ai/interject":
+            _steers[str(params["sessionId"])] = str(params["text"])
+            _response(request, {"result": {"status": "queued"}})
+        elif method == "_x.ai/session/fork":
+            source = _session_dir(str(params["sourceCwd"]), str(params["sourceSessionId"]))
+            target = _session_dir(str(params["newCwd"]), str(params["newSessionId"]))
+            shutil.copytree(source, target)
+            _response(request, {"newSessionId": params["newSessionId"], "parentSessionId": params["sourceSessionId"]})
+        elif method == "_x.ai/compact_conversation":
+            sid = str(params["session_id"])
+            root = _session_dir(cwd_by_session[sid], sid)
+            checkpoint = str(uuid.uuid4())
+            with (root / "updates.jsonl").open("a") as stream:
+                for update in ({"sessionUpdate": "compaction_checkpoint", "checkpoint_id": checkpoint},
+                               {"sessionUpdate": "auto_compact_completed"}):
+                    stream.write(json.dumps({"params": {"sessionId": sid, "update": update}}) + "\n")
+            if not os.environ.get("GROK_FIXTURE_COMPACT_LOSE_RESPONSE"):
+                _response(request, {})
         elif method == "session/prompt":
             session_id = str(params["sessionId"])
             prompt = str(params["prompt"][0]["text"])

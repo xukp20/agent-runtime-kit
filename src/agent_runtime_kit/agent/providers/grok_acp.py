@@ -46,6 +46,7 @@ class GrokAcpProcess:
         self._condition = threading.Condition()
         self._write_lock = threading.Lock()
         self._responses: dict[str, dict[str, object]] = {}
+        self._pending: set[str] = set()
         self._records: list[dict[str, object]] = []
         self._stderr: list[str] = []
         self._error: BaseException | None = None
@@ -78,16 +79,23 @@ class GrokAcpProcess:
         timeout_s: float = 30.0,
     ) -> object:
         request_id = f"ark-{uuid.uuid4().hex}"
-        self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params or {})})
-        deadline = monotonic() + timeout_s
         with self._condition:
-            while request_id not in self._responses:
-                self._raise_if_unusable()
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(f"Grok ACP request timed out: {method}")
-                self._condition.wait(min(remaining, 0.1))
-            response = self._responses.pop(request_id)
+            self._pending.add(request_id)
+        try:
+            self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params or {})})
+            deadline = monotonic() + timeout_s
+            with self._condition:
+                while request_id not in self._responses:
+                    self._raise_if_unusable()
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"Grok ACP request timed out: {method}")
+                    self._condition.wait(min(remaining, 0.1))
+                response = self._responses.pop(request_id)
+        finally:
+            with self._condition:
+                self._pending.discard(request_id)
+                self._responses.pop(request_id, None)
         if "error" in response:
             error = response.get("error")
             message = error.get("message") if isinstance(error, Mapping) else error
@@ -169,9 +177,10 @@ class GrokAcpProcess:
                 with self._condition:
                     if response_id is not None and not is_incoming:
                         key = str(response_id)
-                        if key in self._responses:
+                        if key in self._pending and key in self._responses:
                             raise GrokAcpError(f"duplicate Grok ACP response id: {key}")
-                        self._responses[key] = value
+                        if key in self._pending:
+                            self._responses[key] = value
                     self._records.append(value)
                     self._condition.notify_all()
                 if self._on_record is not None:

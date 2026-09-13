@@ -211,13 +211,23 @@ permission kind; unknown permission kinds and incoming interactive requests
 are denied.
 
 Home instructions are written into the isolated agent profile. Per-run system
-and developer instructions are added to the ACP prompt. Skill discovery,
+and developer instructions are added to the ACP prompt. Unmanaged and
 inherited skills, native subagents, background work, plugins, extensions, raw
 config overrides, and project executable configuration are not supported.
 Before launch, the adapter scans the canonical cwd through its Git worktree
 root (or all filesystem ancestors when no reliable Git boundary exists) and
 rejects known Grok, MCP, Claude, Cursor, hook, plugin, and env configuration
 markers.
+
+Managed skills use explicit `SkillSpec` objects in `ProviderHomeSpec.skills`.
+ARK writes their `SKILL.md` and resource files into the sealed Home and selects
+their canonical names in the native profile. Skill names must use lowercase
+letters, digits and hyphens. Skill files do not grant additional tool permissions.
+When managed skills are enabled, project `.grok/skills`, `.grok/commands`,
+`.agents/skills` and `.agents/commands` directories are rejected to prevent
+project discovery from overriding the declared skill set. Compatibility skill
+discovery remains disabled. Changes or additions to managed skill files fail
+Home validation; native `skills-reload` responses are not ARK request responses.
 
 Native MCP uses `ProviderHomeSpec.mcp_servers`. Grok 1.0.30 stdio and
 streamable HTTP servers are supported. MCP Homes add the hidden
@@ -248,8 +258,41 @@ excluding transient locks. Auth, caches, logs, cwd-level prompt history,
 `session_search.sqlite`, and workspace files are not captured. Capture and
 restore require no active or uncertain process group and are limited to the
 same Home, canonical cwd, and session identity. Restore rewinds conversation
-state only; it does not roll back workspace changes. Fork, steer, follow-up,
-compact, and interactive input are explicitly unsupported.
+state only; it does not roll back workspace changes. In-process artifact copies
+and restores are serialized against session maintenance and run admission.
+
+`AgentService.fork_agent()` uses native `_x.ai/session/fork`. Fork is limited
+to the latest persisted prompt, same Home and canonical cwd. The child has a
+new session identity and independent conversation artifacts; workspace files
+are shared. Historical-turn and cross-Home forks are unsupported.
+
+`AgentService.compact_agent()` loads the idle session and invokes native
+`_x.ai/compact_conversation`. The adapter records a baseline before submitting
+the operation and confirms a persisted checkpoint followed by completion.
+Lost responses leave the existing ARK maintenance journal unresolved; read-only
+reconciliation requires new completion evidence and a clean process state.
+The Context SPI accepts an optional `provider_options={"user_context": "..."}`.
+Current-context token measurement is unavailable, so threshold-based ARK
+compaction is not advertised. This is distinct from Grok's own automatic compaction.
+
+`ProviderRunHandle.control(STEER)` uses native `_x.ai/interject` during an
+active prompt. It rejects startup, cancellation and terminal boundaries.
+An accepted receipt means queued, not proof of model consumption; delivery
+racing a terminal response is reported as unconfirmed without hidden retries.
+Live steering is a Provider SPI operation, not a new AgentService method.
+Native concurrent prompts were observed to complete as separate prompt IDs,
+terminal responses and usage records. This adapter closes its process after
+one prompt, so queued follow-up is not exposed as a control that might outlive
+that boundary. Queued follow-up and interactive input remain unsupported. To run a subsequent
+ARK turn, wait for completion and call `start_agent()` again.
+
+The extended real acceptance modes are `skills`, `fork`, `compact` and `steer`:
+
+```bash
+ARK_RUN_REAL_GROK=1 PYTHONPATH=src \
+  /root/miniconda3/envs/benchmark/bin/python \
+  tests/real/grok/run_extended_acceptance.py MODE
+```
 
 The opt-in real acceptance entrypoint is not collected by normal pytest runs:
 

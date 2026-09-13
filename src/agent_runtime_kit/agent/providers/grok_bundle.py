@@ -15,6 +15,7 @@ from ..provider_contracts import (
 from .grok_artifacts import GrokArtifactAdapter
 from .grok_home import GROK_CLI_VERSION, GrokHomeRenderer
 from .grok_runtime import GrokRuntimeAdapter
+from .grok_context import GrokContextAdapter
 
 
 def build_grok_provider_bundle(
@@ -27,6 +28,7 @@ def build_grok_provider_bundle(
         CapabilityKey.HOME_ENV,
         CapabilityKey.HOME_AUTH_REFS,
         CapabilityKey.HOME_INSTRUCTIONS,
+        CapabilityKey.HOME_SKILLS,
         CapabilityKey.HOME_MCP,
         CapabilityKey.SESSION_CREATE,
         CapabilityKey.SESSION_RESUME,
@@ -34,6 +36,9 @@ def build_grok_provider_bundle(
         CapabilityKey.RUN_WAIT_TERMINAL,
         CapabilityKey.RUN_INTERRUPT,
         CapabilityKey.RUN_CANCEL,
+        CapabilityKey.RUN_STEER,
+        CapabilityKey.CONTROL_FORK,
+        CapabilityKey.CONTROL_COMPACT,
         CapabilityKey.MODEL_OTHER_API,
     }
     supports = {
@@ -53,13 +58,9 @@ def build_grok_provider_bundle(
     for key, reason in (
         (CapabilityKey.HOME_BASE_CONFIG, "raw Grok base configuration is outside the curated Home boundary"),
         (CapabilityKey.HOME_RAW_OVERRIDES, "raw Grok configuration overrides are unsupported"),
-        (CapabilityKey.HOME_SKILLS, "Grok skill discovery and inheritance are disabled"),
         (CapabilityKey.HOME_EXTENSIONS, "Grok extensions and plugins are disabled"),
-        (CapabilityKey.RUN_STEER, "Grok ACP v1 adapter does not support live steering"),
-        (CapabilityKey.RUN_FOLLOW_UP, "Grok ACP v1 adapter does not support follow-up injection"),
-        (CapabilityKey.CONTROL_FORK, "Grok session fork is unsupported"),
-        (CapabilityKey.CONTROL_FORK_FROM_TURN, "Grok session fork is unsupported"),
-        (CapabilityKey.CONTROL_COMPACT, "Grok compact is unsupported"),
+        (CapabilityKey.RUN_FOLLOW_UP, "native queued prompts have distinct terminals; the adapter owns one prompt per run"),
+        (CapabilityKey.CONTROL_FORK_FROM_TURN, "Grok adapter supports only the latest persisted prompt, not historical forks"),
         (CapabilityKey.CONTROL_APPROVAL_RESPONSE, "Grok permissions are resolved non-interactively"),
         (CapabilityKey.CONTROL_INPUT_RESPONSE, "Grok interactive input is unsupported"),
         (CapabilityKey.ARTIFACT_IN_FLIGHT_STATE, "Grok snapshot requires a clean idle process group"),
@@ -99,6 +100,7 @@ def build_grok_provider_bundle(
             static_capabilities=capabilities,
         ),
         runtime=runtime,
+        context=GrokContextAdapter(runtime),
         home_renderer=GrokHomeRenderer(runtime_root=runtime_root, binary_path=binary_path),
         artifacts=GrokArtifactAdapter(runtime_root=runtime_root, active_sessions=runtime),
     )

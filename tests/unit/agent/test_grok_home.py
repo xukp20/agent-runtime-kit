@@ -10,6 +10,8 @@ from agent_runtime_kit.agent.instructions import TextFragment
 from agent_runtime_kit.agent.provider_contracts import ProviderHomeSpec
 from agent_runtime_kit.agent.providers import GrokHomeOptions, build_grok_provider_bundle
 from agent_runtime_kit.agent.providers.grok_runtime import build_grok_command
+from agent_runtime_kit.agent.skills import SkillSpec
+from agent_runtime_kit.agent.providers.grok_home import validate_grok_workdir
 
 
 def test_grok_home_materializes_isolated_profile_auth_and_instructions(tmp_path: Path) -> None:
@@ -150,3 +152,31 @@ def test_grok_home_session_start_commit_accepts_only_verified_marketplace_metada
     service.commit_provider_lifecycle_materialization("grok", "demo", lifecycle="session_start")
     (root / ".grok" / "sessions" / "native-data").mkdir(parents=True)
     service.build_execution_context("grok", "demo", workdir=str(tmp_path))
+def test_managed_skills_are_sealed_and_only_explicit_specs_are_accepted(tmp_path: Path) -> None:
+    binary = tmp_path / "grok"
+    binary.write_text("fixture")
+    bundle = build_grok_provider_bundle(runtime_root=tmp_path / "runtime", binary_path=binary)
+    service = HomeService(tmp_path / "runtime", renderers={"grok": bundle.home_renderer})
+    skill = SkillSpec(name="receipt", description="receipt", body="Read resource", files={"resource.txt": "original"})
+    options = GrokHomeOptions(auth_json_path=None)
+    for skills in (("unknown",), (skill, skill)):
+        with pytest.raises(ValueError):
+            service.create_home(ProviderHomeSpec(provider_type="grok", home_id="invalid", skills=skills, provider_options=options))
+    service.create_home(ProviderHomeSpec(provider_type="grok", home_id="skills", skills=(skill,), provider_options=options))
+    root = service.resolve_home_root("grok", "skills")
+    service.build_execution_context("grok", "skills")
+    resource = root / ".ark/grok-skills/receipt/resource.txt"
+    resource.write_text("changed")
+    with pytest.raises(RuntimeError, match="changed"):
+        service.build_execution_context("grok", "skills")
+    resource.write_text("original")
+    (resource.parent / "extra.txt").write_text("unsealed")
+    with pytest.raises(RuntimeError, match="file set"):
+        service.build_execution_context("grok", "skills")
+
+
+def test_managed_skill_mode_rejects_project_skill_discovery(tmp_path: Path) -> None:
+    (tmp_path / ".grok/skills").mkdir(parents=True)
+    validate_grok_workdir(tmp_path)
+    with pytest.raises(RuntimeError, match="configuration"):
+        validate_grok_workdir(tmp_path, managed_skills=True)

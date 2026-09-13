@@ -7,6 +7,7 @@ import subprocess
 import threading
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from time import monotonic, sleep
@@ -25,6 +26,7 @@ from ..provider_contracts import (
     ProviderControlResult,
     ProviderEventBatch,
     ProviderForkRequest,
+    ProviderForkResult,
     ProviderRunRequest,
     ProviderRunState,
     ProviderSessionLocator,
@@ -67,6 +69,8 @@ class GrokProviderRunHandle:
         self._text_parts: list[str] = []
         self._tool_calls: dict[str, AgentToolCall] = {}
         self._accept_updates = False
+        self._prompt_active = False
+        self._prompt_finished = False
         self._requested_stop: ProviderControlAction | None = None
         self._cleanup_confirmed = False
         self._cleanup_uncertain = False
@@ -119,6 +123,30 @@ class GrokProviderRunHandle:
         return self._stop(ProviderControlAction.INTERRUPT, timeout_s)
 
     def control(self, request: ProviderControlRequest) -> ProviderControlResult:
+        if request.action is ProviderControlAction.STEER:
+            with self._lock:
+                ready = self._prompt_active and self._requested_stop is None and not self._done.is_set()
+                session = self._session
+                transport = self._transport
+            if not ready or session is None or transport is None or not isinstance(request.content, str) or not request.content.strip():
+                return ProviderControlResult(action=request.action, accepted=False, terminal_confirmed=False,
+                    requested_at=request.requested_at, completed_at=utc_now_iso(), reason="Grok steer requires an active prompt and nonempty text")
+            message_id = str(uuid.uuid4())
+            try:
+                response = transport.request("_x.ai/interject", {
+                    "sessionId": session.session_id, "text": request.content, "interjectionId": message_id,
+                }, timeout_s=10)
+            except (GrokAcpError, TimeoutError) as exc:
+                return ProviderControlResult(action=request.action, accepted=False, terminal_confirmed=False,
+                    requested_at=request.requested_at, completed_at=utc_now_iso(), session_locator=session,
+                    reason=f"Grok steer delivery unconfirmed: {exc}")
+            with self._lock:
+                accepted = response.get("result", {}).get("status") == "queued" and self._prompt_active and self._requested_stop is None
+            return ProviderControlResult(action=request.action, accepted=accepted, terminal_confirmed=False,
+                requested_at=request.requested_at, completed_at=utc_now_iso(), session_locator=session,
+                reason="queued, not proof of consumption" if accepted else "prompt ended or cancelled while steer was in flight; delivery unconfirmed",
+                provider_payload=build_provider_payload(provider_type="grok", payload_type="interject_receipt",
+                    data={"interjection_id": message_id, "response": response}, adapter_version=GROK_ADAPTER_VERSION))
         if request.action in {ProviderControlAction.INTERRUPT, ProviderControlAction.CANCEL}:
             timeout = request.options.get("timeout_s")
             effective = float(timeout) if isinstance(timeout, (int, float)) else None
@@ -136,7 +164,7 @@ class GrokProviderRunHandle:
             reason=(
                 "Grok run ended without confirmed process-group cleanup"
                 if self._done.is_set() and not self._cleanup_confirmed
-                else "Grok does not support steer, follow-up, interactive input, compact, or fork controls"
+                else "this Grok run control is unsupported; fork and compact use their dedicated SPI methods"
             ),
         )
 
@@ -247,7 +275,7 @@ class GrokProviderRunHandle:
                 raise ValueError("Grok execution context has no runtime configuration")
             workdir = Path(self.request.workdir or context.workdir or context.home_root).resolve(strict=True)
             self._raise_if_stop_requested()
-            validate_grok_workdir(workdir)
+            validate_grok_workdir(workdir, managed_skills=bool(runtime.get("skills")))
             _validate_resume_identity(self.request, context.home_root, workdir)
             command = build_grok_command(context, model=self.request.model_overrides)
             required_mcp = tuple(str(item) for item in runtime.get("required_mcp_server_names") or ())
@@ -425,6 +453,7 @@ class GrokProviderRunHandle:
                     data={"error_type": type(self._error).__name__, "message": str(self._error)},
                 )
         finally:
+            self._prompt_active = False
             if transport is None and not self._cleanup_uncertain:
                 self._cleanup_confirmed = True
             self._done.set()
@@ -492,7 +521,11 @@ class GrokProviderRunHandle:
             raise GrokAcpError("Grok run was cancelled before prompt submission")
 
     def _native_record(self, record: dict[str, object]) -> None:
-        if not self._accept_updates or record.get("method") != "session/update":
+        if isinstance(record.get("result"), dict) and "stopReason" in record["result"]:
+            with self._lock:
+                self._prompt_active = False
+                self._prompt_finished = True
+        if not self._accept_updates or record.get("method") not in {"session/update", "_x.ai/session/update"}:
             return
         params = _mapping_or_empty(record.get("params"))
         session = self.session_locator()
@@ -500,6 +533,10 @@ class GrokProviderRunHandle:
             return
         update = _mapping_or_empty(params.get("update"))
         kind = str(update.get("sessionUpdate") or "unknown")
+        if kind in {"user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call"}:
+            with self._lock:
+                if not self._prompt_finished:
+                    self._prompt_active = True
         if kind == "agent_message_chunk":
             content = _mapping_or_empty(update.get("content"))
             if content.get("type") == "text" and isinstance(content.get("text"), str):
@@ -618,6 +655,7 @@ class GrokRuntimeAdapter:
         self.runtime_root = Path(runtime_root)
         self._handles: dict[str, GrokProviderRunHandle] = {}
         self._unstable_sessions: set[str] = set()
+        self._maintenance_sessions: set[str] = set()
         self._lock = threading.RLock()
 
     def start(self, request: ProviderRunRequest) -> GrokProviderRunHandle:
@@ -635,13 +673,67 @@ class GrokRuntimeAdapter:
             raise ValueError("Grok adapter does not support run_options.max_turns")
         handle = GrokProviderRunHandle(request=request, resume=resume, on_done=self._on_done)
         with self._lock:
+            if request.session_locator is not None and not self.is_session_stable(request.session_locator.session_id):
+                raise RuntimeError("Grok session is active, under maintenance, or unclean")
             self._handles[handle.run_id] = handle
         handle.begin()
         return handle
 
-    def fork(self, request: ProviderForkRequest):  # noqa: ANN201
-        del request
-        raise NotImplementedError("Grok session fork is unsupported")
+    def fork(self, request: ProviderForkRequest) -> ProviderForkResult:
+        from .grok_session import native_session, latest_prompt_id
+
+        context = request.execution_context
+        if context is None or request.target_home_id != request.source_session.home_id:
+            raise ValueError("Grok fork requires the same Home execution context")
+        source = request.source_session
+        target_id = str(uuid.uuid4())
+        with native_session(self, context, source) as (process, path):
+            if request.source_turn is not None:
+                if request.source_turn.session != source or request.source_turn.turn_id != latest_prompt_id(path):
+                    raise ValueError("Grok supports only a fork at the latest persisted prompt")
+            cwd = source.native_locator["workdir"]
+            response = process.request("_x.ai/session/fork", {
+                "sourceSessionId": source.session_id, "sourceCwd": cwd,
+                "newCwd": cwd, "newSessionId": target_id,
+            }, timeout_s=60)
+            if response.get("newSessionId") != target_id or response.get("parentSessionId") != source.session_id:
+                raise GrokAcpError("Grok fork returned an unexpected session identity")
+        target_path = path.parent / target_id
+        if not target_path.is_dir():
+            raise GrokAcpError("Grok fork did not persist a child session")
+        native = dict(source.native_locator)
+        native["session_relpath"] = str(target_path.relative_to(self.runtime_root))
+        target = replace(source, session_id=target_id, created_at=utc_now_iso(), native_locator=native)
+        return ProviderForkResult(
+            source_session=source, target_session=target, status="forked", source_turn=request.source_turn,
+            target_turn=None,
+            artifact_locator=AgentArtifactLocator(provider_type="grok", home_id=target.home_id,
+                session_id=target_id, adapter_version=GROK_ADAPTER_VERSION, native_primary_ref=native["session_relpath"]),
+            limitations=("same Home and cwd; latest prompt only; workspace is shared",),
+        )
+
+    @contextmanager
+    def maintenance(self, session_id: str):  # noqa: ANN201
+        with self._lock:
+            if not self.is_session_stable(session_id):
+                raise RuntimeError("Grok session is active, under maintenance, or unclean")
+            self._maintenance_sessions.add(session_id)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._maintenance_sessions.discard(session_id)
+
+    def mark_unstable(self, session_id: str) -> None:
+        with self._lock:
+            self._unstable_sessions.add(session_id)
+
+    @contextmanager
+    def artifact_boundary(self, session_id: str):  # noqa: ANN201
+        with self._lock:
+            if not self.is_session_stable(session_id):
+                raise RuntimeError("Grok artifact operation requires a clean idle session")
+            yield
 
     def control(self, request: ProviderControlRequest) -> ProviderControlResult:
         with self._lock:
@@ -697,7 +789,9 @@ class GrokRuntimeAdapter:
 
     def is_session_stable(self, session_id: str) -> bool:
         with self._lock:
-            return not self.is_session_active(session_id) and session_id not in self._unstable_sessions
+            return (not self.is_session_active(session_id)
+                    and session_id not in self._unstable_sessions
+                    and session_id not in self._maintenance_sessions)
 
     def close(self) -> None:
         for handle in self._active_handles():

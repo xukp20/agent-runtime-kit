@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 from ..provider_contracts import (
@@ -115,6 +116,11 @@ class GrokArtifactAdapter:
         )
 
     def capture(self, request: ArtifactCaptureRequest) -> ProviderArtifactSnapshot:
+        guard = getattr(self.active_sessions, "artifact_boundary", None)
+        with guard(request.session.session_id) if callable(guard) else nullcontext():
+            return self._capture(request)
+
+    def _capture(self, request: ArtifactCaptureRequest) -> ProviderArtifactSnapshot:
         stability = self.wait_quiescent(
             ArtifactStabilityRequest(
                 session=request.session,
@@ -154,6 +160,11 @@ class GrokArtifactAdapter:
         self._validate_snapshot(request)
 
     def restore(self, request: ArtifactRestoreRequest) -> ProviderArtifactRestoreResult:
+        guard = getattr(self.active_sessions, "artifact_boundary", None)
+        with guard(request.manifest.session_id) if callable(guard) else nullcontext():
+            return self._restore(request)
+
+    def _restore(self, request: ArtifactRestoreRequest) -> ProviderArtifactRestoreResult:
         self._validate_restore_request(request)
         self._validate_snapshot(request)
         session_entries = [item for item in request.manifest.entries if item.kind == "session_file"]

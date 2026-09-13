@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
 
@@ -19,6 +20,9 @@ from agent_runtime_kit.agent.provider_contracts import (
     ProviderRunOptions,
     ProviderRunRequest,
     ProviderRunState,
+    ProviderForkRequest,
+    ProviderContextCompactionRequest,
+    ProviderContextReconcileRequest,
 )
 from agent_runtime_kit.agent.providers import GrokHomeOptions, build_grok_provider_bundle
 from agent_runtime_kit.agent.service import AgentService, AgentType, AgentTypeRegistry
@@ -334,3 +338,97 @@ def test_grok_fake_provider_runs_through_agent_step(tmp_path: Path, monkeypatch)
     persisted = flow_service.get_step(step.step_id)
     assert persisted.status is StepStatus.COMPLETED
     assert persisted.result is not None and persisted.result.outcome == "incomplete"
+def test_native_fork_compaction_and_stability_boundaries(tmp_path: Path) -> None:
+    bundle, context, workdir = _setup(tmp_path)
+    first = bundle.runtime.start(_request(context, workdir, prompt="first")).wait_terminal(10)
+    session = first.session_locator
+    request = ProviderForkRequest(source_agent_id="agent", source_session=session,
+        target_agent_id="child", target_scope_id="scope", target_home_id="demo",
+        source_turn=first.turn_locator, execution_context=replace(context, workdir=None))
+    fork = bundle.runtime.fork(request)
+    assert fork.target_session.session_id != session.session_id
+    assert not fork.workspace_isolated
+    with pytest.raises(ValueError, match="latest"):
+        bundle.runtime.fork(replace(request, source_turn=replace(first.turn_locator, turn_id="historical")))
+    with bundle.runtime.maintenance(session.session_id):
+        with pytest.raises(RuntimeError, match="maintenance"):
+            bundle.runtime.resume(_request(context, workdir, prompt="second", session=session))
+        assert not bundle.runtime.is_session_stable(session.session_id)
+        with pytest.raises(RuntimeError, match="idle"):
+            bundle.artifacts.capture(ArtifactCaptureRequest(session=session, snapshot_root=str(tmp_path / "busy-snapshot")))
+    baseline = {}
+    result = bundle.context.compact(ProviderContextCompactionRequest(session=session, trigger="manual",
+        execution_context=context, on_started=lambda data, op: baseline.update(data)))
+    assert result.status == "compacted"
+    reconciled = bundle.context.reconcile(ProviderContextReconcileRequest(session=session,
+        execution_context=context, baseline=baseline))
+    assert reconciled.provider_operation_id == result.provider_operation_id
+    bundle.runtime.mark_unstable(session.session_id)
+    assert bundle.context.reconcile(ProviderContextReconcileRequest(session=session,
+        execution_context=context, baseline=baseline)) is None
+
+
+def test_steer_rejects_startup_accepts_active_prompt_and_rejects_terminal(tmp_path: Path) -> None:
+    from agent_runtime_kit.agent.providers.grok_runtime import GrokProviderRunHandle
+
+    bundle, context, workdir = _setup(tmp_path)
+    control = ProviderControlRequest(action=ProviderControlAction.STEER, requested_at="now", content="STEERED")
+    not_started = GrokProviderRunHandle(request=_request(context, workdir, prompt="x"), resume=False, on_done=lambda h: None)
+    assert not not_started.control(control).accepted
+    handle = bundle.runtime.start(_request(context, workdir, prompt="steer-test"))
+    deadline = time.monotonic() + 5
+    while not handle._prompt_active and time.monotonic() < deadline:
+        time.sleep(0.01)
+    receipt = handle.control(control)
+    assert receipt.accepted and not receipt.terminal_confirmed
+    result = handle.wait_terminal(10)
+    assert result.final_text == "STEERED"
+    assert not handle.control(control).accepted
+
+
+def test_compact_cleanup_failure_does_not_authorize_reconciliation(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    from agent_runtime_kit.agent.providers.grok_acp import GrokAcpProcess
+
+    bundle, context, workdir = _setup(tmp_path)
+    first = bundle.runtime.start(_request(context, workdir, prompt="first")).wait_terminal(10)
+    original = GrokAcpProcess.close_process_group
+    def fail_after_cleanup(process, **kwargs):  # noqa: ANN001, ANN202
+        original(process, **kwargs)
+        raise RuntimeError("injected unconfirmed cleanup")
+    monkeypatch.setattr(GrokAcpProcess, "close_process_group", fail_after_cleanup)
+    baseline = {}
+    with pytest.raises(RuntimeError, match="unconfirmed cleanup"):
+        bundle.context.compact(ProviderContextCompactionRequest(session=first.session_locator, trigger="manual",
+            execution_context=context, on_started=lambda data, op: baseline.update(data)))
+    assert not bundle.runtime.is_session_stable(first.session_locator.session_id)
+    assert bundle.context.reconcile(ProviderContextReconcileRequest(session=first.session_locator,
+        execution_context=context, baseline=baseline)) is None
+
+
+def test_compact_response_loss_keeps_service_journal_and_reconciles(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    binary = _fixture_binary(tmp_path)
+    monkeypatch.setattr("agent_runtime_kit.agent.providers.grok_home.GROK_BINARY_SHA256",
+        __import__("hashlib").sha256(binary.read_bytes()).hexdigest())
+    bundle = build_grok_provider_bundle(runtime_root=tmp_path / "runtime", binary_path=binary)
+    types = AgentTypeRegistry()
+    types.register(_GrokStepAgent())
+    service = AgentService(tmp_path / "runtime", agent_types=types, provider_registry=ProviderRegistry((bundle,)))
+    service.home_service.create_home(ProviderHomeSpec(provider_type="grok", home_id="demo",
+        provider_options=GrokHomeOptions(auth_json_path=None)))
+    agent = service.create_agent("scope", "grok-step-agent", home_id="demo")
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    service.start_agent(agent.agent_id, prompt="first", workdir=str(workdir))
+    service.wait_agent(agent.agent_id, timeout_s=10)
+    child = service.fork_agent(agent.agent_id)
+    assert child.session_locator.session_id != service.get_agent(agent.agent_id).session_locator.session_id
+    with pytest.raises(TimeoutError):
+        service.compact_agent(agent.agent_id, workdir=str(workdir), timeout_s=0.1,
+            env={"GROK_FIXTURE_COMPACT_LOSE_RESPONSE": "1"})
+    journal = service.store.read_context_maintenance(agent.agent_id)
+    assert journal.status.value == "unknown_terminal"
+    assert journal.baseline == {"completed_checkpoints": []}
+    context = service.home_service.build_execution_context("grok", "demo", workdir=str(workdir))
+    result = bundle.context.reconcile(ProviderContextReconcileRequest(
+        session=service.get_agent(agent.agent_id).session_locator, execution_context=context, baseline=journal.baseline))
+    assert result.status == "compacted"

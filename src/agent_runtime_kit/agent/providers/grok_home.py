@@ -27,6 +27,7 @@ from ..provider_contracts import (
     build_provider_payload,
 )
 from ..store_utils import read_json, write_json_atomic
+from ..skills import SkillSpec, write_skill_spec
 
 if TYPE_CHECKING:
     from ..homes import HomeRecord
@@ -80,8 +81,16 @@ class GrokHomeRenderer:
             errors.append("Grok base_config is unsupported; use typed Home options and mcp_servers")
         if spec.config_overrides:
             errors.append("Grok raw config_overrides are unsupported")
-        if spec.skills:
-            errors.append("Grok skills are unsupported by the isolated curated profile")
+        names = []
+        for skill in spec.skills:
+            if not isinstance(skill, SkillSpec):
+                errors.append("Grok skills must be explicit SkillSpec objects")
+            elif not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", skill.name):
+                errors.append("Grok skill names must be canonical lowercase names with hyphens")
+            else:
+                names.append(skill.name)
+        if len(names) != len(set(names)):
+            errors.append("duplicate Grok skill names")
         if spec.extensions:
             errors.append("Grok extensions are unsupported by the isolated curated profile")
         options = spec.provider_options
@@ -129,6 +138,11 @@ class GrokHomeRenderer:
 
         mcp_servers = tuple(spec.mcp_servers)
         config_text = _render_mcp_config(mcp_servers)
+        if spec.skills:
+            skills_root = ark_root / "grok-skills"
+            for skill in spec.skills:
+                write_skill_spec(skill, skills_root / skill.name)
+            config_text += "\n[skills]\npaths = [" + json.dumps(str(skills_root)) + "]\n"
         (grok_root / "config.toml").write_text(config_text, encoding="utf-8")
         (ark_root / "grok-config-authority.toml").write_text(config_text, encoding="utf-8")
         tools = list(_resolve_tools(spec, options, []))
@@ -140,8 +154,9 @@ class GrokHomeRenderer:
         profile = {
             "name": "agent-runtime-kit",
             "description": "Bounded ARK provider session",
-            "discoverSkills": False,
+            "discoverSkills": bool(spec.skills),
             "inheritSkills": False,
+            "skills": [skill.name for skill in spec.skills],
             "agentsMd": True,
             "injectDefaultTools": False,
             "toolConfig": {"tools": [{"id": f"GrokBuild:{tool}"} for tool in tools]},
@@ -164,6 +179,7 @@ class GrokHomeRenderer:
             "model": options.model,
             "reasoning_effort": options.reasoning_effort,
             "tools": tools,
+            "skills": [skill.name for skill in spec.skills],
             "mcp_server_names": [str(getattr(server, "name", "")) for server in mcp_servers],
             "required_mcp_server_names": [
                 str(getattr(server, "name", ""))
@@ -286,6 +302,8 @@ class GrokHomeRenderer:
             path = root / item.relpath
             if not path.is_file() or _sha256(path) != item.sha256:
                 raise RuntimeError(f"Grok Home materialized file changed: {item.relpath}")
+        if {item.relpath for item in manifest.generated_files} != {item.relpath for item in _describe_generated_files(root)}:
+            raise RuntimeError("Grok Home managed file set changed")
         runtime = _runtime_config(root)
         _validate_auth_link(root / ".grok" / "auth.json", runtime.get("auth_json_path"))
         env = dict(os.environ)
@@ -314,12 +332,13 @@ class GrokHomeRenderer:
         )
 
 
-def validate_grok_workdir(workdir: Path) -> None:
+def validate_grok_workdir(workdir: Path, *, managed_skills: bool = False) -> None:
     canonical = Path(workdir).resolve(strict=True)
     root = _git_root(canonical)
     current = canonical
     while True:
-        for marker in _PROJECT_CONFIG_MARKERS:
+        skill_markers = (".grok/skills", ".grok/commands", ".agents/skills", ".agents/commands") if managed_skills else ()
+        for marker in (*_PROJECT_CONFIG_MARKERS, *skill_markers):
             candidate = current / marker
             try:
                 candidate.lstat()
@@ -468,6 +487,14 @@ def _describe_generated_files(root: Path) -> tuple[HomeMaterializedFile, ...]:
         path = root / relpath
         if path.is_file():
             files.append(HomeMaterializedFile(relpath=relpath, sha256=_sha256(path)))
+    skills_root = root / ".ark" / "grok-skills"
+    if skills_root.is_symlink():
+        raise ValueError("Grok managed skill root must not be a symlink")
+    for path in sorted(skills_root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("Grok managed skills must not contain symlinks")
+        if path.is_file():
+            files.append(HomeMaterializedFile(relpath=str(path.relative_to(root)), sha256=_sha256(path)))
     return tuple(files)
 
 
@@ -546,6 +573,7 @@ def _home_capabilities(home_id: str, has_mcp: bool) -> ProviderCapabilities:
         CapabilityKey.HOME_ENV,
         CapabilityKey.HOME_AUTH_REFS,
         CapabilityKey.HOME_INSTRUCTIONS,
+        CapabilityKey.HOME_SKILLS,
     ):
         supports[key] = CapabilitySupport(
             capability=key,
