@@ -19,6 +19,7 @@ class FakeCodex:
     created: list["FakeCodex"] = []
     account_calls = 0
     account_delay_s = 0.0
+    thread_start_callback = None
 
     def __init__(self, config=None) -> None:
         self.config = config
@@ -50,6 +51,8 @@ class FakeCodex:
 
     def thread_start(self, **kwargs):
         self._client.thread_start_calls.append(dict(kwargs))
+        if type(self).thread_start_callback is not None:
+            type(self).thread_start_callback(self.config)
         return FakeHighLevelThread("thread-started")
 
     def thread_resume(self, thread_id: str, **kwargs):
@@ -714,6 +717,66 @@ def test_agent_service_commits_session_start_home_only_for_new_session(
     assert commits == [("codex", "live-locator", "session_start")]
 
 
+def test_agent_service_serializes_codex_home_session_start_materialization(
+    tmp_path: Path,
+) -> None:
+    _reset_fake_codex()
+    runtime_root = tmp_path / "runtime"
+    provider = _provider()
+    registry = AgentTypeRegistry()
+    registry.register(LiveLocatorAgentType())
+    service = AgentService(
+        runtime_root,
+        agent_types=registry,
+        provider_registry=ProviderRegistry(
+            (build_codex_provider_bundle(provider, runtime_root=runtime_root),)
+        ),
+    )
+    service.home_service.create_home(
+        ProviderHomeSpec(
+            provider_type="codex",
+            home_id="live-locator",
+            config_overrides={"model": "gpt-test"},
+        )
+    )
+    home_root = service.home_service.resolve_home_root("codex", "live-locator")
+    config_path = home_root / ".codex" / "config.toml"
+    first_start_mutated = threading.Event()
+    release_first_start = threading.Event()
+    callback_lock = threading.Lock()
+    callback_count = 0
+
+    def mutate_first_session_start(config) -> None:  # noqa: ANN001
+        nonlocal callback_count
+        with callback_lock:
+            callback_count += 1
+            current = callback_count
+        if current != 1:
+            return
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8") + "\n# managed session-start mutation\n",
+            encoding="utf-8",
+        )
+        first_start_mutated.set()
+        assert release_first_start.wait(timeout=5)
+
+    FakeCodex.thread_start_callback = mutate_first_session_start
+    first = service.create_agent("scope-a", "live-locator")
+    second = service.create_agent("scope-b", "live-locator")
+
+    service.start_agent(first.agent_id, variables={"item": "first"})
+    assert first_start_mutated.wait(timeout=5)
+    service.start_agent(second.agent_id, variables={"item": "second"})
+    assert service.get_agent(second.agent_id).status == "running"
+    release_first_start.set()
+
+    service.wait_agent(first.agent_id, timeout_s=5)
+    service.wait_agent(second.agent_id, timeout_s=5)
+    assert service.get_agent(first.agent_id).last_completion is not None
+    assert service.get_agent(second.agent_id).last_completion is not None
+    service.home_service.build_execution_context("codex", "live-locator")
+
+
 def test_agent_service_interrupt_waits_until_codex_turn_is_terminal(tmp_path: Path) -> None:
     _reset_fake_codex()
     started = threading.Event()
@@ -928,6 +991,7 @@ def _reset_fake_codex() -> None:
     FakeCodex.created.clear()
     FakeCodex.account_calls = 0
     FakeCodex.account_delay_s = 0.0
+    FakeCodex.thread_start_callback = None
     FakeHighLevelThread.run_started = None
     FakeHighLevelThread.run_release = None
     FakeHighLevelThread.compact_callback = None

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from threading import RLock
+from threading import Lock, RLock
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -24,6 +24,27 @@ MCP_RESULT_PROFILES = frozenset({"content_only", "dual"})
 class HomeRef:
     provider_type: str
     home_id: str
+
+
+@dataclass
+class HomeSessionStartTransition:
+    provider_type: str
+    home_id: str
+    _lock: object = field(repr=False)
+    _release_guard: RLock = field(default_factory=RLock, repr=False)
+    _released: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def active(self) -> bool:
+        with self._release_guard:
+            return not self._released
+
+    def release(self) -> None:
+        with self._release_guard:
+            if self._released:
+                return
+            self._released = True
+            self._lock.release()
 
 
 @dataclass
@@ -279,10 +300,25 @@ class HomeService:
         self.renderers = dict(renderers)
         self._materialization_locks: dict[tuple[str, str], object] = {}
         self._materialization_locks_guard = RLock()
+        self._session_start_locks: dict[tuple[str, str], object] = {}
+        self._session_start_locks_guard = RLock()
 
     def _materialization_lock(self, provider_type: str, home_id: str):
         with self._materialization_locks_guard:
             return self._materialization_locks.setdefault((provider_type, home_id), RLock())
+
+    def _session_start_lock(self, provider_type: str, home_id: str):
+        with self._session_start_locks_guard:
+            return self._session_start_locks.setdefault((provider_type, home_id), Lock())
+
+    def begin_session_start_transition(
+        self,
+        provider_type: str,
+        home_id: str,
+    ) -> HomeSessionStartTransition:
+        lock = self._session_start_lock(provider_type, home_id)
+        lock.acquire()
+        return HomeSessionStartTransition(provider_type, home_id, lock)
 
     def create_home(self, spec: ProviderHomeSpec) -> HomeRecord:
         provider_type = spec.provider_type.strip()
@@ -381,6 +417,36 @@ class HomeService:
         *,
         run_env: Mapping[str, str] | None = None,
         workdir: str | None = None,
+        session_start_transition: HomeSessionStartTransition | None = None,
+    ) -> object:
+        if session_start_transition is not None:
+            if (
+                session_start_transition.provider_type != provider_type
+                or session_start_transition.home_id != home_id
+                or not session_start_transition.active
+            ):
+                raise ValueError("invalid Home session-start transition")
+            return self._build_execution_context(
+                provider_type,
+                home_id,
+                run_env=run_env,
+                workdir=workdir,
+            )
+        with self._session_start_lock(provider_type, home_id):
+            return self._build_execution_context(
+                provider_type,
+                home_id,
+                run_env=run_env,
+                workdir=workdir,
+            )
+
+    def _build_execution_context(
+        self,
+        provider_type: str,
+        home_id: str,
+        *,
+        run_env: Mapping[str, str] | None,
+        workdir: str | None,
     ) -> object:
         with self._materialization_lock(provider_type, home_id):
             renderer = self.renderers.get(provider_type)

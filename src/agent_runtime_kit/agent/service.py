@@ -28,7 +28,7 @@ from .context import (
     AgentContextMaintenanceView,
     AgentContextUsage,
 )
-from .homes import HomeRecord, HomeService
+from .homes import HomeRecord, HomeService, HomeSessionStartTransition
 from .models import (
     Agent,
     AgentAlreadyRunningError,
@@ -282,6 +282,7 @@ class AgentService:
         *,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
+        session_start_transition: HomeSessionStartTransition | None = None,
     ) -> object | None:
         bundle = self._provider_bundle(provider_type)
         home = self.home_service.get_home(provider_type, home_id)
@@ -290,6 +291,7 @@ class AgentService:
             home_id,
             run_env=env,
             workdir=workdir,
+            session_start_transition=session_start_transition,
         )
         result = bundle.home_renderer.initialize(home, context)
         if result.materialization_changed:
@@ -525,84 +527,99 @@ class AgentService:
         env: dict[str, str] | None,
         workdir: str | None,
     ) -> AgentTurnResult:
-        try:
-            bundle = self._provider_bundle(agent.provider_type)
-            self.ensure_provider_home_initialized(
+        session_locator = agent.session_locator
+        session_start_transition = None
+        if agent.provider_type == "codex" and session_locator is None:
+            session_start_transition = self.home_service.begin_session_start_transition(
                 agent.provider_type,
                 agent.home_id,
-                env=env,
-                workdir=workdir,
             )
-        except (MissingProviderEnvError, ProviderCapabilityUnavailable) as exc:
-            raise AgentProviderUnavailable(
-                provider_type=agent.provider_type,
-                provider_error_type=type(exc).__name__,
-                code=None,
-                retryable=False,
-            ) from exc
-        execution_context = self.home_service.build_execution_context(
-            agent.provider_type,
-            agent.home_id,
-            run_env=env,
-            workdir=workdir,
-        )
-        session_locator = agent.session_locator
-        session_start_home_commit: Callable[[], None] | None = None
-        if session_locator is None or agent.provider_type == "grok":
-            def session_start_home_commit() -> None:
-                self._commit_session_start_home_materialization(
+        try:
+            try:
+                bundle = self._provider_bundle(agent.provider_type)
+                self.ensure_provider_home_initialized(
                     agent.provider_type,
                     agent.home_id,
+                    env=env,
+                    workdir=workdir,
+                    session_start_transition=session_start_transition,
                 )
-        request = ProviderRunRequest(
-            agent_id=agent.agent_id,
-            scope_id=agent.scope_id,
-            agent_type=agent.agent_type,
-            provider_type=agent.provider_type,
-            home_id=agent.home_id,
-            session_locator=session_locator,
-            prompt=prompt,
-            developer_instructions=developer_instructions,
-            replace_developer_instructions=overwrite_developer_instructions,
-            workdir=workdir,
-            environment=execution_context.process_environment,
-            model_overrides=execution_context.resolved_defaults,
-            metadata={"agent_created_at": agent.created_at},
-            event_sink=lambda event: self._on_provider_event(agent.agent_id, event),
-            session_start_home_commit=session_start_home_commit,
-            execution_context=execution_context,
-        )
-        active.handle_ready.clear()
-        try:
-            handle = (
-                bundle.runtime.resume(request)
-                if session_locator is not None
-                else bundle.runtime.start(request)
+            except (MissingProviderEnvError, ProviderCapabilityUnavailable) as exc:
+                raise AgentProviderUnavailable(
+                    provider_type=agent.provider_type,
+                    provider_error_type=type(exc).__name__,
+                    code=None,
+                    retryable=False,
+                ) from exc
+            execution_context = self.home_service.build_execution_context(
+                agent.provider_type,
+                agent.home_id,
+                run_env=env,
+                workdir=workdir,
+                session_start_transition=session_start_transition,
             )
-        except (MissingProviderEnvError, ProviderCapabilityUnavailable) as exc:
-            raise AgentProviderUnavailable(
+            session_start_home_commit: Callable[[], None] | None = None
+            if session_locator is None or agent.provider_type == "grok":
+                def session_start_home_commit() -> None:
+                    try:
+                        self._commit_session_start_home_materialization(
+                            agent.provider_type,
+                            agent.home_id,
+                        )
+                    finally:
+                        if session_start_transition is not None:
+                            session_start_transition.release()
+            request = ProviderRunRequest(
+                agent_id=agent.agent_id,
+                scope_id=agent.scope_id,
+                agent_type=agent.agent_type,
                 provider_type=agent.provider_type,
-                provider_error_type=type(exc).__name__,
-                code=None,
-                retryable=False,
-            ) from exc
-        active.provider_handle = handle
-        active.handle_ready.set()
-        locator = handle.session_locator()
-        if locator is not None:
-            self.store.update_session_locators(
-                agent.agent_id,
-                session_locator=locator,
+                home_id=agent.home_id,
+                session_locator=session_locator,
+                prompt=prompt,
+                developer_instructions=developer_instructions,
+                replace_developer_instructions=overwrite_developer_instructions,
+                workdir=workdir,
+                environment=execution_context.process_environment,
+                model_overrides=execution_context.resolved_defaults,
+                metadata={"agent_created_at": agent.created_at},
+                event_sink=lambda event: self._on_provider_event(agent.agent_id, event),
+                session_start_home_commit=session_start_home_commit,
+                execution_context=execution_context,
             )
-        provider_result = handle.wait_terminal()
-        standard_result = AgentTurnResult(
-            agent_id=agent.agent_id,
-            scope_id=agent.scope_id,
-            agent_type=agent.agent_type,
-            home_id=agent.home_id,
-            provider_result=provider_result,
-        )
-        return standard_result
+            active.handle_ready.clear()
+            try:
+                handle = (
+                    bundle.runtime.resume(request)
+                    if session_locator is not None
+                    else bundle.runtime.start(request)
+                )
+            except (MissingProviderEnvError, ProviderCapabilityUnavailable) as exc:
+                raise AgentProviderUnavailable(
+                    provider_type=agent.provider_type,
+                    provider_error_type=type(exc).__name__,
+                    code=None,
+                    retryable=False,
+                ) from exc
+            active.provider_handle = handle
+            active.handle_ready.set()
+            locator = handle.session_locator()
+            if locator is not None:
+                self.store.update_session_locators(
+                    agent.agent_id,
+                    session_locator=locator,
+                )
+            provider_result = handle.wait_terminal()
+            return AgentTurnResult(
+                agent_id=agent.agent_id,
+                scope_id=agent.scope_id,
+                agent_type=agent.agent_type,
+                home_id=agent.home_id,
+                provider_result=provider_result,
+            )
+        finally:
+            if session_start_transition is not None:
+                session_start_transition.release()
 
     def _commit_session_start_home_materialization(
         self,
