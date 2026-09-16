@@ -10,8 +10,17 @@ from agent_runtime_kit.agent.providers.codex import (
 )
 
 
-def failure(details='lc_app: MCP client startup timed out after 30s', operation='resuming'):
-    return InternalRpcError(-32603, f'error {operation} thread: required MCP servers failed to initialize: {details}')
+def failure(
+    details='lc_app: MCP client startup timed out after 30s',
+    operation='resuming',
+    fatal=False,
+):
+    startup = 'Fatal error: Failed to initialize session: ' if fatal else ''
+    return InternalRpcError(
+        -32603,
+        f'error {operation} thread: {startup}'
+        f'required MCP servers failed to initialize: {details}',
+    )
 
 
 @pytest.mark.parametrize('method', ['thread/start', 'thread/resume'])
@@ -43,6 +52,11 @@ def test_repeated_timeout_preserves_exception_and_final_attempt_diagnostics():
     InternalRpcError(-32603, 'thread operation timed out after 30s'),
     TransportClosedError('closed'),
     failure('lc_app: MCP client startup timed out after 30s; lc_submit: unauthorized'),
+    failure('lc_app: timed out handshaking with MCP server after 30s; lc_submit: unauthorized'),
+    failure(
+        'lc_app: timed out handshaking with MCP server after 30s; lc_submit: unauthorized',
+        fatal=True,
+    ),
     failure('lc_app: timed out waiting for MCP event stream response headers'),
     failure('lc_app: MCP startup cancelled'),
     failure('lc_app: arbitrary failure with secret-token-sentinel'),
@@ -68,6 +82,32 @@ def test_both_servers_and_fractional_timeout_are_classified_without_raw_names():
     safe = str(exception_diagnostics(error))
     assert 'private_server' not in safe and 'secret-token-sentinel' not in safe
     assert 'required_mcp_startup_failed' in safe
+
+
+def test_rmcp_handshake_timeout_is_classified_for_bounded_retry():
+    result = _required_mcp_startup_failure(failure(
+        'lc_app: timed out handshaking with MCP server after 30s; '
+        'lc_submit: timed out handshaking with MCP server after 1.5s'))
+    assert result == {
+        'rpc_category': 'required_mcp_startup_timeout',
+        'rpc_mcp_failure_count': 2,
+        'rpc_mcp_lc_app': True,
+        'rpc_mcp_lc_submit': True,
+    }
+
+
+def test_nested_session_initialization_handshake_timeout_is_classified():
+    result = _required_mcp_startup_failure(failure(
+        'lc_app: timed out handshaking with MCP server after 30s; '
+        'lc_submit: timed out handshaking with MCP server after 1.5s',
+        fatal=True,
+    ))
+    assert result == {
+        'rpc_category': 'required_mcp_startup_timeout',
+        'rpc_mcp_failure_count': 2,
+        'rpc_mcp_lc_app': True,
+        'rpc_mcp_lc_submit': True,
+    }
 
 
 def test_policy_can_disable_session_retry():

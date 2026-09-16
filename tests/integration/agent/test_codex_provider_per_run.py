@@ -1069,7 +1069,17 @@ def test_thread_start_rpc_diagnostics_do_not_retry_or_expose_message(tmp_path, m
 
 
 @pytest.mark.parametrize('mode', ['start', 'resume', 'overwrite'])
-def test_required_mcp_initialization_retry_never_duplicates_turn(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize('timeout_reason', [
+    'MCP client startup timed out after 30s',
+    'timed out handshaking with MCP server after 30s',
+])
+@pytest.mark.parametrize('startup_wrapper', [
+    '',
+    'Fatal error: Failed to initialize session: ',
+])
+def test_required_mcp_initialization_retry_never_duplicates_turn(
+    tmp_path, monkeypatch, mode, timeout_reason, startup_wrapper,
+):
     from openai_codex.errors import InternalRpcError
     _reset_fake_codex()
     provider = _provider()
@@ -1082,7 +1092,11 @@ def test_required_mcp_initialization_retry_never_duplicates_turn(tmp_path, monke
         calls.append(1)
         if len(calls) == 1:
             operation = 'creating' if mode == 'start' else 'resuming'
-            raise InternalRpcError(-32603, f'error {operation} thread: required MCP servers failed to initialize: lc_submit: MCP client startup timed out after 30s')
+            raise InternalRpcError(
+                -32603,
+                f'error {operation} thread: {startup_wrapper}'
+                f'required MCP servers failed to initialize: lc_submit: {timeout_reason}',
+            )
         return original(self, *args, **kwargs)
     monkeypatch.setattr(target, method, initialize)
     home = tmp_path / 'home'

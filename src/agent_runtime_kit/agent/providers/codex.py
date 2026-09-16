@@ -28,6 +28,14 @@ from .codex_context import (
 )
 
 
+_REQUIRED_MCP_STARTUP_RE = re.compile(
+    r"error (?:creating|resuming) thread: "
+    r"(?:Fatal error: Failed to initialize session: )?"
+    r"required MCP servers failed to initialize: (.+)",
+    flags=re.DOTALL,
+)
+
+
 def _required_mcp_startup_failure(exc: Exception) -> dict[str, object] | None:
     """Recognize server-rejected initialization, never arbitrary RPC timeouts.
 
@@ -40,11 +48,7 @@ def _required_mcp_startup_failure(exc: Exception) -> dict[str, object] | None:
     message = getattr(exc, "message", None)
     if not isinstance(message, str) or len(message) > 16384:
         return None
-    match = re.fullmatch(
-        r"error (?:creating|resuming) thread: required MCP servers failed to initialize: (.+)",
-        message,
-        flags=re.DOTALL,
-    )
+    match = _REQUIRED_MCP_STARTUP_RE.fullmatch(message)
     if match is None:
         return None
     failures = match[1].split("; ")
@@ -56,7 +60,11 @@ def _required_mcp_startup_failure(exc: Exception) -> dict[str, object] | None:
             known_servers.add(server)
         if not separator or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", server) is None:
             timeout_only = False
-        if re.fullmatch(r"MCP client startup timed out after [0-9]+(?:\.[0-9]+)?(?:ms|s)", reason) is None:
+        timeout_patterns = (
+            r"MCP client startup timed out after [0-9]+(?:\.[0-9]+)?(?:ms|s)",
+            r"timed out handshaking with MCP server after [0-9]+(?:\.[0-9]+)?(?:ms|s)",
+        )
+        if not any(re.fullmatch(pattern, reason) for pattern in timeout_patterns):
             timeout_only = False
     return {
         "rpc_category": "required_mcp_startup_timeout" if timeout_only else "required_mcp_startup_failed",

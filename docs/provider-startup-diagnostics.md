@@ -27,7 +27,7 @@ Scheduler admission failures now pause the runtime before terminating a semantic
 
 Codex thread creation and resume now identify an explicit required-MCP initialization failure without exposing its raw message. Diagnostics include a fixed category, failure count, and booleans for the LC application and submission servers. Unknown RPC failures remain unclassified.
 
-Only an explicit aggregate containing exclusively `MCP client startup timed out` failures may be retried once before any turn starts. The retry delay is at most 30 seconds and the existing retry policy may disable it. Authentication errors, mixed failures, transport disconnects and generic `-32603` errors are not replayed by this gate. Exhaustion preserves the exception and attempt count for suspended-Step recovery. This does not retroactively classify historical errors or prove that MCP endpoint latency has been resolved.
+Only an explicit aggregate containing exclusively known startup or handshake timeout failures may be retried once before any turn starts. The parser accepts the direct Codex wrapper and the fixed `Fatal error: Failed to initialize session` wrapper emitted by Codex 0.154, while still requiring a complete message match. The retry delay is at most 30 seconds and the existing retry policy may disable it. Authentication errors, mixed failures, transport disconnects and generic `-32603` errors are not replayed by this gate. Exhaustion preserves the exception and attempt count for suspended-Step recovery. This does not retroactively classify historical errors or prove that MCP endpoint latency has been resolved.
 
 ### Unclassified Codex RPC message indicators
 
