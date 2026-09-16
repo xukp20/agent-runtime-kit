@@ -12,6 +12,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from agent_runtime_kit.agent.diagnostics import exception_diagnostics
 from agent_runtime_kit.agent.models import (
     AgentCompletionCheckError,
     AgentContextCompactionTimeout,
@@ -635,7 +636,10 @@ class FlowService:
             elif (
                 step.status is StepStatus.SUSPENDED
                 and step.submission is None
-                and flow.status is FlowStatus.RUNNING
+                and (
+                    flow.status is FlowStatus.RUNNING
+                    or (flow.status is FlowStatus.CREATED and step.started_at is not None)
+                )
                 and flow.current_step_id == step_id
             ):
                 actions.append("resume_suspended")
@@ -1585,6 +1589,7 @@ def _agent_step_exception_error(exc: Exception) -> BaseStepError:
         message=message,
         details={
             "exception_type": type(exc).__name__,
+            "diagnostics": exception_diagnostics(exc),
             "category": category,
             "retryable": None,
             "operator_action_required": True,

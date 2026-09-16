@@ -445,3 +445,41 @@ def test_compact_response_loss_keeps_service_journal_and_reconciles(tmp_path: Pa
     result = bundle.context.reconcile(ProviderContextReconcileRequest(
         session=service.get_agent(agent.agent_id).session_locator, execution_context=context, baseline=journal.baseline))
     assert result.status == "compacted"
+
+
+def test_session_identity_survives_home_commit_failure(tmp_path: Path) -> None:
+    from agent_runtime_kit.agent.diagnostics import exception_diagnostics
+
+    bundle, context, workdir = _setup(tmp_path)
+    events = []
+
+    def fail_commit():
+        raise RuntimeError("Grok Home materialization manifest hash mismatch")
+
+    request = replace(
+        _request(context, workdir, prompt="must not start"),
+        session_start_home_commit=fail_commit,
+        event_sink=events.append,
+    )
+    handle = bundle.runtime.start(request)
+    with pytest.raises(RuntimeError) as failure:
+        handle.wait_terminal()
+    diagnostics = exception_diagnostics(failure.value)
+    assert diagnostics["stage"] == "home_session_start_commit"
+    assert diagnostics["code"] == "grok_home_manifest_mismatch"
+    created = next(event for event in events if event.kind == "session.created")
+    locator = created.data["session_locator"]
+    assert locator.native_locator["workdir"] == str(workdir)
+    assert locator.backend_identity == context.resolved_defaults
+    assert not any(event.kind == "turn.accepted" for event in events)
+
+
+def test_resume_commits_verified_home_lifecycle(tmp_path: Path) -> None:
+    bundle, context, workdir = _setup(tmp_path)
+    first = bundle.runtime.start(_request(context, workdir, prompt="first")).wait_terminal()
+    commits = []
+    request = replace(_request(context, workdir, prompt="second", session=first.session_locator),
+                      session_start_home_commit=lambda: commits.append("committed"))
+    result = bundle.runtime.resume(request).wait_terminal()
+    assert result.status is ProviderRunState.COMPLETED
+    assert commits == ["committed"]

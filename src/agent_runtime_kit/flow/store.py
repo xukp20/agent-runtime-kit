@@ -219,44 +219,44 @@ class FlowStepStore:
         with self.lock:
             scope_key = encode_scope_id(scope_id)
             self._ensure_scope_schema(scope_key)
-            with sqlite3.connect(self._scope_index_path(scope_key)) as conn:
-                conn.execute("delete from flows")
-                conn.execute("delete from steps")
-            flows_dir = self.scopes_root / scope_key / "flows"
-            if not flows_dir.exists():
-                return
-            for flow_json in sorted(flows_dir.glob("*/flow.json")):
-                flow = self._flow_from_payload(read_json(flow_json))
-                self._upsert_flow_scope_index(flow)
-                for step_json in sorted(flow_json.parent.glob("steps/*/step.json")):
-                    step = self._step_from_payload(read_json(step_json))
-                    self._upsert_step_scope_index(step, flow)
+            flows, steps = self._collect_index_records([scope_id])
+            self._replace_index(self._scope_index_path(scope_key), flows, steps)
 
     def rebuild_global_index(self) -> None:
         with self.lock:
             self._ensure_global_schema()
-            with sqlite3.connect(self.global_index_path) as conn:
-                conn.execute("delete from flows")
-                conn.execute("delete from steps")
-            seen_flows: set[str] = set()
-            seen_steps: set[str] = set()
-            for scope_id in self.list_scope_ids():
-                scope_key = encode_scope_id(scope_id)
-                flows_dir = self.scopes_root / scope_key / "flows"
-                if not flows_dir.exists():
-                    continue
-                for flow_json in sorted(flows_dir.glob("*/flow.json")):
-                    flow = self._flow_from_payload(read_json(flow_json))
-                    if flow.flow_id in seen_flows:
-                        raise FlowStepStoreError(f"duplicate flow_id while rebuilding global index: {flow.flow_id}")
-                    seen_flows.add(flow.flow_id)
-                    self._upsert_flow_global_index(flow)
-                    for step_json in sorted(flow_json.parent.glob("steps/*/step.json")):
-                        step = self._step_from_payload(read_json(step_json))
-                        if step.step_id in seen_steps:
-                            raise FlowStepStoreError(f"duplicate step_id while rebuilding global index: {step.step_id}")
-                        seen_steps.add(step.step_id)
-                        self._upsert_step_global_index(step, flow)
+            flows, steps = self._collect_index_records(self.list_scope_ids())
+            self._replace_index(self.global_index_path, flows, steps)
+
+    def _collect_index_records(self, scope_ids):
+        flows, steps = [], []
+        seen_flows, seen_steps = set(), set()
+        for scope_id in scope_ids:
+            flows_dir = self.scopes_root / encode_scope_id(scope_id) / "flows"
+            for flow_json in sorted(flows_dir.glob("*/flow.json")):
+                flow = self._flow_from_payload(read_json(flow_json))
+                if flow.flow_id in seen_flows:
+                    raise FlowStepStoreError(f"duplicate flow_id while rebuilding global index: {flow.flow_id}")
+                seen_flows.add(flow.flow_id)
+                flows.append(flow)
+                for step_json in sorted(flow_json.parent.glob("steps/*/step.json")):
+                    step = self._step_from_payload(read_json(step_json))
+                    if step.step_id in seen_steps:
+                        raise FlowStepStoreError(f"duplicate step_id while rebuilding global index: {step.step_id}")
+                    seen_steps.add(step.step_id)
+                    steps.append((step, flow))
+        return flows, steps
+
+    def _replace_index(self, path, flows, steps):
+        # Parse before opening the transaction; readers retain the previous index
+        # until the complete replacement commits.
+        with sqlite3.connect(path) as conn:
+            conn.execute("delete from flows")
+            conn.execute("delete from steps")
+            for flow in flows:
+                _upsert_flow_row(conn, flow, encode_scope_id(flow.scope_id), self._flow_relpath(flow))
+            for step, flow in steps:
+                _upsert_step_row(conn, step, flow, encode_scope_id(step.scope_id), self._step_relpath(step))
 
     def rebuild_all_indexes(self) -> None:
         for scope_id in self.list_scope_ids():

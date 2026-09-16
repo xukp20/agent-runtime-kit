@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 import shutil
 import sys
 import threading
@@ -16,6 +17,7 @@ from ..models import (
     AgentContextCompactionEvidenceError,
     AgentContextCompactionRequestUnknown,
     AgentContextCompactionTimeout,
+    AgentProviderTurnFailed,
 )
 from ..store_utils import read_json, utc_now_iso, write_json_atomic
 from .codex_context import (
@@ -24,6 +26,86 @@ from .codex_context import (
     inspect_codex_compact_evidence,
     inspect_codex_rollout_context,
 )
+
+
+def _required_mcp_startup_failure(exc: Exception) -> dict[str, object] | None:
+    """Recognize server-rejected initialization, never arbitrary RPC timeouts.
+
+    Required-server validation fails before SessionConfigured/thread registration.
+    Accept timeout-only aggregates; mixed/unknown failures remain non-retryable.
+    Raw server names, messages, URLs and error data never leave this classifier.
+    """
+    if type(exc).__name__ != "InternalRpcError" or getattr(exc, "code", None) != -32603:
+        return None
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str) or len(message) > 16384:
+        return None
+    match = re.fullmatch(
+        r"error (?:creating|resuming) thread: required MCP servers failed to initialize: (.+)",
+        message,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        return None
+    failures = match[1].split("; ")
+    timeout_only = True
+    known_servers = set()
+    for failure in failures:
+        server, separator, reason = failure.partition(": ")
+        if server in {"lc_app", "lc_submit"}:
+            known_servers.add(server)
+        if not separator or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", server) is None:
+            timeout_only = False
+        if re.fullmatch(r"MCP client startup timed out after [0-9]+(?:\.[0-9]+)?(?:ms|s)", reason) is None:
+            timeout_only = False
+    return {
+        "rpc_category": "required_mcp_startup_timeout" if timeout_only else "required_mcp_startup_failed",
+        "rpc_mcp_failure_count": len(failures),
+        "rpc_mcp_lc_app": "lc_app" in known_servers,
+        "rpc_mcp_lc_submit": "lc_submit" in known_servers,
+    }
+
+
+@contextmanager
+def _context_rpc(method: str, *, attempt: int = 1):
+    """Attach bounded metadata only; never persist RPC message or data."""
+    started = monotonic()
+    try:
+        yield
+    except Exception as exc:
+        exc.ark_context_diagnostics = {
+            "rpc_method": method,
+            "rpc_elapsed_s": round(monotonic() - started, 3),
+            "rpc_attempt": attempt,
+            "rpc_category": (
+                "transport_closed" if type(exc).__name__ == "TransportClosedError"
+                else "server_busy" if type(exc).__name__ == "ServerBusyError"
+                else "unclassified"
+            ),
+        }
+        if failure := _required_mcp_startup_failure(exc):
+            exc.ark_context_diagnostics.update(failure)
+        # Diagnostic indicators are not retry eligibility. Never retain the text.
+        message = getattr(exc, "message", None)
+        if isinstance(message, str):
+            exc.ark_context_diagnostics["rpc_message_length"] = len(message)
+            if len(message) <= 16384:
+                lowered = message.lower()
+                for key, marker in {
+                    "rpc_message_thread_wrapper": "error resuming thread:",
+                    "rpc_message_required_mcp": "required mcp servers failed to initialize",
+                    "rpc_message_startup_timeout": "mcp client startup timed out",
+                    "rpc_message_event_stream_timeout": "timed out waiting for mcp event stream response headers",
+                    "rpc_message_handshake": "handshak",
+                    "rpc_message_timeout": "timed out",
+                    "rpc_message_lc_app": "lc_app",
+                    "rpc_message_lc_submit": "lc_submit",
+                }.items():
+                    exc.ark_context_diagnostics[key] = marker in lowered
+        code = getattr(exc, "code", None)
+        if type(code) is int:
+            exc.ark_context_diagnostics["rpc_code"] = code
+        raise
 
 
 class CodexSdkUnavailable(RuntimeError):
@@ -138,12 +220,16 @@ class CodexProvider:
         try:
             sdk = self._sdk()
             with self._new_codex(sdk, env=env, workdir=workdir) as codex:
-                thread = codex.thread_start(
-                    cwd=workdir,
-                    developer_instructions=developer_instructions,
-                    model=self.model,
-                    config=self.thread_config or None,
-                    approval_mode=self._sdk_approval_mode(sdk),
+                thread = self._initialize_session_with_retry(
+                    method="thread/start",
+                    call=lambda: codex.thread_start(
+                        cwd=workdir,
+                        developer_instructions=developer_instructions,
+                        model=self.model,
+                        config=self.thread_config or None,
+                        approval_mode=self._sdk_approval_mode(sdk),
+                    ),
+                    on_transient_retry=on_transient_retry,
                 )
                 self._update_agent_run_locator(agent_id, thread_id=thread.id)
                 if on_thread_started is not None:
@@ -206,12 +292,16 @@ class CodexProvider:
                         turn_result=turn_result,
                         thread=thread,
                     )
-                thread = codex.thread_resume(
-                    thread_id,
-                    cwd=workdir,
-                    developer_instructions=developer_instructions,
-                    model=self.model,
-                    config=self.thread_config or None,
+                thread = self._initialize_session_with_retry(
+                    method="thread/resume",
+                    call=lambda: codex.thread_resume(
+                        thread_id,
+                        cwd=workdir,
+                        developer_instructions=developer_instructions,
+                        model=self.model,
+                        config=self.thread_config or None,
+                    ),
+                    on_transient_retry=on_transient_retry,
                 )
                 turn_result = self._run_turn_with_control_handle(
                     sdk=sdk,
@@ -250,13 +340,13 @@ class CodexProvider:
             raise RuntimeError(
                 "Codex developer instruction overwrite requires a Codex SDK object with _client"
             )
-        resumed = client.thread_resume(
-            thread_id,
-            {
-                "cwd": workdir,
-                "model": self.model,
-                "config": self.thread_config or None,
-            },
+        resumed = self._initialize_session_with_retry(
+            method="thread/resume",
+            call=lambda: client.thread_resume(
+                thread_id,
+                {"cwd": workdir, "model": self.model, "config": self.thread_config or None},
+            ),
+            on_transient_retry=on_transient_retry,
         )
         response_thread = getattr(resumed, "thread", None)
         resumed_thread_id = str(getattr(response_thread, "id", thread_id))
@@ -302,6 +392,39 @@ class CodexProvider:
         )
         return thread, turn_result
 
+    def _initialize_session_with_retry(
+        self,
+        *,
+        method: str,
+        call: Callable[[], object],
+        on_transient_retry: Callable[[dict[str, object]], None] | None,
+    ) -> object:
+        # Only a definitive required-MCP timeout rejection before a turn exists
+        # permits replay. Unknown RPC/transport failures may have created a thread.
+        attempts = min(2, self.transient_retry_policy.max_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                with _context_rpc(method, attempt=attempt):
+                    return call()
+            except Exception as exc:
+                failure = _required_mcp_startup_failure(exc)
+                if (attempt >= attempts or failure is None
+                        or failure["rpc_category"] != "required_mcp_startup_timeout"):
+                    raise
+                delay = min(30.0, self.transient_retry_policy.initial_delay_s,
+                            self.transient_retry_policy.max_delay_s)
+                if on_transient_retry is not None:
+                    on_transient_retry({
+                        "classification": "required_mcp_startup_timeout",
+                        "failed_attempt": attempt, "next_attempt": attempt + 1,
+                        "max_attempts": attempts, "delay_s": delay,
+                        "error_type": type(exc).__name__, "turn_id": None,
+                        "rpc_method": method,
+                    })
+                if delay > 0:
+                    sleep(delay)
+        raise AssertionError("session initialization requires at least one attempt")
+
     def _run_turn_with_control_handle(
         self,
         sdk,
@@ -344,8 +467,14 @@ class CodexProvider:
                 turn_handle = start_turn()
             except Exception as exc:
                 classification = _classify_transient_codex_error(sdk, exc)
-                if classification is None or attempt >= policy.max_attempts:
+                if classification is None:
                     raise
+                if attempt >= policy.max_attempts:
+                    raise AgentProviderTurnFailed(
+                        provider_type="codex", provider_error_type=classification,
+                        code="codex_transient_retry_exhausted", retryable=True,
+                        session_id=thread_id,
+                    ) from exc
                 self._wait_before_transient_retry(
                     attempt=attempt,
                     classification=classification,
@@ -369,8 +498,14 @@ class CodexProvider:
                 return turn_handle.run()
             except Exception as exc:
                 classification = _classify_transient_codex_error(sdk, exc)
-                if classification is None or attempt >= policy.max_attempts:
+                if classification is None:
                     raise
+                if attempt >= policy.max_attempts:
+                    raise AgentProviderTurnFailed(
+                        provider_type="codex", provider_error_type=classification,
+                        code="codex_transient_retry_exhausted", retryable=True,
+                        session_id=thread_id, turn_id=turn_id,
+                    ) from exc
                 self._wait_before_transient_retry(
                     attempt=attempt,
                     classification=classification,
@@ -474,24 +609,29 @@ class CodexProvider:
         try:
             sdk = self._sdk()
             with self._new_codex(sdk, env=env, workdir=workdir) as codex:
-                thread = codex.thread_resume(
-                    thread_id,
-                    cwd=workdir,
-                    model=self.model,
-                    config=self.thread_config or None,
-                )
-                status = _codex_thread_status_type(thread.read(include_turns=False))
+                with _context_rpc("thread/resume"):
+                    thread = codex.thread_resume(
+                        thread_id,
+                        cwd=workdir,
+                        model=self.model,
+                        config=self.thread_config or None,
+                    )
+                with _context_rpc("thread/read"):
+                    status = _codex_thread_status_type(thread.read(include_turns=False))
                 if status != "idle":
                     raise AgentContextCompactionEvidenceError(
                         f"Codex thread is not idle before compaction: {thread_id} ({status or 'unknown'})"
                     )
                 started_at = utc_now_iso()
                 try:
-                    response = thread.compact()
+                    with _context_rpc("thread/compact/start"):
+                        response = thread.compact()
                 except BaseException as exc:
-                    raise AgentContextCompactionRequestUnknown(
+                    unknown = AgentContextCompactionRequestUnknown(
                         f"Codex compaction request terminal state is unknown: {agent_id}"
-                    ) from exc
+                    )
+                    unknown.ark_context_diagnostics = getattr(exc, "ark_context_diagnostics", {})
+                    raise unknown from exc
                 operation_id = _optional_operation_id(response)
                 if on_compaction_started is not None:
                     on_compaction_started(baseline.to_dict(), operation_id)
@@ -506,7 +646,8 @@ class CodexProvider:
                     except ValueError as exc:
                         raise AgentContextCompactionEvidenceError(str(exc)) from exc
                     if evidence.complete:
-                        status = _codex_thread_status_type(thread.read(include_turns=False))
+                        with _context_rpc("thread/read"):
+                            status = _codex_thread_status_type(thread.read(include_turns=False))
                         if status == "systemError":
                             raise AgentContextCompactionEvidenceError(
                                 f"Codex thread entered systemError after compaction: {thread_id}"
@@ -523,9 +664,19 @@ class CodexProvider:
                             )
                     remaining = deadline - monotonic()
                     if remaining <= 0:
-                        raise AgentContextCompactionTimeout(
+                        exc = AgentContextCompactionTimeout(
                             f"Codex compaction did not reach a confirmed idle terminal state: {agent_id}"
                         )
+                        exc.ark_context_diagnostics = {
+                            "wait_elapsed_s": round(timeout_s + max(0, -remaining), 3),
+                            "wait_limit_s": timeout_s,
+                            "has_new_compacted": evidence.has_new_compacted,
+                            "has_new_completion_marker": evidence.has_new_context_compacted,
+                            "has_new_token_count": evidence.has_new_token_count,
+                            "evidence_complete": evidence.complete,
+                            "provider_idle": status == "idle" if evidence.complete else False,
+                        }
+                        raise exc
                     sleep(min(0.1, remaining))
         finally:
             self._finish_agent_run(agent_id)
@@ -561,15 +712,25 @@ class CodexProvider:
         self._begin_agent_run(home_id=home_id, agent_id=agent_id, thread_id=thread_id)
         try:
             sdk = self._sdk()
-            with self._new_codex(sdk, env=env, workdir=workdir) as codex:
-                thread = codex.thread_resume(
-                    thread_id,
-                    cwd=workdir,
-                    model=self.model,
-                    config=self.thread_config or None,
-                )
-                if _codex_thread_status_type(thread.read(include_turns=False)) != "idle":
-                    return None
+            for attempt in (1, 2):
+                try:
+                    with self._new_codex(sdk, env=env, workdir=workdir) as codex:
+                        with _context_rpc("thread/resume", attempt=attempt):
+                            thread = codex.thread_resume(
+                                thread_id,
+                                cwd=workdir,
+                                model=self.model,
+                                config=self.thread_config or None,
+                            )
+                        with _context_rpc("thread/read", attempt=attempt):
+                            if _codex_thread_status_type(thread.read(include_turns=False)) != "idle":
+                                return None
+                    break
+                except Exception as exc:
+                    if attempt == 2 or type(exc).__name__ not in {"TransportClosedError", "ServerBusyError"}:
+                        raise
+                    sleep(1.0)
+
         finally:
             self._finish_agent_run(agent_id)
         now = utc_now_iso()
@@ -806,18 +967,7 @@ class CodexProvider:
 
 
 def _classify_transient_codex_error(sdk: object, exc: Exception) -> str | None:
-    is_retryable = getattr(sdk, "is_retryable_error", None)
-    if callable(is_retryable):
-        try:
-            if is_retryable(exc):
-                return "server_overloaded"
-        except Exception:
-            pass
-
     message = str(exc).casefold()
-    if "selected model is at capacity" in message:
-        return "model_capacity"
-
     non_retryable_markers = (
         "content_filter",
         "content filter",
@@ -826,9 +976,27 @@ def _classify_transient_codex_error(sdk: object, exc: Exception) -> str | None:
         "unauthorized",
         "bad request",
         "cyber policy",
+        "balance exhausted",
+        "payment required",
+        "insufficient_quota",
+        "invalid api key",
     )
     if any(marker in message for marker in non_retryable_markers):
         return None
+
+    # A known routing rejection; do not generalize to arbitrary 404s or disconnects.
+    if "unexpected status 404" in message and "no enabled channel for model" in message:
+        return "model_channel_unavailable"
+    if "selected model is at capacity" in message:
+        return "model_capacity"
+
+    is_retryable = getattr(sdk, "is_retryable_error", None)
+    if callable(is_retryable):
+        try:
+            if is_retryable(exc):
+                return "server_overloaded"
+        except Exception:
+            pass
 
     exception_classifications = {
         "ServerBusyError": "server_overloaded",

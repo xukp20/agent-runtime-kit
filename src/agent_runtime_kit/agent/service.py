@@ -548,7 +548,7 @@ class AgentService:
         )
         session_locator = agent.session_locator
         session_start_home_commit: Callable[[], None] | None = None
-        if session_locator is None:
+        if session_locator is None or agent.provider_type == "grok":
             def session_start_home_commit() -> None:
                 self._commit_session_start_home_materialization(
                     agent.provider_type,
@@ -629,6 +629,22 @@ class AgentService:
         try:
             agent = self.store.get_agent(agent_id)
         except KeyError:
+            return
+        if (agent.session_locator is not None
+                and agent.session_locator.session_id == event.session_id
+                and agent.session_locator.native_locator):
+            # A completed turn retains the same full session identity. Session/load
+            # defaults may differ from the backend identity resolved by that turn.
+            return
+        locator = event.data.get("session_locator") if isinstance(event.data, dict) else None
+        if (
+            event.kind == "session.created"
+            and isinstance(locator, ProviderSessionLocator)
+            and locator.provider_type == agent.provider_type
+            and locator.home_id == agent.home_id
+            and locator.session_id == event.session_id
+        ):
+            self.store.update_session_locators(agent_id, session_locator=locator)
             return
         if agent.session_locator is not None and agent.session_locator.session_id == event.session_id:
             return
@@ -780,7 +796,7 @@ class AgentService:
         self,
         agent_id: str,
         *,
-        timeout_s: float = 120.0,
+        timeout_s: float = 600.0,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
     ) -> AgentContextCompactionResult:
@@ -799,7 +815,7 @@ class AgentService:
         agent_id: str,
         *,
         threshold: float = 0.80,
-        timeout_s: float = 120.0,
+        timeout_s: float = 600.0,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
     ) -> AgentContextCompactionResult:

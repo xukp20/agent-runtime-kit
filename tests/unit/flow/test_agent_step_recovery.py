@@ -805,3 +805,27 @@ def test_recovery_holds_agent_boundary_until_flow_commit_against_close(tmp_path:
     close_thread.join(2)
     assert not close_thread.is_alive()
     assert service.get_flow(receipt.flow_id).current_step_id == receipt.replacement_step_id
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_created_flow_suspended_recovery_requires_execution_evidence(tmp_path: Path, started: bool) -> None:
+    agent = Agent("reviewer", "scope", "ReviewerAgent", "codex", "ReviewerAgent")
+    service, _, _, _ = _service(tmp_path, agent=agent)
+    flow_id, step_id = _lost_step(service, agent_id=agent.agent_id)
+    service.store.update_flow_record(flow_id, lambda flow: setattr(flow, "status", FlowStatus.CREATED))
+    service.store.update_step_record(step_id, lambda step: (
+        setattr(step, "status", StepStatus.SUSPENDED),
+        setattr(step, "started_at", "2026-09-14T00:00:00Z" if started else None),
+    ))
+    before = service.get_step(step_id).model_dump(mode="json")
+    preview = service.inspect_agent_step_recovery(step_id)
+    assert ("resume_suspended" in preview.available_actions) is started
+    if started:
+        receipt = service.recover_agent_step(
+            step_id=step_id, expected_status=StepStatus.SUSPENDED,
+            expected_recovery_token=preview.recovery_token,
+            action="resume_suspended", agent_mode="fresh",
+        )
+        assert service.get_step(step_id).model_dump(mode="json") == before
+        assert service.get_flow(flow_id).status is FlowStatus.RUNNING
+        assert service.get_flow(flow_id).current_step_id == receipt.replacement_step_id

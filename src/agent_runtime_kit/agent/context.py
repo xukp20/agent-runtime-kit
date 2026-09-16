@@ -28,7 +28,7 @@ class AgentContextMaintenanceJournalStatus(str, Enum):
 class AgentContextMaintenancePolicy:
     enabled: bool = True
     threshold: float = 0.80
-    timeout_s: float = 120.0
+    timeout_s: float = 600.0
 
     def __post_init__(self) -> None:
         if not 0 < self.threshold <= 1:

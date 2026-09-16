@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_runtime_kit.agent.diagnostics import exception_diagnostics
+
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -56,6 +58,7 @@ class SchedulerRunLeaseView(BaseModel):
     advanced_flow_ids: list[str] = Field(default_factory=list)
     started_step_ids: list[str] = Field(default_factory=list)
     terminal_reason: str | None = None
+    failure_diagnostics: dict[str, object] | None = None
     run_control: SchedulerRunControlView
 
 
@@ -358,7 +361,9 @@ class RuntimeScheduleService:
             )
             result.run_control = self.get_run_control_view()
             return result
-        except Exception:
+        except Exception as exc:
+            # Closing the lease must not fall through to unbounded admission.
+            self.ark.pause_controller.pause(None)
             with self.lock:
                 if self._semantic_run_active:
                     self._semantic_run_active = False
@@ -367,6 +372,7 @@ class RuntimeScheduleService:
                     self._update_semantic_lease_locked(
                         status="terminal",
                         terminal_reason="runtime_failure",
+                        failure_diagnostics=exception_diagnostics(exc),
                     )
             raise
 
@@ -722,6 +728,7 @@ class RuntimeScheduleService:
         *,
         status: Literal["active", "draining", "terminal"] | None = None,
         terminal_reason: str | None = None,
+        failure_diagnostics: dict[str, object] | None = None,
         advanced_flow_ids: list[str] | None = None,
         started_step_ids: list[str] | None = None,
     ) -> None:
@@ -752,6 +759,7 @@ class RuntimeScheduleService:
         self._run_leases[lease_id] = current.model_copy(
             update={
                 "status": next_status,
+                "failure_diagnostics": failure_diagnostics or current.failure_diagnostics,
                 "version": current.version + 1,
                 "terminal_at": (
                     current.terminal_at

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from threading import RLock
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -276,6 +277,12 @@ class HomeService:
 
             renderers = {"codex": CodexHomeRenderer(runtime_root=self.runtime_root)}
         self.renderers = dict(renderers)
+        self._materialization_locks: dict[tuple[str, str], object] = {}
+        self._materialization_locks_guard = RLock()
+
+    def _materialization_lock(self, provider_type: str, home_id: str):
+        with self._materialization_locks_guard:
+            return self._materialization_locks.setdefault((provider_type, home_id), RLock())
 
     def create_home(self, spec: ProviderHomeSpec) -> HomeRecord:
         provider_type = spec.provider_type.strip()
@@ -375,11 +382,12 @@ class HomeService:
         run_env: Mapping[str, str] | None = None,
         workdir: str | None = None,
     ) -> object:
-        renderer = self.renderers.get(provider_type)
-        if renderer is None:
-            raise ValueError(f"no Home renderer registered for provider: {provider_type}")
-        home = self.get_home(provider_type, home_id)
-        return renderer.build_execution_context(home, run_env=run_env, workdir=workdir)
+        with self._materialization_lock(provider_type, home_id):
+            renderer = self.renderers.get(provider_type)
+            if renderer is None:
+                raise ValueError(f"no Home renderer registered for provider: {provider_type}")
+            home = self.get_home(provider_type, home_id)
+            return renderer.build_execution_context(home, run_env=run_env, workdir=workdir)
 
     def seal_home_materialization(self, provider_type: str, home_id: str) -> HomeRecord:
         """Explicitly accept application post-processing and refresh the manifest.
@@ -389,19 +397,20 @@ class HomeService:
         verification when an execution context is built.
         """
 
-        renderer = self.renderers.get(provider_type)
-        refresh = getattr(renderer, "refresh_materialization", None)
-        if not callable(refresh):
-            raise ValueError(f"provider does not support Home materialization sealing: {provider_type}")
-        home = self.get_home(provider_type, home_id)
-        home_root = self.resolve_home_root(provider_type, home_id)
-        materialization = refresh(home, home_root)
-        return self._store_refreshed_materialization(
-            provider_type,
-            home_id,
-            home,
-            materialization,
-        )
+        with self._materialization_lock(provider_type, home_id):
+            renderer = self.renderers.get(provider_type)
+            refresh = getattr(renderer, "refresh_materialization", None)
+            if not callable(refresh):
+                raise ValueError(f"provider does not support Home materialization sealing: {provider_type}")
+            home = self.get_home(provider_type, home_id)
+            home_root = self.resolve_home_root(provider_type, home_id)
+            materialization = refresh(home, home_root)
+            return self._store_refreshed_materialization(
+                provider_type,
+                home_id,
+                home,
+                materialization,
+            )
 
     def commit_provider_lifecycle_materialization(
         self,
@@ -412,23 +421,24 @@ class HomeService:
     ) -> HomeRecord:
         """Commit only renderer-declared changes at a trusted provider boundary."""
 
-        renderer = self.renderers.get(provider_type)
-        commit = getattr(renderer, "commit_lifecycle_materialization", None)
-        if not callable(commit):
-            raise ValueError(
-                f"provider does not support lifecycle Home materialization commits: {provider_type}"
+        with self._materialization_lock(provider_type, home_id):
+            renderer = self.renderers.get(provider_type)
+            commit = getattr(renderer, "commit_lifecycle_materialization", None)
+            if not callable(commit):
+                raise ValueError(
+                    f"provider does not support lifecycle Home materialization commits: {provider_type}"
+                )
+            home = self.get_home(provider_type, home_id)
+            home_root = self.resolve_home_root(provider_type, home_id)
+            materialization = commit(home, home_root, lifecycle=lifecycle)
+            if materialization is None:
+                return home
+            return self._store_refreshed_materialization(
+                provider_type,
+                home_id,
+                home,
+                materialization,
             )
-        home = self.get_home(provider_type, home_id)
-        home_root = self.resolve_home_root(provider_type, home_id)
-        materialization = commit(home, home_root, lifecycle=lifecycle)
-        if materialization is None:
-            return home
-        return self._store_refreshed_materialization(
-            provider_type,
-            home_id,
-            home,
-            materialization,
-        )
 
     def _store_refreshed_materialization(
         self,

@@ -267,6 +267,7 @@ class GrokProviderRunHandle:
     def _run(self) -> None:
         transport: GrokAcpProcess | None = None
         try:
+            stage = "execution_context"
             context = self.request.execution_context
             if context is None or context.provider_type != "grok":
                 raise ValueError("Grok runtime requires a Grok ProviderExecutionContext")
@@ -275,10 +276,13 @@ class GrokProviderRunHandle:
                 raise ValueError("Grok execution context has no runtime configuration")
             workdir = Path(self.request.workdir or context.workdir or context.home_root).resolve(strict=True)
             self._raise_if_stop_requested()
+            stage = "workdir_validation"
             validate_grok_workdir(workdir, managed_skills=bool(runtime.get("skills")))
+            stage = "resume_identity"
             _validate_resume_identity(self.request, context.home_root, workdir)
             command = build_grok_command(context, model=self.request.model_overrides)
             required_mcp = tuple(str(item) for item in runtime.get("required_mcp_server_names") or ())
+            stage = "mcp_preflight"
             if required_mcp:
                 _verify_required_mcp(
                     command[0],
@@ -288,6 +292,7 @@ class GrokProviderRunHandle:
                     cancelled=lambda: self._requested_stop is not None,
                 )
             self._raise_if_stop_requested()
+            stage = "acp_initialize"
             transport = GrokAcpProcess(
                 command,
                 cwd=workdir,
@@ -317,6 +322,7 @@ class GrokProviderRunHandle:
                 raise GrokAcpError(f"Grok adapter requires agentVersion {GROK_CLI_VERSION}")
             self._raise_if_stop_requested()
             params: dict[str, object] = {"cwd": str(workdir), "mcpServers": []}
+            stage = "session_load_or_create"
             if self.resume:
                 capabilities = _mapping_or_empty(init.get("agentCapabilities"))
                 if capabilities.get("loadSession") is not True:
@@ -346,9 +352,12 @@ class GrokProviderRunHandle:
                     "grok_home": str(context.home_root / ".grok"),
                 },
             )
-            if not self.resume and self.request.session_start_home_commit is not None:
+            self._append_event("session.created", data={"session_locator": self._session})
+            stage = "home_session_start_commit"
+            if self.request.session_start_home_commit is not None:
                 self.request.session_start_home_commit()
             self._raise_if_stop_requested()
+            stage = "tool_catalog"
             catalog = _mapping(
                 transport.request("_x.ai/commands/list", {"sessionId": session_id}, timeout_s=20),
                 "commands/list result",
@@ -374,6 +383,7 @@ class GrokProviderRunHandle:
             self._raise_if_stop_requested()
             prompt = _compose_prompt(self.request)
             self._append_event("turn.accepted")
+            stage = "prompt"
             result = _mapping(
                 transport.request(
                     "session/prompt",
@@ -415,6 +425,7 @@ class GrokProviderRunHandle:
                 self._state = state
             self._append_event("terminal." + state.value, terminal=True, data={"stop_reason": stop_reason})
         except BaseException as exc:
+            exc.ark_provider_stage = stage
             if isinstance(exc, GrokProcessCleanupError):
                 self._cleanup_uncertain = True
             cleanup_error: BaseException | None = None

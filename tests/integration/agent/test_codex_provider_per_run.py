@@ -548,7 +548,9 @@ def test_codex_provider_stops_after_transient_retry_budget_is_exhausted(
     ]
     retries: list[dict[str, object]] = []
 
-    with pytest.raises(RuntimeError, match="Selected model is at capacity"):
+    from agent_runtime_kit.agent.models import AgentProviderTurnFailed
+
+    with pytest.raises(AgentProviderTurnFailed) as failure:
         provider.start_thread(
             home_id="worker",
             home_root=tmp_path / "home",
@@ -563,6 +565,10 @@ def test_codex_provider_stops_after_transient_retry_budget_is_exhausted(
     assert FakeHighLevelTurnHandle.run_calls == 3
     assert [item["next_attempt"] for item in retries] == [2, 3]
 
+
+    assert failure.value.provider_error_type == "model_capacity"
+    assert failure.value.retryable is True
+    assert failure.value.code == "codex_transient_retry_exhausted"
 
 def test_agent_service_persists_new_thread_locator_while_first_turn_is_running(
     tmp_path: Path,
@@ -952,3 +958,142 @@ def _token_count(*, total_tokens: int) -> dict[str, object]:
             },
         },
     }
+
+
+def test_codex_channel_fluctuation_retries_same_session_and_reports_exhaustion(tmp_path, monkeypatch):
+    from agent_runtime_kit.agent.models import AgentProviderTurnFailed
+    from agent_runtime_kit.agent.providers import codex as module
+
+    _reset_fake_codex()
+    delays = []
+    monkeypatch.setattr(module, 'sleep', delays.append)
+    provider = _provider(transient_retry_policy=CodexTransientRetryPolicy(max_attempts=3))
+    error = 'unexpected status 404 Not Found: no enabled channel for model "gpt-5.6-luna"'
+    FakeHighLevelTurnHandle.run_errors = [RuntimeError(error), RuntimeError(error)]
+    turns, retries = [], []
+    args = dict(home_id='worker', home_root=tmp_path/'home',
+                env={'CODEX_HOME': str(tmp_path/'home'/'.codex')},
+                workdir=str(tmp_path), prompt='capacity', developer_instructions=None,
+                agent_id='agent-a', on_turn_started=lambda thread,turn: turns.append((thread,turn)),
+                on_transient_retry=retries.append)
+    provider.start_thread(**args)
+    assert delays == [30, 60]
+    assert len(turns) == 3 and len({thread for thread,turn in turns}) == 1
+    assert all(r['classification'] == 'model_channel_unavailable' for r in retries)
+    _reset_fake_codex()
+    FakeHighLevelTurnHandle.run_errors = [RuntimeError(error)] * 3
+    with pytest.raises(AgentProviderTurnFailed) as raised:
+        provider.start_thread(**args)
+    assert raised.value.provider_error_type == 'model_channel_unavailable'
+    assert raised.value.retryable is True
+    assert raised.value.code == 'codex_transient_retry_exhausted'
+    assert raised.value.session_id == 'thread-started' and raised.value.turn_id is not None
+    assert FakeHighLevelTurnHandle.run_calls == 3
+
+
+def test_context_timeout_has_safe_evidence(tmp_path):
+    from agent_runtime_kit.agent.models import AgentContextCompactionTimeout
+    from agent_runtime_kit.agent.diagnostics import exception_diagnostics
+    from agent_runtime_kit.agent.context import AgentContextMaintenancePolicy
+    assert AgentContextMaintenancePolicy().timeout_s == 600
+    assert AgentContextMaintenancePolicy(timeout_s=12).timeout_s == 12
+    _reset_fake_codex()
+    provider = _provider()
+    home = tmp_path / "home"
+    rollout = home / ".codex/sessions/rollout-thread-existing.jsonl"
+    _append_rollout(rollout, _token_count(total_tokens=80))
+    with pytest.raises(AgentContextCompactionTimeout) as err:
+        provider.compact_thread(home_id="worker", home_root=home, env={"CODEX_HOME": str(home / ".codex")},
+            thread_id="thread-existing", workdir=str(tmp_path), agent_id="a", timeout_s=0.001)
+    info = exception_diagnostics(err.value)["context"]
+    assert info["evidence_complete"] is False
+    assert info["has_new_compacted"] is False
+    assert info["wait_limit_s"] == 0.001
+
+
+@pytest.mark.parametrize("error_name,expected_attempts", [
+    ("TransportClosedError", 2), ("ServerBusyError", 2), ("InternalRpcError", 1)])
+def test_context_reconcile_retry_is_narrow_and_has_no_turn(tmp_path, monkeypatch, error_name, expected_attempts):
+    from agent_runtime_kit.agent.providers import codex as module
+    from agent_runtime_kit.agent.diagnostics import exception_diagnostics
+    _reset_fake_codex()
+    provider = _provider()
+    home = tmp_path / "home"
+    rollout = home / ".codex/sessions/rollout-thread-existing.jsonl"
+    _append_rollout(rollout, _token_count(total_tokens=80))
+    baseline = module.capture_codex_compact_baseline(rollout, session_id="thread-existing")
+    _append_rollout(rollout, {"type": "compacted", "payload": {}})
+    _append_rollout(rollout, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+    _append_rollout(rollout, _token_count(total_tokens=20))
+    calls = []
+    error_type = type(error_name, (RuntimeError,), {})
+    def failed(*args, **kwargs):
+        calls.append(1)
+        e = error_type("secret-value")
+        e.code = -32603
+        raise e
+    monkeypatch.setattr(FakeCodex, "thread_resume", failed)
+    monkeypatch.setattr(module, "sleep", lambda _: None)
+    with pytest.raises(error_type) as err:
+        provider.reconcile_thread_compaction(home_id="worker", home_root=home, env={"CODEX_HOME": str(home / ".codex")},
+            thread_id="thread-existing", workdir=str(tmp_path), agent_id="a",
+            baseline=baseline.to_dict(), provider_operation_id=None)
+    assert len(calls) == expected_attempts
+    info = exception_diagnostics(err.value)
+    assert info["context"]["rpc_method"] == "thread/resume"
+    assert info["context"]["rpc_attempt"] == expected_attempts
+    assert info["context"]["rpc_code"] == -32603
+    assert "secret-value" not in str(info)
+    assert provider.list_active_agents() == []
+
+
+def test_thread_start_rpc_diagnostics_do_not_retry_or_expose_message(tmp_path, monkeypatch):
+    from agent_runtime_kit.agent.diagnostics import exception_diagnostics
+    _reset_fake_codex()
+    provider = _provider()
+    calls = []
+    def failed(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("sensitive startup text")
+    monkeypatch.setattr(FakeCodex, "thread_start", failed)
+    home = tmp_path / "home"
+    with pytest.raises(RuntimeError) as err:
+        provider.start_thread(home_id="worker", home_root=home,
+            env={"CODEX_HOME": str(home / ".codex")}, workdir=str(tmp_path),
+            prompt="unused", developer_instructions=None, agent_id="a")
+    info = exception_diagnostics(err.value)
+    assert info["context"]["rpc_method"] == "thread/start"
+    assert len(calls) == 1
+    assert "sensitive" not in str(info)
+    assert provider.list_active_agents() == []
+
+
+@pytest.mark.parametrize('mode', ['start', 'resume', 'overwrite'])
+def test_required_mcp_initialization_retry_never_duplicates_turn(tmp_path, monkeypatch, mode):
+    from openai_codex.errors import InternalRpcError
+    _reset_fake_codex()
+    provider = _provider()
+    provider.transient_retry_policy = CodexTransientRetryPolicy(initial_delay_s=0)
+    target, method = (FakeClient, 'thread_resume') if mode == 'overwrite' else (
+        FakeCodex, 'thread_start' if mode == 'start' else 'thread_resume')
+    original = getattr(target, method)
+    calls = []
+    def initialize(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            operation = 'creating' if mode == 'start' else 'resuming'
+            raise InternalRpcError(-32603, f'error {operation} thread: required MCP servers failed to initialize: lc_submit: MCP client startup timed out after 30s')
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(target, method, initialize)
+    home = tmp_path / 'home'
+    args = dict(home_id='worker', home_root=home, env={'CODEX_HOME': str(home / '.codex')},
+                workdir=str(tmp_path), prompt='once', developer_instructions=None, agent_id='a')
+    if mode == 'start':
+        provider.start_thread(**args)
+    else:
+        result = provider.resume_thread(**args, thread_id='existing', overwrite_developer_instructions=mode == 'overwrite')
+        assert result.thread_id == 'existing'
+    assert len(calls) == 2
+    assert FakeHighLevelTurnHandle.run_calls + FakeTurnHandle.run_calls == 1
+    assert provider.list_active_agents() == []
+    assert all(c.closed for c in FakeCodex.created)

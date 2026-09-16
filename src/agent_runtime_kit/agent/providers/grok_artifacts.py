@@ -6,6 +6,7 @@ import shutil
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 from ..provider_contracts import (
     AgentArtifactLocator,
@@ -253,6 +254,18 @@ class GrokArtifactAdapter:
 
     def _session_dir(self, session) -> Path:  # noqa: ANN001
         native = session.native_locator
+        if native is None:
+            # Legacy failed startups persisted only the session ID. Preserve their
+            # artifacts without changing Agent truth or making them resumable.
+            root = self._home_root(session.home_id) / ".grok" / "sessions"
+            candidates = [path for path in root.glob("*/*") if path.name == session.session_id]
+            if len(candidates) != 1:
+                raise RuntimeError("Grok legacy session directory is missing or ambiguous")
+            candidate = candidates[0]
+            workdir = unquote(candidate.parent.name)
+            if not Path(workdir).is_absolute() or quote(workdir, safe="") != candidate.parent.name:
+                raise RuntimeError("Grok legacy session directory has invalid workdir encoding")
+            native = {"session_relpath": str(candidate.relative_to(self.runtime_root))}
         if not isinstance(native, dict) or not isinstance(native.get("session_relpath"), str):
             raise RuntimeError("Grok session locator has no native session path")
         path = _safe_join(self.runtime_root, native["session_relpath"])

@@ -950,3 +950,52 @@ def test_waiting_flow_exits_waiting_on_later_tick(tmp_path: Path) -> None:
 
     assert second_tick.advanced_flow_ids == [flow_id]
     assert second_tick.started_step_ids == [f"{flow_id}-step-1"]
+
+
+def test_semantic_runtime_failure_pauses_before_next_tick(tmp_path, monkeypatch):
+    pause = FakePauseController(paused=False)
+    flow_service, _, scheduler = make_services(tmp_path / ".agent_runtime", pause=pause)
+    flow_id = start_scheduler_flow(flow_service, status="waiting", ready=False, enqueue=True)
+    control = scheduler.configure_semantic_run(SchedulerSemanticRunPolicy(
+        name="failure", allow_flow_advance=lambda flow: True, allow_step_start=lambda step: True,
+        decide=lambda service: SchedulerRunDecision(), max_flow_advances=10, max_step_starts=10,
+    ))
+    original = flow_service.can_advance_flow
+    def fail(fid):
+        raise KeyError("sensitive arbitrary message")
+    monkeypatch.setattr(flow_service, "can_advance_flow", fail)
+    with pytest.raises(KeyError):
+        scheduler.schedule_ready()
+    assert pause.is_paused()
+    lease = scheduler._run_leases[control.lease_id]
+    assert lease.status == "terminal" and lease.terminal_reason == "runtime_failure"
+    assert lease.failure_diagnostics["exception_type"] == "KeyError"
+    assert "sensitive arbitrary message" not in str(lease.failure_diagnostics)
+    monkeypatch.setattr(flow_service, "can_advance_flow", original)
+    scheduler.enqueue_flow(flow_id)
+    tick = scheduler.schedule_ready()
+    assert tick.advanced_flow_ids == [] and tick.started_step_ids == []
+
+
+@pytest.mark.parametrize("scope", [False, True])
+def test_index_rebuild_readers_see_previous_complete_index(tmp_path, monkeypatch, scope):
+    import sqlite3
+    from agent_runtime_kit.flow import store as store_module
+    fs, _, _ = make_services(tmp_path / ".agent_runtime", pause=FakePauseController(paused=True))
+    fid = start_scheduler_flow(fs, status="waiting", ready=False, enqueue=False)
+    store = fs.store
+    flow = fs.get_flow(fid)
+    from agent_runtime_kit.agent.store_utils import encode_scope_id
+    path = store._scope_index_path(encode_scope_id(flow.scope_id)) if scope else store.global_index_path
+    original = store_module._upsert_flow_row
+    observed = []
+    def check(conn, item, key, relpath):
+        with sqlite3.connect(path) as reader:
+            observed.append(reader.execute("select flow_id from flows").fetchall())
+        return original(conn, item, key, relpath)
+    monkeypatch.setattr(store_module, "_upsert_flow_row", check)
+    if scope:
+        store.rebuild_scope_index(flow.scope_id)
+    else:
+        store.rebuild_global_index()
+    assert observed == [[(fid,)]]

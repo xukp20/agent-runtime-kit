@@ -127,3 +127,26 @@ def _token_count(*, total_tokens: int, context_window: int) -> dict[str, object]
             "rate_limits": None,
         },
     }
+
+
+@pytest.mark.parametrize("item_type,thread_id,event_type,expected", [
+    ("ContextCompaction", "thread-1", "item_completed", True),
+    ("ContextCompaction", "other", "item_completed", False),
+    ("AgentMessage", "thread-1", "item_completed", False),
+    ("ContextCompaction", "thread-1", "item_started", False),
+])
+def test_modern_compaction_completion_marker(tmp_path, item_type, thread_id, event_type, expected):
+    rollout = tmp_path / "rollout.jsonl"
+    _append(rollout, _token_count(total_tokens=80, context_window=100))
+    baseline = capture_codex_compact_baseline(rollout, session_id="thread-1")
+    marker = {"type": "event_msg", "payload": {
+        "type": event_type, "thread_id": thread_id,
+        "item": {"type": item_type, "id": "compact-item"},
+    }}
+    _append(rollout, marker)
+    assert not inspect_codex_compact_evidence(rollout, session_id="thread-1", baseline=baseline).complete
+    _append(rollout, {"type": "compacted", "payload": {}})
+    _append(rollout, _token_count(total_tokens=20, context_window=100))
+    assert inspect_codex_compact_evidence(rollout, session_id="thread-1", baseline=baseline).complete is expected
+    new_baseline = capture_codex_compact_baseline(rollout, session_id="thread-1")
+    assert not inspect_codex_compact_evidence(rollout, session_id="thread-1", baseline=new_baseline).complete

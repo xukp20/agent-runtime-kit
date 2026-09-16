@@ -161,7 +161,16 @@ def _scan_rollout(path: Path, *, session_id: str | None) -> _RolloutScan:
             if event_type == "compacted":
                 compacted_count += 1
                 latest_compacted = locator
-            elif event_type == "event_msg" and payload_type == "context_compacted":
+            elif event_type == "event_msg" and (
+                payload_type == "context_compacted"
+                or (
+                    payload_type == "item_completed"
+                    and isinstance(payload.get("item"), dict)
+                    and payload["item"].get("type") == "ContextCompaction"
+                    and session_id is not None
+                    and payload.get("thread_id") == session_id
+                )
+            ):
                 context_compacted_count += 1
                 latest_context_compacted = locator
             elif event_type == "event_msg" and payload_type == "token_count":
