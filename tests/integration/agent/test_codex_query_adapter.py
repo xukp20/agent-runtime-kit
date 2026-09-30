@@ -67,10 +67,13 @@ def test_codex_standard_query_projects_rollout(tmp_path: Path) -> None:
         },
         {
             "type": "turn_context",
-            "payload": {
-                "turn_id": "turn-1",
-                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
-            },
+            "payload": {"turn_id": "turn-1"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+            }},
         },
         {
             "type": "response_item",
@@ -126,6 +129,8 @@ def test_codex_standard_query_projects_rollout(tmp_path: Path) -> None:
     assert usage.token_usage.total_tokens == 15
 
     report = service.build_trace_report(agent.agent_id)
+    assert report.usage.token_usage.total_tokens == 15
+    assert report.usage.aggregate_complete
     assert report.latest_turn.locator.turn_id == "turn-1"
     assert report.tool_calls[0].tool_name == "lean_check"
 

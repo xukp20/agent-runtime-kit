@@ -324,7 +324,13 @@ def test_codex_provider_interrupts_the_live_turn_handle(tmp_path: Path) -> None:
     assert provider.list_active_agents() == []
 
 
-def test_codex_provider_retries_capacity_failure_on_a_new_turn(tmp_path: Path) -> None:
+@pytest.mark.parametrize("message,classification", [
+    ("Selected model is at capacity", "model_capacity"),
+    ("stream disconnected before completion: Incomplete response returned, reason: upstream_truncated", "upstream_truncated"),
+    ("stream disconnected before completion: Upstream timed out, please retry.", "upstream_timeout"),
+    ("stream disconnected before completion: Transport error: network error: error decoding response body", "response_body_transport"),
+])
+def test_codex_provider_retries_capacity_failure_on_a_new_turn(tmp_path: Path, message: str, classification: str) -> None:
     _reset_fake_codex()
     provider = _provider(
         transient_retry_policy=CodexTransientRetryPolicy(
@@ -332,7 +338,7 @@ def test_codex_provider_retries_capacity_failure_on_a_new_turn(tmp_path: Path) -
             initial_delay_s=0,
         )
     )
-    FakeHighLevelTurnHandle.run_errors = [RuntimeError("Selected model is at capacity")]
+    FakeHighLevelTurnHandle.run_errors = [RuntimeError(message)]
     retries: list[dict[str, object]] = []
     started_turns: list[tuple[str, str]] = []
 
@@ -356,7 +362,7 @@ def test_codex_provider_retries_capacity_failure_on_a_new_turn(tmp_path: Path) -
     ]
     assert retries == [
         {
-            "classification": "model_capacity",
+            "classification": classification,
             "failed_attempt": 1,
             "next_attempt": 2,
             "max_attempts": 3,
@@ -534,8 +540,14 @@ def test_codex_provider_does_not_retry_content_filter_stream_failure(tmp_path: P
     assert FakeHighLevelTurnHandle.run_calls == 1
 
 
+@pytest.mark.parametrize("message,classification", [
+    ("Selected model is at capacity", "model_capacity"),
+    ("Incomplete response returned, reason: upstream_truncated", "upstream_truncated"),
+    ("Upstream timed out, please retry.", "upstream_timeout"),
+    ("Transport error: network error: error decoding response body", "response_body_transport"),
+])
 def test_codex_provider_stops_after_transient_retry_budget_is_exhausted(
-    tmp_path: Path,
+    tmp_path: Path, message: str, classification: str,
 ) -> None:
     _reset_fake_codex()
     provider = _provider(
@@ -545,9 +557,9 @@ def test_codex_provider_stops_after_transient_retry_budget_is_exhausted(
         )
     )
     FakeHighLevelTurnHandle.run_errors = [
-        RuntimeError("Selected model is at capacity"),
-        RuntimeError("Selected model is at capacity"),
-        RuntimeError("Selected model is at capacity"),
+        RuntimeError(message),
+        RuntimeError(message),
+        RuntimeError(message),
     ]
     retries: list[dict[str, object]] = []
 
@@ -569,7 +581,7 @@ def test_codex_provider_stops_after_transient_retry_budget_is_exhausted(
     assert [item["next_attempt"] for item in retries] == [2, 3]
 
 
-    assert failure.value.provider_error_type == "model_capacity"
+    assert failure.value.provider_error_type == classification
     assert failure.value.retryable is True
     assert failure.value.code == "codex_transient_retry_exhausted"
 

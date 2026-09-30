@@ -29,3 +29,29 @@ def test_channel_unavailable_is_narrowly_retryable_and_auth_quota_are_not():
     for message in ['Unauthorized', 'Payment required', 'Build usage balance exhausted',
                     'insufficient_quota', 'invalid api key']:
         assert _classify_transient_codex_error(optimistic_sdk, RuntimeError(message)) is None
+
+
+UPSTREAM_ERRORS = [
+    ('Incomplete response returned, reason: upstream_truncated', 'upstream_truncated'),
+    ('Upstream timed out, please retry.', 'upstream_timeout'),
+    ('Transport error: network error: error decoding response body', 'response_body_transport'),
+]
+
+
+def test_known_upstream_errors_survive_sdk_runtime_error_flattening():
+    from types import SimpleNamespace
+    from agent_runtime_kit.agent.providers.codex import _classify_transient_codex_error
+
+    sdk = SimpleNamespace(is_retryable_error=lambda exc: False)
+    for message, classification in UPSTREAM_ERRORS:
+        for prefix in ['', 'stream disconnected before completion: ',
+                       'response stream disconnected before completion: ']:
+            assert _classify_transient_codex_error(sdk, RuntimeError(prefix + message)) == classification
+        for permanent in ['Unauthorized', 'insufficient_quota', 'invalid api key',
+                          'context window exceeded', 'content_filter', 'bad request']:
+            assert _classify_transient_codex_error(sdk, RuntimeError(message + ': ' + permanent)) is None
+    for unknown in ['error decoding response body', 'upstream_truncated',
+                    'Incomplete response returned, reason: content_filter',
+                    'Upstream timed out while compiling local source',
+                    'stream disconnected before completion: unknown cause']:
+        assert _classify_transient_codex_error(sdk, RuntimeError(unknown)) is None

@@ -188,6 +188,12 @@ def _parse_trace_events(events: list[dict[str, Any]]) -> _ParsedTrace:
     calls_by_id: dict[str, AgentToolCallView] = {}
     pending_outputs: dict[str, tuple[int, dict[str, Any]]] = {}
     current_turn_id: str | None = None
+    cumulative_usage: dict[str, int] = {}
+    usage_baselines: dict[str, dict[str, int]] = {}
+    turns_with_counts: set[str] = set()
+    unknown_baselines: set[str] = set()
+    token_fields = ("input_tokens", "output_tokens", "total_tokens",
+                    "cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens")
     tool_search_count = 0
     warnings: list[str] = []
 
@@ -213,6 +219,29 @@ def _parse_trace_events(events: list[dict[str, Any]]) -> _ParsedTrace:
                 raw_event=event,
             )
         )
+        if turn_id is not None and turn_id not in usage_baselines:
+            if turn_order and turn_order[-1] not in turns_with_counts:
+                unknown_baselines.add(turn_id)
+            usage_baselines[turn_id] = dict(cumulative_usage)
+        if event_type == "event_msg" and payload_type == "token_count":
+            info = payload.get("info")
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if isinstance(total, dict):
+                values = {key: value for key in token_fields
+                          if isinstance((value := total.get(key)), int)
+                          and not isinstance(value, bool) and value >= 0}
+                if turn_id is not None:
+                    baseline = usage_baselines[turn_id]
+                    if any(value < cumulative_usage.get(key, 0) for key, value in values.items()):
+                        unknown_baselines.add(turn_id)
+                    # Rollout totals are session cumulative: subtract the prior
+                    # turn baseline, never sum repeated token_count events.
+                    delta = {key: value - baseline.get(key, 0) for key, value in values.items()
+                             if value >= baseline.get(key, 0)}
+                    _ensure_turn(turns, turn_order, turn_id).usage = (
+                        delta if turn_id not in unknown_baselines else {})
+                    turns_with_counts.add(turn_id)
+                cumulative_usage.update(values)
         if turn_id is not None:
             turn = _ensure_turn(turns, turn_order, turn_id)
             if turn.event_start_index is None:

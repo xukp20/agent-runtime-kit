@@ -204,7 +204,7 @@ class CodexQueryAdapter:
                 request_count=None,
                 token_usage=tokens,
                 turns=usages,
-                aggregate_complete=all(item.aggregate_complete for item in usages),
+                aggregate_complete=bool(usages) and all(item.aggregate_complete for item in usages),
             )
         return usages[-1] if usages else AgentTurnUsage(
             request_count=None,
@@ -336,15 +336,16 @@ def _turn_usage(raw: object, *, model_identity) -> AgentTurnUsage:  # noqa: ANN0
     payload = raw if isinstance(raw, dict) else {}
     total = payload.get("total") if isinstance(payload.get("total"), dict) else payload
     token_usage = TokenUsage(
-        input_tokens=_int(total.get("input_tokens") or total.get("inputTokens")),
-        output_tokens=_int(total.get("output_tokens") or total.get("outputTokens")),
-        total_tokens=_int(total.get("total_tokens") or total.get("totalTokens")),
+        input_tokens=_int(total.get("input_tokens", total.get("inputTokens"))),
+        output_tokens=_int(total.get("output_tokens", total.get("outputTokens"))),
+        total_tokens=_int(total.get("total_tokens", total.get("totalTokens"))),
         cached_input_tokens=_int(
-            total.get("cached_input_tokens") or total.get("cachedInputTokens")
+            total.get("cached_input_tokens", total.get("cachedInputTokens"))
         ),
         reasoning_output_tokens=_int(
-            total.get("reasoning_output_tokens") or total.get("reasoningOutputTokens")
+            total.get("reasoning_output_tokens", total.get("reasoningOutputTokens"))
         ),
+        cache_write_input_tokens=_int(total.get("cache_write_input_tokens")),
         semantics={
             "cached_input_tokens": "subset_of_input_tokens",
             "reasoning_output_tokens": "subset_of_output_tokens",

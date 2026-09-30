@@ -992,6 +992,23 @@ def _classify_transient_codex_error(sdk: object, exc: Exception) -> str | None:
     if any(marker in message for marker in non_retryable_markers):
         return None
 
+    # The SDK flattens failed streamed turns to RuntimeError. Recognize only
+    # observed transient upstream reasons, not arbitrary RuntimeErrors or bare
+    # disconnects whose cause may be permanent. Permanent errors above win.
+    upstream_message = message.strip()
+    for prefix in ("response stream disconnected before completion: ",
+                   "stream disconnected before completion: "):
+        if upstream_message.startswith(prefix):
+            upstream_message = upstream_message[len(prefix):]
+            break
+    upstream_failures = {
+        "incomplete response returned, reason: upstream_truncated": "upstream_truncated",
+        "upstream timed out, please retry.": "upstream_timeout",
+        "transport error: network error: error decoding response body": "response_body_transport",
+    }
+    if classification := upstream_failures.get(upstream_message):
+        return classification
+
     # A known routing rejection; do not generalize to arbitrary 404s or disconnects.
     if "unexpected status 404" in message and "no enabled channel for model" in message:
         return "model_channel_unavailable"
